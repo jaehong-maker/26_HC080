@@ -1,14 +1,5 @@
 #include "Globals.h"
 
-
-// 앰비언트 모드 고도화 전역 변수 초기화
-float hourlyDbBuffer[20] = {0.0};
-int hourlyDbCount = 0;
-int hourlyDbIndex = 0;
-unsigned long lastScentChangeTime = 0;
-bool isPurging = false;
-int currentActiveScent = 0; // 0: 없음, 1~4: 해당 향
-
 // ==========================================
 // [5] 전역 객체 (Global Objects)
 // ==========================================
@@ -139,6 +130,9 @@ bool isWaitingForTestDb = false;
 unsigned long lastAmbientTime = 0;    
 int currentAmbientTrack = 0;
 bool forceAmbientSkip = false;
+float dbHistory[20] = {0};
+int dbHistoryIndex = 0;
+int dbHistoryCount = 0;
 
 // --- 기타 (데모, 터미널) ---
 String lastWebMessage = "Ready";
