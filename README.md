@@ -118,7 +118,8 @@
   - 데이터 수집 센서부 : INMP441 I2S 모듈 (실내 소음 맥락 수집), 4축 고정밀 로드셀 및 HX711 모듈 (질량 정밀 계측)
   - 기기 출력부 : 4채널 독립 분리형 릴레이 스위칭 모듈, 4채널 독립식 초음파 진동자 액추에이터, Nextion 4.3인치 HMI 디스플레이
   - 오디오 출력 : DFPlayer Mini MP3 (안내 음성 출력 및 음악 재생용)
-<img width="500" height="500" alt="image" src="https://github.com/user-attachments/assets/28fc8453-d1a0-4184-8fd0-130d93d18545" />
+<img width="542" height="521" alt="image" src="https://github.com/user-attachments/assets/9c79ada2-2715-404f-93bb-469c275d6e02" />
+
 
 
 - **[ 주요 서비스 흐름도 (소음 반영 모드 중심) ]**
@@ -141,30 +142,31 @@
 
 ---
 ## **💡5. 핵심 소스코드**
-- 소스코드 설명 : API를 활용해서 자동 배포를 생성하는 메서드입니다.
+- 소스코드 설명 : 노이즈 최소화를 위한 EMA 필터 알고리즘을 도입한 무게 측정 함수 및 일정 잔량 미만 시 분사를 차단하는 함수입니다.
 
-```Java
-    private static void start_deployment(JsonObject jsonObject) {
-        String user = jsonObject.get("user").getAsJsonObject().get("login").getAsString();
-        Map<String, String> map = new HashMap<>();
-        map.put("environment", "QA");
-        map.put("deploy_user", user);
-        Gson gson = new Gson();
-        String payload = gson.toJson(map);
-
-        try {
-            GitHub gitHub = GitHubBuilder.fromEnvironment().build();
-            GHRepository repository = gitHub.getRepository(
-                    jsonObject.get("head").getAsJsonObject()
-                            .get("repo").getAsJsonObject()
-                            .get("full_name").getAsString());
-            GHDeployment deployment =
-                    new GHDeploymentBuilder(
-                            repository,
-                            jsonObject.get("head").getAsJsonObject().get("sha").getAsString()
-                    ).description("Auto Deploy after merge").payload(payload).autoMerge(false).create();
-        } catch (IOException e) {
-            e.printStackTrace();
+```cpp
+#include <HX711.h>
+const float ALPHA = 0.15;       // 최신 데이터 반영 가중치 계수 (0 < ALPHA < 1)
+float filteredWeight = 0.0;     // 필터링 적용 후 최종 무게 가중치
+long rawValue = 0;              // HX711로부터 수신한 24bit 원시 ADC 값
+float applyEMAFilter(float currentRawValue, float previousFilteredValue) {
+    // 수식: S_t = alpha * Y_t + (1 - alpha) * S_{t-1}
+    return (ALPHA * currentRawValue) + ((1.0 - ALPHA) * previousFilteredValue);
+}
+void processLoadcellData() {
+    if (scale.is_ready()) {
+        rawValue = scale.read(); // 20ms 간격 샘플링 데이터 취득
+        float currentWeight = (rawValue - tareOffset) / calibrationFactor;
+               // 지수이동평균 알고리즘 적용을 통한 스파이크 노이즈 제거
+        filteredWeight = applyEMAFilter(currentWeight, filteredWeight);
+        // 가공된 무게 기준 백분율(%) 변환 연산 수행
+        int currentPercent = calculatePercentage(filteredWeight);
+       
+        // REQ-F-06: 과열 방지 인터록 안전 로직 (15% 미만 차단)
+        if (currentPercent < 15) {
+            forceShutoffChannel(); // 해당 채널 릴레이 즉각 강제 오프(Low)
         }
     }
+}
+
 ```
