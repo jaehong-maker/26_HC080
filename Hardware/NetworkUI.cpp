@@ -1399,77 +1399,7 @@ void sendServerRequest(String payload) {
   }
 }
 
-// --- 최적화 2: 오디오 버퍼 메모리 할당 방식 개선 (ESP-IDF API 적용) ---
-bool recordAudio(uint8_t** audioBuffer, uint32_t* totalSize) {
-  uint32_t dataSize = SAMPLE_RATE * RECORD_TIME * 2;
-  *totalSize = sizeof(WavHeader) + dataSize;
-  
-  if (ESP.getFreeHeap() < *totalSize + 20000) { 
-    updateDisplay(0, "Memory Full"); 
-    return false; 
-  }
-  Serial.printf(C_YELLOW "\r\n[Voice] 🎤 녹음 시작 (2초)...\r\n" C_RESET);
-  
-  // 일반 malloc 대신 단편화가 적은 8-bit Internal RAM 영역 명시적 할당
-  *audioBuffer = (uint8_t*)heap_caps_malloc(*totalSize, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL); 
-  if (*audioBuffer == NULL) return false;
-  
-  WavHeader header; memcpy(header.riff, "RIFF", 4); header.overall_size = *totalSize - 8; 
-  memcpy(header.wave, "WAVE", 4); memcpy(header.fmt_chunk_marker, "fmt ", 4); 
-  header.length_of_fmt = 16; header.format_type = 1; header.channels = 1; 
-  header.sample_rate = SAMPLE_RATE; header.byterate = SAMPLE_RATE * 2; 
-  header.block_align = 2; header.bits_per_sample = 16; 
-  memcpy(header.data_chunk_header, "data", 4); header.data_size = dataSize; 
-  memcpy(*audioBuffer, &header, sizeof(WavHeader));
-  
-  size_t bytesRead = 0; 
-  i2s_read(I2S_PORT, (void*)(*audioBuffer + sizeof(WavHeader)), dataSize, &bytesRead, portMAX_DELAY);
-  Serial.println(C_GREEN "→ ✅ 필터링 완료" C_RESET); 
-  return true;
-}
-
-void executeVoiceCommand(String jsonResponse) {
-  JsonDocument doc; if (deserializeJson(doc, jsonResponse)) { Serial.println(C_RED "⚠️ JSON 파싱 실패" C_RESET); return; }
-  String transcript = doc["transcript"] | "인식 실패"; String resultText = doc["result_text"] | "명령 수신";
-  int cmd = doc["spray"] | -1; int dur = doc["duration"] | 3; int music = doc["music"] | 0;
-  Serial.printf("\r\n" C_CYAN "[Voice Result]" C_RESET "\r\n 🗣️  인식: %s\r\n 🤖  서버: %s\r\n", transcript.c_str(), resultText.c_str());
-  if (cmd >= 1 && cmd <= 4) triggerSpray(cmd, dur, music, resultText, false);
-  else if (cmd == 0) { stopSystem(); updateDisplay(0, resultText); Serial.println(C_YELLOW "🛑 시스템 정지" C_RESET); }
-}
-
-// --- 최적화 3: HTTP 응답 데이터 메모리 예약 ---
-bool sendAudioToServer(uint8_t* audioBuffer, uint32_t totalSize, String& response) {
-  if (isCommunicate) { Serial.println(C_RED "→ ⚠️ Lock" C_RESET); return false; }
-  isCommunicate = true; Serial.println(C_GREEN "→ 🗣️ 전송 중..." C_RESET); updateDisplay(0, "Thinking...");
-  esp_task_wdt_delete(NULL); bool success = false; initNetworkSession();
-  HTTPClient http; http.setTimeout(15000); 
-  
-  if (http.begin(sharedClient, serverName)) {
-    http.addHeader("Content-Type", "audio/wav");
-    int httpCode = http.POST(audioBuffer, totalSize);
-    if (httpCode > 0) { 
-      response.reserve(512); // 대용량 응답 문자열 사전 할당
-      response = http.getString(); 
-      Serial.println(C_GREEN "→ ✅ 응답 수신 완료" C_RESET); 
-      success = true; 
-    } 
-    else Serial.printf(C_RED "→ ❌ HTTP %d\r\n" C_RESET, httpCode);
-    http.end();
-  }
-  esp_task_wdt_add(NULL); isCommunicate = false; return success;
-}
-
-void recordAndSendVoice() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  SystemMode prevMode = currentMode; currentMode = MODE_VOICE; 
-  uint8_t* audioBuffer = NULL; uint32_t totalSize = 0;
-  if (recordAudio(&audioBuffer, &totalSize)) {
-    String response = "";
-    if (sendAudioToServer(audioBuffer, totalSize, response)) executeVoiceCommand(response);
-  }
-  if (audioBuffer != NULL) free(audioBuffer);
-  currentMode = (prevMode == MODE_VOICE) ? MODE_READY : prevMode; showPrompt();
-}
+// --- 음성 인식 기능 제거됨 ---
 
 void autoWeatherScheduler() {
   if (currentMode != MODE_WEATHER || isRunning) return; 
