@@ -126,13 +126,17 @@ int ambientCycleCount = 0;
 int ambientCycleStorage[5] = {0, 0, 0, 0, 0};
 bool isFirstAmbientRun = true;
 int lastAmbientScent = 0;
+int targetAmbientScent = 0; // ★ 추가
 bool isWaitingForTestDb = false;
 unsigned long lastAmbientTime = 0;    
 int currentAmbientTrack = 0;
 bool forceAmbientSkip = false;
-float dbHistory[20] = {0};
+
+float dbHistory[20] = {0.0f};
 int dbHistoryIndex = 0;
 int dbHistoryCount = 0;
+unsigned long lastScentChangeTime = 0;
+unsigned long last1HourCheckTime = 0;
 
 // --- 기타 (데모, 터미널) ---
 String lastWebMessage = "Ready";
