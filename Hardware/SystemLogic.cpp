@@ -34,11 +34,7 @@ void processAudioEvents() {
   int eventCode = 0;
   if (audioEventQueue != NULL && xQueueReceive(audioEventQueue, &eventCode, 0) == pdTRUE) {
     if (eventCode == 1) { 
-      SystemMode prev = currentMode;
-      setSystemMode(MODE_VOICE, "Voice Command");
-      recordAndSendVoice(); 
-      setSystemMode(isRunning ? prev : MODE_READY);
-      showPrompt(); Serial.print(inputBuffer);
+      // 음성 명령(Voice Command) 기능 제거됨
     } else if (eventCode == 2) { 
       wakeUpSystem();
     }
@@ -70,7 +66,7 @@ void checkFluidLevels() {
 
 // --- 서브 루틴: 노즐 막힘 방지 (Auto-Cleaning) ---
 void runAutoCleaning() {
-  if (isRunning || currentMode == MODE_SLEEP || currentMode == MODE_VOICE) return;
+  if (isRunning || currentMode == MODE_SLEEP) return;
   unsigned long currentTime = millis();
   for (int i = 0; i < 4; i++) {
     if (currentTime - lastNozzleSprayTime[i] > CLEANING_INTERVAL) {
@@ -412,7 +408,7 @@ void processStandardInput() {
         }
         
         inputBuffer = "";
-        if (currentMode != MODE_SLEEP && currentMode != MODE_VOICE && !isWaitingForTestDb) {
+        if (currentMode != MODE_SLEEP && !isWaitingForTestDb) {
             showPrompt(); 
         }
       }
@@ -813,28 +809,14 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
       return; 
   }
 
-  // 3. 앰비언트 모드 ⑤ [규칙 ⑤] 15분 Table/Scent Purging 쿨타임 적용
+  // 3. 앰비언트 모드 향기 쿨타임(연속 분사 방지) 로직
   if (currentMode == MODE_AMBIENT) {
-    // 최초 실행 시 현재 향 설정
-    if (currentActiveScent == 0) {
-      currentActiveScent = cmd;
-      lastScentChangeTime = millis();
-    } 
-    // 향 변경 요청이 들어온 경우!
-    else if (currentActiveScent != cmd) {
-      // 15분(또는 설정된 쿨타임)이 지나지 않았다면?
-      if (millis() - lastScentChangeTime < Config::SCENT_PURGE_COOLTIME) {
-        Serial.printf(C_MAGENTA "\r\n[잔향 소거 쿨타임] %d번 -> %d번 향 변경 대기 중... (기존 향 잔향 제거 15분 락 작동 중)\r\n" C_RESET, 
-                      currentActiveScent, cmd);
-        // 모터 끄고 분사 안함 (순수 BGM & LED만 유지)
-        forceAllOff();
-        return; 
-      } else {
-        // 15분 쿨타임이 통과했으면 새로운 향으로 교체 승인
-        Serial.printf(C_GREEN "\r\n[잔향 소거 완료] %d번 -> %d번 향으로 정식 교체 및 분사 시작!\r\n" C_RESET, currentActiveScent, cmd);
-        currentActiveScent = cmd;
-        lastScentChangeTime = millis();
-      }
+    if (lastAmbientScent == 0) {
+      lastAmbientScent = cmd; 
+    } else if (lastAmbientScent != cmd) {
+      Serial.printf(C_MAGENTA "\r\n[향기 쿨타임] 추천 향이 %d번에서 %d번으로 변경되었습니다. 이번 턴 분사는 생략!\r\n" C_RESET, lastAmbientScent, cmd);
+      lastAmbientScent = cmd; 
+      return; 
     }
   }
 
@@ -878,7 +860,7 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
   }
 
   Serial.printf("\r\n" C_GREEN "✅ 분사 실행: %s (명령:%d)\r\n" C_RESET, txt.c_str(), cmd);
-  if (currentMode != MODE_SLEEP && currentMode != MODE_VOICE && !isWaitingForTestDb) {
+  if (currentMode != MODE_SLEEP && !isWaitingForTestDb) {
       showPrompt();
   }
 }
