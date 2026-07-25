@@ -1219,7 +1219,7 @@ static void processServerResponse(const String& response) {
   JsonDocument doc;
   if (deserializeJson(doc, response)) return; 
 
-  // 1. 발향 강도 및 스피커 볼륨 설정 (명령 실행 전 우선 처리)
+  // 1. 발향 강도 및 스피커 볼륨 설정
   if (canApplyServerSettings() && !doc["intensity"].isNull()) {
     SprayIntensity(doc["intensity"] | 2);
   }
@@ -1230,7 +1230,6 @@ static void processServerResponse(const String& response) {
     scaledVol = constrain(scaledVol, 0, 30);
     if (scaledVol != currentVolume) {
       changeVolume(scaledVol);
-      // 서버 명령으로 변경된 경우, 디스플레이 화면도 해당 음량 페이지로 즉시 전환
       showPage(VOLUME_PAGE_BASE + (scaledVol / 3));
     }
   }
@@ -1271,7 +1270,7 @@ static void processServerResponse(const String& response) {
     updateTempHumi(tempC, humi);
   }
 
-  // 4. 분사 제어 명령 처리
+  // 4. [플로우차트 반영] 분사 제어 및 향 변경 (Same Scent vs Different Scent)
   int cmd = doc["spray"] | -1;
   String resultText = doc["result_text"] | "";
   
@@ -1282,21 +1281,52 @@ static void processServerResponse(const String& response) {
   if (cmd > 0) {
     int dur = doc["duration"] | 3; 
     int music = doc["music"] | 0; 
-    String txt = resultText.length() > 0 ? resultText : "명령 수신";
-    triggerSpray(cmd, dur, music, txt, (currentMode == MODE_WEATHER));
-  } else if (cmd == 0 && resultText != "OK") {
-    SystemMode modeBeforeStop = currentMode;
-    setSystemMode(MODE_READY, "Stopped by Server");
-    if (modeBeforeStop == MODE_WEATHER) {
-      hasWeatherSnapshot = false;
-      hasTempHumiSnapshot = false;
-      lastWeatherLabel = "";
-      lastWeatherIconId = 0;
-      showPage(PAGE_WEATHER_OFF);
+    String txt = resultText.length() > 0 ? resultText : "추천 향 수신";
+    
+    // 🌸 앰비언트 모드일 때: <향이 같은가?> 판별
+    if (currentMode == MODE_AMBIENT) {
+      targetAmbientScent = cmd;
+      
+      // [YES] 기존 향과 동일한 경우 -> 즉시 정상 분사
+      if (lastAmbientScent == targetAmbientScent) {
+        Serial.printf(C_GREEN "✅ [향 유지] 동일한 %d번 향 유지. 정상 분사합니다.\r\n" C_RESET, targetAmbientScent);
+        triggerSpray(cmd, dur, music, txt, false);
+      } 
+      // [NO] 향이 변경된 경우 -> 15분 잔향 소거 쿨타임 체크 (피드백 상태)
+      else {
+        unsigned long elapsed = millis() - lastScentChangeTime;
+        if (lastAmbientScent != 0 && elapsed < Config::SCENT_PURGE_COOLTIME) {
+          Serial.printf(C_MAGENTA "⏳ [향 변경/잔향 소거] %d번 -> %d번 향 변경 감지! 15분 잔향 소거 대기 중 (%lu초 남음). 분사 보류, BGM 유지.\r\n" C_RESET,
+                        lastAmbientScent, targetAmbientScent, (Config::SCENT_PURGE_COOLTIME - elapsed) / 1000);
+          forceAllOff(); // 모터만 끄고 BGM/LED는 계속 유지
+        } else {
+          // 15분 지났거나 첫 진입인 경우 -> 새로운 향으로 교체 승인 및 분사
+          Serial.printf(C_GREEN "✨ [향 교체 완료] %d번 -> %d번 향으로 교체 및 분사 시작!\r\n" C_RESET, lastAmbientScent, targetAmbientScent);
+          lastAmbientScent = targetAmbientScent;
+          lastScentChangeTime = millis();
+          triggerSpray(cmd, dur, music, txt, false);
+        }
+      }
     } else {
-      updateDisplay(0, "Stopped by Server");
+      // 일반/수동/날씨 모드일 때
+      triggerSpray(cmd, dur, music, txt, (currentMode == MODE_WEATHER));
     }
-    Serial.println(C_YELLOW "\r\n🛑 서버 명령으로 시스템 강제 정지\r\n" C_RESET);
+  } else if (cmd == 0 && resultText != "OK") {
+    // 앰비언트/날씨 모드 중에는 spray=0 이어도 Ready 모드로 튕겨나가지 않음
+    if (currentMode != MODE_AMBIENT && currentMode != MODE_WEATHER) {
+      SystemMode modeBeforeStop = currentMode;
+      setSystemMode(MODE_READY, "Stopped by Server");
+      if (modeBeforeStop == MODE_WEATHER) {
+        hasWeatherSnapshot = false;
+        hasTempHumiSnapshot = false;
+        lastWeatherLabel = "";
+        lastWeatherIconId = 0;
+        showPage(PAGE_WEATHER_OFF);
+      } else {
+        updateDisplay(0, "Stopped by Server");
+      }
+      Serial.println(C_YELLOW "\r\n🛑 서버 명령으로 시스템 강제 정지\r\n" C_RESET);
+    }
   }
   else if (!doc["music"].isNull()) {
     int track = doc["music"] | 0;
@@ -1344,7 +1374,7 @@ static void processServerResponse(const String& response) {
     Serial.printf(C_GREEN "\r\n🎨 서버 명령으로 LED 변경: R:%d G:%d B:%d 밝기:%d ON:%d\r\n" C_RESET,
                   ledR, ledG, ledB, ledBrightness, ledEnabled);
     
-    if (currentMode != MODE_SLEEP && currentMode != MODE_VOICE && !isWaitingForTestDb) {
+    if (currentMode != MODE_SLEEP && !isWaitingForTestDb) {
       showPrompt();
     }
   }
