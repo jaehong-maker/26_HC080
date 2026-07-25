@@ -69,6 +69,15 @@ namespace Config {
     const int PIN_DF_BUSY = 21;
     const float EMPTY_WEIGHT = 19.8f;
     const unsigned long AMBIENT_COOL_DOWN = 5000; 
+
+    // ★ [플로우차트 반영] 15분 잔향 소거 쿨타임 (테스트 시 30000ms = 30초로 변경 가능)
+    const unsigned long SCENT_PURGE_COOLTIME = 15 * 60 * 1000; 
+    
+    // ★ [플로우차트 반영] 1시간 (3600000ms) 거시적 분위기 갱신 주기
+    const unsigned long ONE_HOUR_MS = 60 * 60 * 1000; 
+
+    // 1시간 슬라이딩 윈도우 크기 (3~4분 1곡 기준, 1시간 = 20개 샘플)
+    const int HOURLY_BUFFER_SIZE = 20; 
 }
 
 // 터미널 색상 출력용 매크로
@@ -200,6 +209,7 @@ extern int ambientCycleCount;
 extern int ambientCycleStorage[5];
 extern bool isFirstAmbientRun;
 extern int lastAmbientScent;
+extern int targetAmbientScent;        // ★ 서버에서 새로 추천받은 향
 extern bool isWaitingForTestDb;
 extern unsigned long lastAmbientTime;
 extern int currentAmbientTrack;
@@ -207,6 +217,8 @@ extern bool forceAmbientSkip;
 extern float dbHistory[20];
 extern int dbHistoryIndex;
 extern int dbHistoryCount;
+extern unsigned long lastScentChangeTime; // 마지막 향 교체/피드백 시작 시간
+extern unsigned long last1HourCheckTime;   // 1시간 타이머 기준점
 
 // 기타 (데모, 터미널)
 extern String lastWebMessage;
