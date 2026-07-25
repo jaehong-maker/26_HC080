@@ -770,18 +770,22 @@ int parseAndSetNozzles(String cmdStr) {
 // 🚿 [통합 분사 제어 컨트롤러] 모든 분사(수동, 서버, 날씨, 음성) 전담
 // =================================================================
 void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
-  // 🚨 [핵심 버그 수정] 어떤 명령이 들어오든, 일단 기존 작동을 완벽히 정지시키고 초기화합니다.
-  // 이렇게 해야 이전 향기가 멈추지 않고 계속 분사되는 버그(무한 분사)를 막을 수 있습니다.
+  // 1. 모터 끄기 (기존 분사 중단)
   forceAllOff();
-  myDFPlayer.stop();
+  
+  // ★ 앰비언트 모드가 아닐 때만 BGM을 끕니다. (앰비언트 BGM 연속성 보장)
+  if (currentMode != MODE_AMBIENT) {
+    myDFPlayer.stop();
+  }
+  
   isRunning = false;
   isSpraying = false;
   
-  // 1. 명령어 파싱
+  // 2. 명령어 파싱
   String cmdStr = String(cmd);
   int activeCount = parseAndSetNozzles(cmdStr);
   
-  // 2. 15% 미만 잔량 노즐 개별 필터링 (혼합 분사 시 15% 이상인 것만 살림)
+  // 3. 15% 미만 잔량 노즐 개별 필터링
   bool hasValidNozzle = false;
   bool blockedLowFluidNozzle = false;
   int lastLowFluidCartridge = -1;
@@ -789,7 +793,7 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
       if (activeNozzles[i]) {
           if (calculateScentPercent(weights[i]) < MIN_SPRAY_SCENT_PERCENT) {
               Serial.printf(C_YELLOW "\r\n[Warning] %d번 향기 잔량이 15%% 미만이어서 작동에서 제외됩니다.\r\n" C_RESET, i + 1);
-              activeNozzles[i] = false; // 해당 향기만 분사 취소
+              activeNozzles[i] = false;
               blockedLowFluidNozzle = true;
               lastLowFluidCartridge = i + 1;
           } else {
@@ -803,21 +807,9 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
       showLowFluidPage(lastLowFluidCartridge);
   }
 
-  // 3. 작동 가능한 노즐이 아예 없으면 (모두 15% 미만이거나 잘못된 명령) 그대로 종료
   if (!hasValidNozzle) {
       Serial.println(C_YELLOW "⚠️ 작동 가능한 카트리지가 없어 분사가 취소되었습니다." C_RESET);
       return; 
-  }
-
-  // 3. 앰비언트 모드 향기 쿨타임(연속 분사 방지) 로직
-  if (currentMode == MODE_AMBIENT) {
-    if (lastAmbientScent == 0) {
-      lastAmbientScent = cmd; 
-    } else if (lastAmbientScent != cmd) {
-      Serial.printf(C_MAGENTA "\r\n[향기 쿨타임] 추천 향이 %d번에서 %d번으로 변경되었습니다. 이번 턴 분사는 생략!\r\n" C_RESET, lastAmbientScent, cmd);
-      lastAmbientScent = cmd; 
-      return; 
-    }
   }
 
   // 4. 시스템 분사 상태 ON 및 타이머 설정
@@ -835,22 +827,20 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
     }
   }
   
-  // 6. 상황에 맞는 스피커 음악 자동 재생
+  // 6. 수동/날씨 모드 등 일반 모드일 때만 지정된 트랙 재생
   if (currentMode != MODE_AMBIENT) {
-  int track = 1;
-  if (music > 0 && music <= 25) {
-      track = music; // 서버에서 지정해준 특정 곡
-  } else {
-      // 🚀 수정: 수동 분사 시에도 앱에서 설정한 매핑된 곡을 재생!
-      if (cmd >= 1 && cmd <= 4) {
-          track = musicMapping[cmd - 1];
-      } else {
-          track = 1; // 혼합 향 등은 1번 곡으로 고정
-      }
-  }
-  playSound(track);
-
-  Serial.printf(C_GREEN "[Audio] 재생 시도: %d번 트랙 (%s)\r\n" C_RESET, track, getTrackName(track).c_str());
+    int track = 1;
+    if (music > 0 && music <= 25) {
+        track = music;
+    } else {
+        if (cmd >= 1 && cmd <= 4) {
+            track = musicMapping[cmd - 1];
+        } else {
+            track = 1;
+        }
+    }
+    playSound(track);
+    Serial.printf(C_GREEN "[Audio] 재생 시도: %d번 트랙 (%s)\r\n" C_RESET, track, getTrackName(track).c_str());
   }
 
   // 7. 디스플레이 및 웹 로그 업데이트
