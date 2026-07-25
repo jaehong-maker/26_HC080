@@ -55,7 +55,7 @@
 | <img width="80" height="100" src="https://github.com/user-attachments/assets/ab73bb1c-c1d4-464d-8ad3-635b45d5a8ae" > | <img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/c7f66b7c-ab84-41fa-8fba-b49dba28b677" > | <img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/c33252c7-3bf6-43cf-beaa-a9e2d9bd090b" > | <img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/0d5909f0-fc73-4ab9-be09-4d48e3e71083" > | <img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/c7f66b7c-ab84-41fa-8fba-b49dba28b677" > | |
 |:---:|:---:|:---:|:---:|:---:|:---:|
 | **류재홍** | **김지훈** | **신양섭** | **이준선** | **이헌영** | **김창환** |
-| • 팀 관리 및 프로젝트 총괄 <br> • 로드셀 및 서버 통신 딜레이 해결 | • 애플리케이션 UI 수정 <br> • 서버 및 기기 제어 연동 | • AI 엔진 연동 <br> • 서버 에러 수정 및 DynamoDB 관리 |• 클라우드 관리 <br> • 디스플레이 UI/UX 설계 및 기기 제어 | • 모듈 제어 검증 <br> • 하드웨어 기구 설계 및 외관 PCB 가공 |• 프로젝트 멘토 <br> • 기술 자문 |
+| • 팀 관리 및 총괄 <br> • 로드셀 & 통신 딜레이 개선 | • 앱 UI/UX 개발 <br> • 서버-기기 제어 연동 | • AI 엔진 연동 <br> • 서버 & DynamoDB 관리 |• 클라우드 관리 <br> • 디스플레이 UI & 기기 제어 | • 모듈 제어 검증 <br> • H/W & PCB 설계 및 가공 |• 프로젝트 멘토 <br> • 기술 자문 |
 
 
 
