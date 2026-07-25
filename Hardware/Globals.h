@@ -69,12 +69,6 @@ namespace Config {
     const int PIN_DF_BUSY = 21;
     const float EMPTY_WEIGHT = 19.8f;
     const unsigned long AMBIENT_COOL_DOWN = 5000; 
-
-    // ★ [추가] ⑤ 잔향 소거 쿨타임 (기본 15분 = 900,000ms / 테스트시 30초 = 30000ms)
-    const unsigned long SCENT_PURGE_COOLTIME = 15 * 60 * 1000; // 15분 (테스트시 30000으로 변경)
-    
-    // ★ [추가] 1시간 슬라이딩 윈도우 크기 (3~4분 1곡 기준, 1시간 = 약 15~20개 샘플)
-    const int HOURLY_BUFFER_SIZE = 20; 
 }
 
 // 터미널 색상 출력용 매크로
@@ -96,7 +90,7 @@ enum SystemMode {
   MODE_WEATHER,   // 2
   MODE_SETTING,   // 3
   MODE_DEMO,      // 4
-  MODE_VOICE,     // 5
+  MODE_VOICE,     // 5  <--- ★ 이 줄을 다시 추가해 주세요!
   MODE_VISUAL,    // 6
   MODE_REACTIVE,  // 7
   MODE_DASHBOARD, // 8
@@ -210,6 +204,9 @@ extern bool isWaitingForTestDb;
 extern unsigned long lastAmbientTime;
 extern int currentAmbientTrack;
 extern bool forceAmbientSkip;
+extern float dbHistory[20];
+extern int dbHistoryIndex;
+extern int dbHistoryCount;
 
 // 기타 (데모, 터미널)
 extern String lastWebMessage;
@@ -218,13 +215,6 @@ extern int demoStep;
 extern unsigned long prevDemoMillis;
 extern unsigned long prevMotorMillis;
 extern unsigned long startTimeMillis;
-
-extern float hourlyDbBuffer[20];
-extern int hourlyDbCount;
-extern int hourlyDbIndex;
-extern unsigned long lastScentChangeTime; // 마지막으로 향이 바뀐 시간 (15분 쿨타임용)
-extern bool isPurging;                   // 현재 15분 잔향 소거 중인지 여부
-extern int currentActiveScent;            // 현재 설정된/분사 중인 향 번호
 
 // ==========================================
 // [7] 전역 함수 선언 (Global Functions)
@@ -273,7 +263,7 @@ void rememberWeatherRegion(const String &region);
 String buildWeatherRequestPayload(const String &region);
 void handleWebClient();
 void autoWeatherScheduler();
-void recordAndSendVoice();
+// 음성 인식 관련 기능 제거됨
 void checkNextionInput();
 void clearNextionInputBuffer();
 void clearNextionInputBuffer();
