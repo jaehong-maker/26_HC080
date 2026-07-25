@@ -52,6 +52,34 @@
 ---
 
 ## **💡2. 팀원 소개**
+
+<table align="center">
+  <tr align="center">
+    <td width="16%"><b>류재홍</b></td>
+    <td width="16%"><b>김지훈</b></td>
+    <td width="16%"><b>신양섭</b></td>
+    <td width="16%"><b>이준선</b></td>
+    <td width="16%"><b>이헌영</b></td>
+    <td width="16%"><b>김창환</b></td>
+  </tr>
+  <tr align="center">
+    <td><img width="80" height="100" src="https://github.com/user-attachments/assets/ab73bb1c-c1d4-464d-8ad3-635b45d5a8ae" ></td>
+    <td><img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/c7f66b7c-ab84-41fa-8fba-b49dba28b677" ></td>
+    <td><img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/c33252c7-3bf6-43cf-beaa-a9e2d9bd090b" ></td>
+    <td><img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/0d5909f0-fc73-4ab9-be09-4d48e3e71083" ></td>
+    <td><img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/c7f66b7c-ab84-41fa-8fba-b49dba28b677" ></td>
+    <td><img width="80" height="100" src="https://github.com/user-attachments/assets/ab73bb1c-c1d4-464d-8ad3-635b45d5a8ae" ></td>
+  </tr>
+  <tr>
+    <td valign="top">• 팀 관리 및 총괄<br>• 로드셀/통신 개선</td>
+    <td valign="top">• 앱 UI/UX 개발<br>• 서버-기기 연동</td>
+    <td valign="top">• AI 엔진 연동<br>• 서버 & DB 관리</td>
+    <td valign="top">• 클라우드 관리<br>• 디스플레이 UI 제어</td>
+    <td valign="top">• 모듈 제어 검증<br>• H/W & PCB 설계</td>
+    <td valign="top">• 프로젝트 멘토<br>• 기술 자문 및 지도</td>
+  </tr>
+</table>
+
 | **류재홍** | **김지훈** | **신양섭** | **이준선** | **이헌영** | **김창환** |
 |:---:|:---:|:---:|:---:|:---:|:---:|
 | <img width="80" height="100" src="https://github.com/user-attachments/assets/ab73bb1c-c1d4-464d-8ad3-635b45d5a8ae" > | <img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/c7f66b7c-ab84-41fa-8fba-b49dba28b677" > | <img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/c33252c7-3bf6-43cf-beaa-a9e2d9bd090b" > | <img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/0d5909f0-fc73-4ab9-be09-4d48e3e71083" > | <img width="80" height="100" alt="image" src="https://github.com/user-attachments/assets/c7f66b7c-ab84-41fa-8fba-b49dba28b677" > | <img width="80" height="100" src="https://github.com/user-attachments/assets/ab73bb1c-c1d4-464d-8ad3-635b45d5a8ae" > |
