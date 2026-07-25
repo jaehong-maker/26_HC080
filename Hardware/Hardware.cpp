@@ -371,80 +371,132 @@ void sensorTaskLoop(void *parameter) {
   }
 }
 
+// --- [1시간 슬라이딩 윈도우 헬퍼 함수] ---
+void addDbToSlidingWindow(float db) {
+  dbHistory[dbHistoryIndex] = db;
+  dbHistoryIndex = (dbHistoryIndex + 1) % Config::HOURLY_BUFFER_SIZE;
+  if (dbHistoryCount < Config::HOURLY_BUFFER_SIZE) dbHistoryCount++;
+}
+
+float get1HourDbAverage() {
+  if (dbHistoryCount == 0) return 0.0f;
+  float sum = 0;
+  for (int i = 0; i < dbHistoryCount; i++) {
+    sum += dbHistory[i];
+  }
+  return sum / dbHistoryCount;
+}
+
+void resetSlidingWindow() {
+  dbHistoryCount = 0;
+  dbHistoryIndex = 0;
+  Serial.println(C_YELLOW "🔄 [1시간 슬라이딩 윈도우] 스파이크 감지로 버퍼가 리셋되었습니다." C_RESET);
+}
+
+// ===================================================================================
+// 🎙️ [플로우차트 100% 반영] 앰비언트(소음) 자동 제어 메인 루프
+// ===================================================================================
 void runAmbientMode() {
   if (isWaitingForTestDb) return; 
 
   unsigned long currentTime = millis();
+  
+  // 조건 판별
   bool isSongFinished = (digitalRead(Config::PIN_DF_BUSY) == HIGH && (currentTime - lastAmbientTime > Config::AMBIENT_COOL_DOWN));
+  bool isOneHourPassed = (last1HourCheckTime > 0 && (currentTime - last1HourCheckTime >= Config::ONE_HOUR_MS));
 
-  if (isFirstAmbientRun || isSongFinished || forceAmbientSkip) {
+  // -----------------------------------------------------------------------------------
+  // [트리거 조건]: 1) 최초 실행  2) 1시간 경과  3) 노래 종료  4) 강제 스킵(n)
+  // -----------------------------------------------------------------------------------
+  if (isFirstAmbientRun || isOneHourPassed || isSongFinished || forceAmbientSkip) {
     forceAmbientSkip = false;
-    lastAmbientTime = currentTime;
+    
+    // 1시간 타이머 갱신
+    if (isFirstAmbientRun || isOneHourPassed) {
+      last1HourCheckTime = currentTime;
+    }
 
-    myDFPlayer.stop(); delay(100);
+    // [단계 1] 무음 구간(Silence Gap) 수음: BGM을 잠시 끄고 3초간 순수 앰비언트 소음 측정
+    myDFPlayer.stop(); 
+    delay(100);
 
-    Serial.printf(C_CYAN "\r\n[Ambient Analysis] 주변 소음 패턴 분석 중...\r\n" C_RESET);
+    Serial.printf(C_CYAN "\r\n[Silence Gap] 🤫 BGM 무음 구간: 3초간 앰비언트 소음 측정 중...\r\n" C_RESET);
 
     const int sampleCount = 100;
     int dbSamples[sampleCount];
     long sumDB = 0;
     
-    // 1. 데이터 수집 및 실시간 처리
     for (int i = 0; i < sampleCount; i++) {
-      int32_t samples[64]; size_t bytes_read = 0;
+      int32_t samples[64]; 
+      size_t bytes_read = 0;
       i2s_read(I2S_PORT, &samples, sizeof(samples), &bytes_read, I2S_READ_TIMEOUT);
       
       int current_db = (bytes_read > 0) ? calculateDecibels(samples, bytes_read / sizeof(int32_t)) : 0;
-      dbSamples[i] = current_db; sumDB += current_db;
+      dbSamples[i] = current_db; 
+      sumDB += current_db;
 
       if (isRunning) runSprayLogic();
       
-      // ★ [최종 디테일] 3초간의 수음 중에도 시스템이 멈춘 것처럼 보이지 않게 처리!
-      esp_task_wdt_reset();   // 워치독 갱신 (에러 방지)
-      checkNextionInput();    // 넥션 화면 터치 즉각 반응 허용
+      esp_task_wdt_reset();
+      checkNextionInput();
       updateClockDisplay();
-
-      delay(100);
+      delay(30); // 30ms * 100 = 3초 수음
     }
 
-    // 2. 통계 데이터 계산 및 소음 성격 분류
+    // 이번 트랙 소음 통계
     float avgDB = (float)sumDB / sampleCount;
     float stdDev = calculateStdDev(dbSamples, sampleCount, avgDB);
-    String noiseType = (stdDev > 8.0) ? "불규칙적(대화/활동)" : "안정적(음악/정적)";
-    
-    // 1시간 평균 계산 (슬라이딩 윈도우, 최대 20회 누적)
-    dbHistory[dbHistoryIndex] = avgDB;
-    dbHistoryIndex = (dbHistoryIndex + 1) % 20;
-    if (dbHistoryCount < 20) dbHistoryCount++;
 
-    float db_1hr_avg = 0.0;
-    for (int j = 0; j < dbHistoryCount; j++) {
-        db_1hr_avg += dbHistory[j];
+    // 1시간 이동평균 산출 및 스파이크(±15dB or 75dB) 검사
+    float previous1HourAvg = get1HourDbAverage();
+    bool isSpike = false;
+
+    if (dbHistoryCount > 0) {
+      if (abs(avgDB - previous1HourAvg) >= 15.0f || avgDB >= 75.0f) {
+        isSpike = true;
+        Serial.printf(C_RED "🚨 [Fast-Track] 소음 스파이크 감지! (현재: %.1fdB, 1시간평균: %.1fdB)\r\n" C_RESET, avgDB, previous1HourAvg);
+        resetSlidingWindow(); // 스파이크 발생 시 1시간 버퍼 및 타이머 리셋
+        last1HourCheckTime = currentTime;
+      }
     }
-    db_1hr_avg /= dbHistoryCount;
 
-    // is_spike 계산 (15dB 이상 급변 또는 75dB 초과 시 Fast-track Flag)
-    bool is_spike = (abs(avgDB - db_1hr_avg) >= 15.0) || (avgDB > 75.0);
+    // 슬라이딩 윈도우에 현재 소음 추가
+    addDbToSlidingWindow(avgDB);
+    float current1HourAvg = get1HourDbAverage();
 
-    Serial.printf(C_GREEN "✅ 분석 완료: 평균 %.1f dB (1시간평균: %.1f dB), 편차 %.1f, Spike: %s (%s)\r\n" C_RESET, 
-                  avgDB, db_1hr_avg, stdDev, is_spike ? "True" : "False", noiseType.c_str());
+    Serial.printf(C_GREEN "📊 [소음 분석] 현재: %.1f dB | 1시간 average: %.1f dB | Spike: %s\r\n" C_RESET, 
+                  avgDB, current1HourAvg, isSpike ? "YES" : "NO");
 
-    // 3. 서버 전송
-    String payload = "{\"mode\": \"ambient\", \"db_avg\": " + String(avgDB, 1) + 
-                     ", \"db_1hr_avg\": " + String(db_1hr_avg, 1) +
-                     ", \"is_spike\": " + (is_spike ? "true" : "false") +
-                     ", \"db_stddev\": " + String(stdDev, 1) + 
-                     ", \"weights\": [" + String(weights[0], 1) + ", " + String(weights[1], 1) + 
+    // [단계 2] 서버로 소음 데이터 전송 (AWS 1-9-90 룰렛 요청)
+    String payload = "{\"mode\": \"ambient\","
+                     "\"db_avg\": " + String(avgDB, 1) + ","
+                     "\"db_1hr_avg\": " + String(current1HourAvg, 1) + ","
+                     "\"is_spike\": " + String(isSpike ? "true" : "false") + ","
+                     "\"db_stddev\": " + String(stdDev, 1) + ","
+                     "\"weights\": [" + String(weights[0], 1) + ", " + String(weights[1], 1) + 
                      ", " + String(weights[2], 1) + ", " + String(weights[3], 1) + "]}";
-    sendServerRequest(payload);
     
+    sendServerRequest(payload);
     isFirstAmbientRun = false;
 
-    // 4. 다음 곡 재생 
+    // [단계 3] 다음 BGM 트랙 연속 재생 (음악이 끊기지 않도록)
     currentAmbientTrack++;
     if (currentAmbientTrack > 20) currentAmbientTrack = 1;
     playSound(currentAmbientTrack);
     
     lastAmbientTime = millis();
+  }
+
+  // -----------------------------------------------------------------------------------
+  // [실시간 백그라운드 스파이크 감시]: BGM 재생 중에도 Fast-track 스파이크 즉시 체크
+  // -----------------------------------------------------------------------------------
+  static unsigned long lastSpikeCheck = 0;
+  if (currentTime - lastSpikeCheck > 1000) { // 1초마다 실시간 체크
+    lastSpikeCheck = currentTime;
+    float currentAvg = get1HourDbAverage();
+    if (currentAvg > 0 && (abs(currentDbLevel - currentAvg) >= 15.0f || currentDbLevel >= 75.0f)) {
+      Serial.printf(C_RED "⚡ [Instant Spike] BGM 재생 중 돌발 소음 감지(%d dB)! 즉시 재수음 진입.\r\n" C_RESET, currentDbLevel);
+      forceAmbientSkip = true; // 다음 루프에서 즉시 무음 수음 모드로 전환
+    }
   }
 }
