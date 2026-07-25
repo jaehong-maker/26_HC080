@@ -315,6 +315,7 @@ void initMicrophone() {
 }
 
 void runSoundVisualizer() {
+  if (currentMode != MODE_AMBIENT) return;
   int32_t sample = 0; size_t bytes_read = 0;
   i2s_read(I2S_PORT, &sample, sizeof(sample), &bytes_read, 0);
   if (bytes_read == 0) return;
@@ -333,6 +334,7 @@ void runSoundVisualizer() {
 }
 
 void runSoundReaction() {
+  if (currentMode != MODE_AMBIENT) return;
   int32_t samples[64]; size_t bytes_read = 0;
   i2s_read(I2S_PORT, &samples, sizeof(samples), &bytes_read, 0);
   if (bytes_read == 0) return;
@@ -347,6 +349,7 @@ void runSoundReaction() {
 }
 
 void checkBackgroundNoise() {
+  if (currentMode != MODE_AMBIENT) return;
   int32_t samples[32]; size_t bytes_read = 0;
   i2s_read(I2S_PORT, &samples, sizeof(samples), &bytes_read, 0);
   if (bytes_read == 0) return;
@@ -368,104 +371,76 @@ void sensorTaskLoop(void *parameter) {
   }
 }
 
-// --- [추가] 1시간 슬라이딩 윈도우 관리 헬퍼 함수들 ---
-void addDbToSlidingWindow(float db) {
-  hourlyDbBuffer[hourlyDbIndex] = db;
-  hourlyDbIndex = (hourlyDbIndex + 1) % Config::HOURLY_BUFFER_SIZE;
-  if (hourlyDbCount < Config::HOURLY_BUFFER_SIZE) hourlyDbCount++;
-}
-
-float get1HourDbAverage() {
-  if (hourlyDbCount == 0) return 0.0f;
-  float sum = 0;
-  for (int i = 0; i < hourlyDbCount; i++) {
-    sum += hourlyDbBuffer[i];
-  }
-  return sum / hourlyDbCount;
-}
-
-void resetSlidingWindow() {
-  hourlyDbCount = 0;
-  hourlyDbIndex = 0;
-  Serial.println(C_YELLOW "🔄 [1시간 슬라이딩 윈도우] 버퍼가 리셋되었습니다." C_RESET);
-}
-
-// --- [개편된 runAmbientMode] ---
 void runAmbientMode() {
   if (isWaitingForTestDb) return; 
 
   unsigned long currentTime = millis();
-  
-  // ① [규칙 ①] 곡 간 무음 구간(Silence Gap) 및 BGM 종료 감지
   bool isSongFinished = (digitalRead(Config::PIN_DF_BUSY) == HIGH && (currentTime - lastAmbientTime > Config::AMBIENT_COOL_DOWN));
 
   if (isFirstAmbientRun || isSongFinished || forceAmbientSkip) {
     forceAmbientSkip = false;
     lastAmbientTime = currentTime;
 
-    // 음악 정지 (무음 구간 확보 -> Self-Noise 원천 차단)
-    myDFPlayer.stop(); 
-    delay(100);
+    myDFPlayer.stop(); delay(100);
 
-    Serial.printf(C_CYAN "\r\n[Silence Gap] 🤫 BGM 무음 구간: 3초간 앰비언트 소음 수음 중...\r\n" C_RESET);
+    Serial.printf(C_CYAN "\r\n[Ambient Analysis] 주변 소음 패턴 분석 중...\r\n" C_RESET);
 
-    // 3초간 (100회) pure 앰비언트 소음 measurement
     const int sampleCount = 100;
     int dbSamples[sampleCount];
     long sumDB = 0;
     
+    // 1. 데이터 수집 및 실시간 처리
     for (int i = 0; i < sampleCount; i++) {
       int32_t samples[64]; size_t bytes_read = 0;
       i2s_read(I2S_PORT, &samples, sizeof(samples), &bytes_read, I2S_READ_TIMEOUT);
       
       int current_db = (bytes_read > 0) ? calculateDecibels(samples, bytes_read / sizeof(int32_t)) : 0;
-      dbSamples[i] = current_db; 
-      sumDB += current_db;
+      dbSamples[i] = current_db; sumDB += current_db;
 
       if (isRunning) runSprayLogic();
       
-      esp_task_wdt_reset();
-      checkNextionInput();
+      // ★ [최종 디테일] 3초간의 수음 중에도 시스템이 멈춘 것처럼 보이지 않게 처리!
+      esp_task_wdt_reset();   // 워치독 갱신 (에러 방지)
+      checkNextionInput();    // 넥션 화면 터치 즉각 반응 허용
       updateClockDisplay();
-      delay(30); // 30ms * 100 = 3초
+
+      delay(100);
     }
 
-    float currentTrackAvgDb = (float)sumDB / sampleCount;
-    float stdDev = calculateStdDev(dbSamples, sampleCount, currentTrackAvgDb);
+    // 2. 통계 데이터 계산 및 소음 성격 분류
+    float avgDB = (float)sumDB / sampleCount;
+    float stdDev = calculateStdDev(dbSamples, sampleCount, avgDB);
+    String noiseType = (stdDev > 8.0) ? "불규칙적(대화/활동)" : "안정적(음악/정적)";
+    
+    // 1시간 평균 계산 (슬라이딩 윈도우, 최대 20회 누적)
+    dbHistory[dbHistoryIndex] = avgDB;
+    dbHistoryIndex = (dbHistoryIndex + 1) % 20;
+    if (dbHistoryCount < 20) dbHistoryCount++;
 
-    // ③ [규칙 ③] 1시간 슬라이딩 윈도우 평균 계산 (이전 평균값)
-    float previous1HourAvg = get1HourDbAverage();
-    bool isSpike = false;
-
-    // ④ [규칙 ④] 동적 임계값 패스트 트랙 (±15dB 스파이크 OR 75dB 초과)
-    if (hourlyDbCount > 0) { // 기존 누적 데이터가 있을 때만 스파이크 판단
-      if (abs(currentTrackAvgDb - previous1HourAvg) >= 15.0f || currentTrackAvgDb >= 75.0f) {
-        isSpike = true;
-        Serial.printf(C_RED "🚨 [Fast-Track Spiked!] 현재: %.1fdB, 1시간평균: %.1fdB (스파이크 발생!)\r\n" C_RESET, currentTrackAvgDb, previous1HourAvg);
-        resetSlidingWindow(); // 1시간 버퍼 타이머/데이터 리셋 (Spike Reset)
-      }
+    float db_1hr_avg = 0.0;
+    for (int j = 0; j < dbHistoryCount; j++) {
+        db_1hr_avg += dbHistory[j];
     }
+    db_1hr_avg /= dbHistoryCount;
 
-    // Current dB를 1시간 슬라이딩 윈도우에 추가
-    addDbToSlidingWindow(currentTrackAvgDb);
-    float current1HourAvg = get1HourDbAverage();
+    // is_spike 계산 (15dB 이상 급변 또는 75dB 초과 시 Fast-track Flag)
+    bool is_spike = (abs(avgDB - db_1hr_avg) >= 15.0) || (avgDB > 75.0);
 
-    Serial.printf(C_GREEN "📊 [소음 분석] 이번 track 평균: %.1f dB | 1시간 이동평균: %.1f dB | Fast-Track: %s\r\n" C_RESET, 
-                  currentTrackAvgDb, current1HourAvg, isSpike ? "YES" : "NO");
+    Serial.printf(C_GREEN "✅ 분석 완료: 평균 %.1f dB (1시간평균: %.1f dB), 편차 %.1f, Spike: %s (%s)\r\n" C_RESET, 
+                  avgDB, db_1hr_avg, stdDev, is_spike ? "True" : "False", noiseType.c_str());
 
-    // ② [규칙 ②] 서버(AWS)로 비동기 데이터 전송 (UI/LED는 즉시 반응, 모터/LLM은 보류)
-    String payload = "{\"mode\": \"ambient\","
-                     "\"db_avg\": " + String(currentTrackAvgDb, 1) + ","
-                     "\"db_1hr_avg\": " + String(current1HourAvg, 1) + ","
-                     "\"is_spike\": " + String(isSpike ? "true" : "false") + ","
-                     "\"db_stddev\": " + String(stdDev, 1) + ","
-                     "\"weights\": [" + String(weights[0], 1) + ", " + String(weights[1], 1) + 
+    // 3. 서버 전송
+    String payload = "{\"mode\": \"ambient\", \"db_avg\": " + String(avgDB, 1) + 
+                     ", \"db_1hr_avg\": " + String(db_1hr_avg, 1) +
+                     ", \"is_spike\": " + (is_spike ? "true" : "false") +
+                     ", \"db_stddev\": " + String(stdDev, 1) + 
+                     ", \"weights\": [" + String(weights[0], 1) + ", " + String(weights[1], 1) + 
                      ", " + String(weights[2], 1) + ", " + String(weights[3], 1) + "]}";
     sendServerRequest(payload);
     
     isFirstAmbientRun = false;
 
-    // BGM 다음 곡 재생
+    // 4. 다음 곡 재생 
     currentAmbientTrack++;
     if (currentAmbientTrack > 20) currentAmbientTrack = 1;
     playSound(currentAmbientTrack);
