@@ -61,7 +61,7 @@ const int NEXTION_RX_PIN = 16;
 #define I2S_READ_TIMEOUT (100 / portTICK_PERIOD_MS)
 #define SAMPLE_RATE 16000
 #define RECORD_TIME 2
-#define CLEANING_INTERVAL 86400000 // <--- ★ 여기에 딱 한 줄 추가!
+#define CLEANING_INTERVAL 86400000
 
 namespace Config {
     const int SPRAY_PINS[4] = {27, 14, 13, 4}; 
@@ -70,10 +70,10 @@ namespace Config {
     const float EMPTY_WEIGHT = 19.8f;
     const unsigned long AMBIENT_COOL_DOWN = 5000; 
 
-    // ★ [플로우차트 반영] 15분 잔향 소거 쿨타임 (테스트 시 30000ms = 30초로 변경 가능)
+    // 15분 잔향 소거 쿨타임 (테스트 시 30000ms = 30초로 변경 가능)
     const unsigned long SCENT_PURGE_COOLTIME = 15 * 60 * 1000; 
     
-    // ★ [플로우차트 반영] 1시간 (3600000ms) 거시적 분위기 갱신 주기
+    // 1시간 (3600000ms) 거시적 분위기 갱신 주기
     const unsigned long ONE_HOUR_MS = 60 * 60 * 1000; 
 
     // 1시간 슬라이딩 윈도우 크기 (3~4분 1곡 기준, 1시간 = 20개 샘플)
@@ -99,7 +99,7 @@ enum SystemMode {
   MODE_WEATHER,   // 2
   MODE_SETTING,   // 3
   MODE_DEMO,      // 4
-  MODE_VOICE,     // 5  <--- ★ 이 줄을 다시 추가해 주세요!
+  MODE_VOICE,     // 5
   MODE_VISUAL,    // 6
   MODE_REACTIVE,  // 7
   MODE_DASHBOARD, // 8
@@ -192,14 +192,20 @@ extern String lastWeatherRegion;
 extern int lastWeatherIconId;
 extern String lastWeatherLabel;
 
-// 타이머 및 스케줄러
+// 타이머 및 스케줄러 & 음악 플레이리스트
 extern unsigned long lastNozzleSprayTime[4]; 
 extern bool schedulerEnabled;
 extern int activeStartHour;  
 extern int activeEndHour;    
 extern unsigned long lastPollTime;
 extern const unsigned long POLL_INTERVAL;
-extern int musicMapping[4]; // <--- ★ 여기에 한 줄 추가!
+extern int musicMapping[4];
+
+// ★ [추가] 슬롯별 플레이리스트 및 바통 터치 전역 변수
+extern String slotPlaylists[4];
+extern int currentSlotTracks[10];
+extern int currentSlotTracksCount;
+extern int currentPlaylistIdx;
 
 // 오디오 및 앰비언트 모드
 extern int soundThreshold;
@@ -209,7 +215,7 @@ extern int ambientCycleCount;
 extern int ambientCycleStorage[5];
 extern bool isFirstAmbientRun;
 extern int lastAmbientScent;
-extern int targetAmbientScent;        // ★ 서버에서 새로 추천받은 향
+extern int targetAmbientScent;
 extern bool isWaitingForTestDb;
 extern unsigned long lastAmbientTime;
 extern int currentAmbientTrack;
@@ -217,8 +223,8 @@ extern bool forceAmbientSkip;
 extern float dbHistory[20];
 extern int dbHistoryIndex;
 extern int dbHistoryCount;
-extern unsigned long lastScentChangeTime; // 마지막 향 교체/피드백 시작 시간
-extern unsigned long last1HourCheckTime;   // 1시간 타이머 기준점
+extern unsigned long lastScentChangeTime;
+extern unsigned long last1HourCheckTime;
 
 // 기타 (데모, 터미널)
 extern String lastWebMessage;
@@ -241,10 +247,10 @@ void checkSensorHealth();
 void runScheduler(); 
 void runAutoCleaning(); 
 void resetScaleZero();
-float calculateScentPercent(float currentWeight); // <--- void를 float으로 변경!
+float calculateScentPercent(float currentWeight);
 void SprayIntensity(int intensityVal);
-String getTrackName(int trackNum); // <--- 추가
-void updateMusicMapping(String data); // <--- 추가
+String getTrackName(int trackNum);
+void updateMusicMapping(String data);
 
 // 📄 Hardware.cpp
 void initMicrophone();
@@ -259,7 +265,7 @@ void playSound(int trackNum);
 void bootAnimation();
 void systemHeartbeat();
 void monitorWeight();
-void resetWeightFilters(); // 이 줄을 추가하세요!
+void resetWeightFilters();
 void printCalibrationInfo();
 void runAmbientMode();
 void setLedColor(uint8_t r, uint8_t g, uint8_t b);
@@ -275,9 +281,7 @@ void rememberWeatherRegion(const String &region);
 String buildWeatherRequestPayload(const String &region);
 void handleWebClient();
 void autoWeatherScheduler();
-// 음성 인식 관련 기능 제거됨
 void checkNextionInput();
-void clearNextionInputBuffer();
 void clearNextionInputBuffer();
 void handleNextionCmd(const String &cmd);
 void nexSend(const String &cmd);
