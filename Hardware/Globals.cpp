@@ -52,7 +52,7 @@ uint8_t ledB = 255;
 int ledBrightness = 150;
 bool ledEnabled = true;
 
-LedMode ledEffect = LED_SOLID; // <--- ★ 이 줄을 추가해 주세요! ★
+LedMode ledEffect = LED_SOLID;
 
 // --- 향수 및 무게 데이터 ---
 float weights[4] = {0.0, 0.0, 0.0, 0.0};
@@ -74,14 +74,20 @@ String lastWeatherRegion = "";
 int lastWeatherIconId = 0;
 String lastWeatherLabel = "";
 
-// --- 타이머 및 스케줄러 ---
+// --- 타이머 및 스케줄러 & 음악 플레이리스트 ---
 unsigned long lastNozzleSprayTime[4] = {0, 0, 0, 0};
 bool schedulerEnabled = true;
 int activeStartHour   = 8; 
 int activeEndHour     = 23;
 unsigned long lastPollTime = 0;
 const unsigned long POLL_INTERVAL = 2000;
-int musicMapping[4] = {1, 6, 11, 16}; // 기본값 (1, 6, 11, 16번 곡)
+int musicMapping[4] = {1, 6, 11, 16}; // 기본값
+
+// ★ [추가] 슬롯별 플레이리스트 및 바통 터치 변수 정의
+String slotPlaylists[4] = {"1,2,3", "6,7,8", "11,12,13", "16,17,18"};
+int currentSlotTracks[10] = {1, 2, 3, 0};
+int currentSlotTracksCount = 3;
+int currentPlaylistIdx = 0;
 
 // 🎵 곡 제목 데이터베이스 (모바일 앱의 TRACKS와 일치)
 const char* TRACK_NAMES[] = {
@@ -126,7 +132,7 @@ int ambientCycleCount = 0;
 int ambientCycleStorage[5] = {0, 0, 0, 0, 0};
 bool isFirstAmbientRun = true;
 int lastAmbientScent = 0;
-int targetAmbientScent = 0; // ★ 추가
+int targetAmbientScent = 0;
 bool isWaitingForTestDb = false;
 unsigned long lastAmbientTime = 0;    
 int currentAmbientTrack = 0;
