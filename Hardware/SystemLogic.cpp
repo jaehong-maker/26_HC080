@@ -480,8 +480,7 @@ void handleInput(String input) {
   else if (currentMode == MODE_WEATHER) {
     rememberWeatherRegion(input);
     Serial.printf("\r\n🔍 [%s] 지역 날씨 조회 요청 중...\r\n", input.c_str());
-    lastWeatherCallMillis = millis();
-    sendServerRequest(buildWeatherRequestPayload(lastWeatherRegion));
+    requestWeatherRefresh(lastWeatherRegion);
   }
 }
 
@@ -493,8 +492,7 @@ void enterWeatherMode(bool runNow) {
     Serial.printf(C_YELLOW "\r\n[Weather] Saved region: %s\r\n" C_RESET, lastWeatherRegion.c_str());
   }
   if (runNow) {
-    lastWeatherCallMillis = millis();
-    sendServerRequest(buildWeatherRequestPayload(""));
+    requestWeatherRefresh("");
   }
 }
 
@@ -505,26 +503,33 @@ void runSprayLogic() {
   updateClockDisplay();
   if (!isRunning) return;
 
-  // 🎵 일반/수동 모드 플레이리스트 연속 재생 검사 (최소 3초 재생 후 감지)
+  // ★ 1. 동료분의 쿨다운 아이디어 추가
+  static unsigned long lastTrackChangeTime = 0;
+
+  // 🎵 일반/수동 모드 플레이리스트 연속 재생 검사
   if (currentMode != MODE_AMBIENT && millis() - startTimeMillis > 3000) {
-    // 재생 중인 음악이 끝났는지 확인 (DFPlayer BUSY 핀 HIGH 확인)
-    if (digitalRead(Config::PIN_BUSY) == HIGH) {
-      currentPlaylistIdx++;
-      if (currentPlaylistIdx >= currentSlotTracksCount) {
-        currentPlaylistIdx = 0; // 마지막 곡 완료 시 첫 곡으로 순환 (무한 루프)
-      }
-
-      int nextTrack = currentSlotTracks[currentPlaylistIdx];
-      startTimeMillis = millis(); // 다음 곡 기준 타임스탬프 리셋
-
-      // ★ 스피커 직접 명령 (중복 방지 필터에 막히지 않고 즉시 100% 재생)
-      myDFPlayer.stop();
-      delay(100);
-      myDFPlayer.playMp3Folder(nextTrack);
+    
+    // ★ 2. 트랙 변경 후 최소 0.5초(500ms)가 지나야만 BUSY 핀 검사
+    if (millis() - lastTrackChangeTime > 500) {
       
-      Serial.printf(C_GREEN "\r\n🎵 [Playlist] 다음 곡 연속 재생 (%d/%d번째 곡): %d번 트랙 (%s)\r\n" C_RESET, 
-                    currentPlaylistIdx + 1, currentSlotTracksCount, nextTrack, getTrackName(nextTrack).c_str());
-      return;
+      // ★ 3. Config:: 삭제 완료 (컴파일 에러 해결)
+      if (digitalRead(PIN_BUSY) == HIGH) { 
+        currentPlaylistIdx++;
+        if (currentPlaylistIdx >= currentSlotTracksCount) {
+          currentPlaylistIdx = 0; 
+        }
+
+        int nextTrack = currentSlotTracks[currentPlaylistIdx];
+        lastTrackChangeTime = millis(); // 타이머 리셋
+
+        myDFPlayer.stop();
+        delay(100);
+        myDFPlayer.playMp3Folder(nextTrack);
+        
+        Serial.printf(C_GREEN "\r\n🎵 [Playlist] 다음 곡 연속 재생 (%d/%d번째 곡): %d번 트랙 (%s)\r\n" C_RESET, 
+                      currentPlaylistIdx + 1, currentSlotTracksCount, nextTrack, getTrackName(nextTrack).c_str());
+        return;
+      }
     }
   }
 
@@ -730,7 +735,6 @@ int parseAndSetNozzles(String cmdStr) {
     return activeCount;
 }
 
-// 📄 [SystemLogic.cpp] triggerSpray 함수 전체 교체
 void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
   static int lastActiveCmd = -1;
   bool isAlreadyRunningSameCmd = (isRunning && lastActiveCmd == cmd);
@@ -787,51 +791,45 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
   }
   
   // 🎵 오직 서버에서 내려준 음악 데이터만 믿고 재생하는 깔끔한 로직
-  if (currentMode != MODE_AMBIENT) {
+  if (currentMode != MODE_AMBIENT && cmd >= 1 && cmd <= 34) {
     if (!isAlreadyRunningSameCmd) {
       currentSlotTracksCount = 0;
       currentPlaylistIdx = 0;
       startTimeMillis = millis();
 
-      // [우선순위 1] 서버가 이번 명령에 특정 단일 트랙(music)을 명시적으로 보냈다면 그걸 최우선으로 틉니다.
-      if (music > 0) {
-        currentSlotTracks[0] = music;
-        currentSlotTracksCount = 1;
-      } 
-      else {
-        // [우선순위 2] 단일 트랙 명시가 없다면, 서버가 갱신해둔 해당 카트리지의 플레이리스트(slotPlaylists)를 읽어옵니다.
-        for (int i = 0; i < cmdStr.length(); i++) {
-          int cart = cmdStr.charAt(i) - '0';
-          if (cart >= 1 && cart <= 4) {
-            String rawSlotStr = slotPlaylists[cart - 1];
-            rawSlotStr.trim();
-            if (rawSlotStr.length() > 0 && rawSlotStr != "0") {
-              int start = 0;
-              while (currentSlotTracksCount < 10) {
-                int comma = rawSlotStr.indexOf(',', start);
-                String numStr = (comma == -1) ? rawSlotStr.substring(start) : rawSlotStr.substring(start, comma);
-                numStr.trim();
-                int trackNum = numStr.toInt();
-                if (trackNum > 0) currentSlotTracks[currentSlotTracksCount++] = trackNum;
-                if (comma == -1) break;
-                start = comma + 1;
-              }
+      // ★ [우선순위 1] 단독 재생 로직(아이묭 버그 원인) 삭제! 무조건 플레이리스트를 파싱하도록 변경
+      // [우선순위 2] 서버가 갱신해둔 해당 카트리지의 플레이리스트(slotPlaylists)를 읽어옵니다.
+      for (int i = 0; i < cmdStr.length(); i++) {
+        int cart = cmdStr.charAt(i) - '0';
+        if (cart >= 1 && cart <= 4) {
+          String rawSlotStr = slotPlaylists[cart - 1];
+          rawSlotStr.trim();
+          if (rawSlotStr.length() > 0 && rawSlotStr != "0") {
+            int start = 0;
+            while (currentSlotTracksCount < 10) {
+              int comma = rawSlotStr.indexOf(',', start);
+              String numStr = (comma == -1) ? rawSlotStr.substring(start) : rawSlotStr.substring(start, comma);
+              numStr.trim();
+              int trackNum = numStr.toInt();
+              if (trackNum > 0) currentSlotTracks[currentSlotTracksCount++] = trackNum;
+              if (comma == -1) break;
+              start = comma + 1;
             }
           }
         }
-
-        // [우선순위 3] 서버에서 받은 배열마저 비어있다면 최후의 보루로 매핑된 기본 대표곡을 틉니다. (1번 고정 등 꼼수 삭제)
-        if (currentSlotTracksCount == 0) {
-          int primaryCart = (cmdStr.length() > 0) ? (cmdStr.charAt(0) - '0') : 1;
-          if (primaryCart >= 1 && primaryCart <= 4) {
-            currentSlotTracks[0] = musicMapping[primaryCart - 1];
-          } else {
-            currentSlotTracks[0] = 1; // 서버/매핑 모두 실패했을 때 에러 방지용 최소값
-          }
-          currentSlotTracksCount = 1;
-        }
       }
 
+      // [우선순위 3] 서버에서 받은 배열마저 비어있다면 최후의 보루로 매핑된 기본 대표곡을 틉니다.
+      if (currentSlotTracksCount == 0) {
+        int primaryCart = (cmdStr.length() > 0) ? (cmdStr.charAt(0) - '0') : 1;
+        if (primaryCart >= 1 && primaryCart <= 4) {
+          currentSlotTracks[0] = musicMapping[primaryCart - 1];
+        } else {
+          currentSlotTracks[0] = 1; 
+        }
+        currentSlotTracksCount = 1;
+      }
+      
       // 서버가 결정한 최종 트랙 번호를 군말 없이 스피커 모듈로 넘깁니다.
       playSound(currentSlotTracks[0]);
       Serial.printf(C_GREEN "[Audio] 서버 데이터 기준 재생 시작 (총 %d곡 대기): %d번 트랙 (%s)\r\n" C_RESET, 
