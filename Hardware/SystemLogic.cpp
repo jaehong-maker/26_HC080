@@ -75,7 +75,7 @@ void runAutoCleaning() {
   }
 }
 
-// --- 시스템 초기화 ---
+// 📄 [SystemLogic.cpp] initSystem 함수 전체 교체
 void initSystem() {
   inputBuffer.reserve(64);
   lastWebMessage.reserve(128);
@@ -104,11 +104,10 @@ void initSystem() {
   pinMode(PIN_SUNNY, OUTPUT); pinMode(PIN_CLOUDY, OUTPUT);
   pinMode(PIN_RAIN, OUTPUT); pinMode(PIN_SNOW, OUTPUT); pinMode(PIN_LED, OUTPUT);
   
-  // ★ [핵심 수정] BUSY 핀을 INPUT_PULLUP으로 설정하여 Floating 현상 방지!
   pinMode(PIN_BUSY, INPUT_PULLUP);
   forceAllOff();
 
-  Serial.printf(C_BOLD "\r\n 🚀 SMART DIFFUSER V12.7.0 (REFACTORED ARCHITECTURE) \r\n" C_RESET);
+  Serial.printf(C_BOLD "\r\n 🚀 SMART DIFFUSER V12.7.0 (CLEAN SERVER SYNC) \r\n" C_RESET);
 
   mySoftwareSerial.begin(9600, SERIAL_8N1, DFPLAYER_RX_PIN, DFPLAYER_TX_PIN);
   
@@ -137,7 +136,8 @@ void initSystem() {
   }
   myDFPlayer.volume(currentVolume);
 
-  String savedMusic = prefs.getString("music_tracks", "1_6_11_16");
+  // ★ 펌웨어의 강제 개입 없이, 오직 서버에서 마지막으로 준 음악 데이터만 로드합니다.
+  String savedMusic = prefs.getString("music_tracks", "1,6,11,16");
   updateMusicMapping(savedMusic);
 
   SprayIntensity(prefs.getInt("intensity", currentIntensity));
@@ -508,15 +508,19 @@ void runSprayLogic() {
   // 🎵 일반/수동 모드 플레이리스트 연속 재생 검사 (최소 3초 재생 후 감지)
   if (currentMode != MODE_AMBIENT && millis() - startTimeMillis > 3000) {
     // 재생 중인 음악이 끝났는지 확인 (DFPlayer BUSY 핀 HIGH 확인)
-    if (digitalRead(Config::PIN_DF_BUSY) == HIGH) {
+    if (digitalRead(Config::PIN_BUSY) == HIGH) {
       currentPlaylistIdx++;
       if (currentPlaylistIdx >= currentSlotTracksCount) {
-        currentPlaylistIdx = 0; // 마지막 곡 완료 시 첫 곡으로 순환
+        currentPlaylistIdx = 0; // 마지막 곡 완료 시 첫 곡으로 순환 (무한 루프)
       }
 
       int nextTrack = currentSlotTracks[currentPlaylistIdx];
-      startTimeMillis = millis(); // 다음 곡 재생 시작 시점 타임스탬프 갱신
-      playSound(nextTrack);
+      startTimeMillis = millis(); // 다음 곡 기준 타임스탬프 리셋
+
+      // ★ 스피커 직접 명령 (중복 방지 필터에 막히지 않고 즉시 100% 재생)
+      myDFPlayer.stop();
+      delay(100);
+      myDFPlayer.playMp3Folder(nextTrack);
       
       Serial.printf(C_GREEN "\r\n🎵 [Playlist] 다음 곡 연속 재생 (%d/%d번째 곡): %d번 트랙 (%s)\r\n" C_RESET, 
                     currentPlaylistIdx + 1, currentSlotTracksCount, nextTrack, getTrackName(nextTrack).c_str());
@@ -726,8 +730,8 @@ int parseAndSetNozzles(String cmdStr) {
     return activeCount;
 }
 
+// 📄 [SystemLogic.cpp] triggerSpray 함수 전체 교체
 void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
-  // 동일 명령으로 이미 실행 중인지 확인 (서버 폴링 시 노래 순서 리셋 방지)
   static int lastActiveCmd = -1;
   bool isAlreadyRunningSameCmd = (isRunning && lastActiveCmd == cmd);
   lastActiveCmd = cmd;
@@ -782,42 +786,55 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
     }
   }
   
-  // 🎵 플레이리스트 다중 곡 파싱 로직 (신규 작동일 때만 0번 곡부터 시작)
+  // 🎵 오직 서버에서 내려준 음악 데이터만 믿고 재생하는 깔끔한 로직
   if (currentMode != MODE_AMBIENT) {
     if (!isAlreadyRunningSameCmd) {
       currentSlotTracksCount = 0;
       currentPlaylistIdx = 0;
       startTimeMillis = millis();
 
-      if (cmd >= 1 && cmd <= 4) {
-        String rawSlotStr = slotPlaylists[cmd - 1];
-        rawSlotStr.trim();
-        if (rawSlotStr.length() > 0 && rawSlotStr != "0") {
-          int start = 0;
-          while (currentSlotTracksCount < 10) {
-            int comma = rawSlotStr.indexOf(',', start);
-            String numStr = (comma == -1) ? rawSlotStr.substring(start) : rawSlotStr.substring(start, comma);
-            numStr.trim();
-            int trackNum = numStr.toInt();
-            if (trackNum > 0) currentSlotTracks[currentSlotTracksCount++] = trackNum;
-            if (comma == -1) break;
-            start = comma + 1;
+      // [우선순위 1] 서버가 이번 명령에 특정 단일 트랙(music)을 명시적으로 보냈다면 그걸 최우선으로 틉니다.
+      if (music > 0) {
+        currentSlotTracks[0] = music;
+        currentSlotTracksCount = 1;
+      } 
+      else {
+        // [우선순위 2] 단일 트랙 명시가 없다면, 서버가 갱신해둔 해당 카트리지의 플레이리스트(slotPlaylists)를 읽어옵니다.
+        for (int i = 0; i < cmdStr.length(); i++) {
+          int cart = cmdStr.charAt(i) - '0';
+          if (cart >= 1 && cart <= 4) {
+            String rawSlotStr = slotPlaylists[cart - 1];
+            rawSlotStr.trim();
+            if (rawSlotStr.length() > 0 && rawSlotStr != "0") {
+              int start = 0;
+              while (currentSlotTracksCount < 10) {
+                int comma = rawSlotStr.indexOf(',', start);
+                String numStr = (comma == -1) ? rawSlotStr.substring(start) : rawSlotStr.substring(start, comma);
+                numStr.trim();
+                int trackNum = numStr.toInt();
+                if (trackNum > 0) currentSlotTracks[currentSlotTracksCount++] = trackNum;
+                if (comma == -1) break;
+                start = comma + 1;
+              }
+            }
           }
+        }
+
+        // [우선순위 3] 서버에서 받은 배열마저 비어있다면 최후의 보루로 매핑된 기본 대표곡을 틉니다. (1번 고정 등 꼼수 삭제)
+        if (currentSlotTracksCount == 0) {
+          int primaryCart = (cmdStr.length() > 0) ? (cmdStr.charAt(0) - '0') : 1;
+          if (primaryCart >= 1 && primaryCart <= 4) {
+            currentSlotTracks[0] = musicMapping[primaryCart - 1];
+          } else {
+            currentSlotTracks[0] = 1; // 서버/매핑 모두 실패했을 때 에러 방지용 최소값
+          }
+          currentSlotTracksCount = 1;
         }
       }
 
-      if (currentSlotTracksCount == 0 && music > 0 && music <= 25) {
-        currentSlotTracks[0] = music;
-        currentSlotTracksCount = 1;
-      }
-
-      if (currentSlotTracksCount == 0) {
-        currentSlotTracks[0] = 1;
-        currentSlotTracksCount = 1;
-      }
-
+      // 서버가 결정한 최종 트랙 번호를 군말 없이 스피커 모듈로 넘깁니다.
       playSound(currentSlotTracks[0]);
-      Serial.printf(C_GREEN "[Audio] 플레이리스트 재생 시작 (총 %d곡 등록됨): %d번 트랙 (%s)\r\n" C_RESET, 
+      Serial.printf(C_GREEN "[Audio] 서버 데이터 기준 재생 시작 (총 %d곡 대기): %d번 트랙 (%s)\r\n" C_RESET, 
                     currentSlotTracksCount, currentSlotTracks[0], getTrackName(currentSlotTracks[0]).c_str());
     }
   }
@@ -844,15 +861,10 @@ void updateMusicMapping(String data) {
         int end = data.indexOf('_', start);
         String slotStr = (end == -1) ? data.substring(start) : data.substring(start, end);
         slotStr.trim();
-        
-        // 단일 트랙 문자열 수신 시 연속 재생 테스트를 위해 기본 플레이리스트로 자동 확장
-        if (slotStr == "1") slotStr = "1,2,3";
-        else if (slotStr == "6") slotStr = "6,7,8";
-        else if (slotStr == "11") slotStr = "11,12,13";
-        else if (slotStr == "16") slotStr = "16,17,18";
 
+        // 앱에서 전달받은 다중 트랙 문자열("22,23,24" 등)을 변형 없이 그대로 저장
         slotPlaylists[idx] = slotStr; 
-        musicMapping[idx] = slotStr.toInt();
+        musicMapping[idx] = slotStr.toInt(); // 대표곡 번호
         
         if (end == -1) break;
         start = end + 1;
