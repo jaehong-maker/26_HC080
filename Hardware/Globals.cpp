@@ -83,8 +83,7 @@ unsigned long lastPollTime = 0;
 const unsigned long POLL_INTERVAL = 2000;
 int musicMapping[4] = {1, 6, 11, 26}; // 기본값
 
-// ★ [추가] 슬롯별 플레이리스트 및 바통 터치 변수 정의
-String slotPlaylists[4] = {"1,2,3", "6,7,8", "11,12,13", "26"};
+String slotPlaylists[4] = {"1,2,3", "6,7,8", "11,12,13", "26,8,1,2"};
 int currentSlotTracks[10] = {26,0};
 int currentSlotTracksCount = 1;
 int currentPlaylistIdx = 0;
