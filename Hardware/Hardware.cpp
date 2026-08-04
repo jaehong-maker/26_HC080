@@ -266,13 +266,13 @@ void printCalibrationInfo() {
 // [5] 오디오 (마이크 수음, 스피커 및 앰비언트 분석)
 // ===================================================================================
 
+// 📄 [Hardware.cpp] playSound 함수 전체 교체
 void playSound(int trackNum) {
-  int safeTrack = constrain(trackNum, 1, 25);
+  // 곡 번호가 0 이하일 때만 1번으로 보정하고 상한선 제한은 제거
+  int safeTrack = (trackNum > 0) ? trackNum : 1;
   int safeVolume = constrain(currentVolume, 0, 30);
 
   // --- [오버랩 방지 로직] ---
-  // 네트워크 지연/폴링 겹침으로 인해 동일한 곡의 재생 명령이 매우 짧은 시간 내에
-  // 중복 도착했을 때, 노래가 멈추고 처음부터 다시 재생(끊김)되는 현상을 막습니다.
   static int lastPlayedTrack = -1;
   static unsigned long lastPlayTime = 0;
   if (safeTrack == lastPlayedTrack && millis() - lastPlayTime < 3500) {
@@ -290,7 +290,9 @@ void playSound(int trackNum) {
   delay(120);
   myDFPlayer.volume(safeVolume);
   delay(30);
-  myDFPlayer.play(safeTrack);
+  
+  // ★ MP3 폴더 지정 재생(playMp3Folder)으로 변경하여 26번(0026.MP3)을 정확히 재생
+  myDFPlayer.playMp3Folder(safeTrack);
 }
 
 void initMicrophone() {
@@ -399,7 +401,7 @@ void runAmbientMode() {
   unsigned long currentTime = millis();
   
   // ★ [수정] BUSY 핀 HIGH(노래 끝남) 감지 로직 안정화
-  bool isSongFinished = (digitalRead(Config::PIN_DF_BUSY) == HIGH && (currentTime - lastAmbientTime > 3000));
+  bool isSongFinished = (digitalRead(Config::PIN_BUSY) == HIGH && (currentTime - lastAmbientTime > 3000));
   bool isOneHourPassed = (last1HourCheckTime > 0 && (currentTime - last1HourCheckTime >= Config::ONE_HOUR_MS));
 
   // -----------------------------------------------------------------------------------
