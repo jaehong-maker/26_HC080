@@ -42,6 +42,8 @@ const int LOADCELL_SCK[4] = {33, 33, 33, 33};
 // DFPlayer (오디오 스피커)
 const int DFPLAYER_RX_PIN = 25; 
 const int DFPLAYER_TX_PIN = 26;
+const int PIN_BUSY = 21;
+
 
 // Nextion (디스플레이)
 const int NEXTION_TX_PIN = 17;  
@@ -66,7 +68,6 @@ const int NEXTION_RX_PIN = 16;
 namespace Config {
     const int SPRAY_PINS[4] = {27, 14, 13, 4}; 
     const int PIN_LED = 2;
-    const int PIN_DF_BUSY = 21;
     const float EMPTY_WEIGHT = 19.8f;
     const unsigned long AMBIENT_COOL_DOWN = 5000; 
 
@@ -304,8 +305,6 @@ void initOTA();
 void handleOTA();
 int getPinFromCommand(int cmd);
 void networkTaskLoop(void *pvParameters);
-
-#define PIN_BUSY 21
 
 int parseAndSetNozzles(String cmdStr);
 void handleInput(String input);
