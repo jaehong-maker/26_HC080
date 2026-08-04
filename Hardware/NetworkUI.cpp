@@ -40,6 +40,8 @@ static int currentDisplayPage = PAGE_WEATHER_OFF;
 static bool offlineModeActive = false;
 static unsigned long lastLocalSettingsMillis = 0;
 static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 30000;
+static unsigned long lastLocalStopMillis = 0;
+static const unsigned long WEATHER_RESPONSE_IGNORE_AFTER_STOP_MS = 15000;
 
 static String pendingManualScent = "";
 static unsigned long lastScentTouchTime = 0;
@@ -238,6 +240,34 @@ static void syncLocalVolumeToServer(int displayLevel) {
 
 static bool isLedColorOff(uint8_t r, uint8_t g, uint8_t b) {
   return r == 0 && g == 0 && b == 0;
+}
+
+static bool isServerStopCommand(int cmd, const String &resultText, const String &serverActiveMode) {
+  if (cmd != 0) return false;
+  return resultText == "STOP" || resultText == "OFF" ||
+         serverActiveMode == "ready" || serverActiveMode == "off";
+}
+
+static void markLocalStop() {
+  lastLocalStopMillis = millis();
+}
+
+static bool wasRecentlyStoppedLocally() {
+  return lastLocalStopMillis > 0 &&
+         millis() - lastLocalStopMillis < WEATHER_RESPONSE_IGNORE_AFTER_STOP_MS;
+}
+
+void requestWeatherRefresh(const String &region) {
+  lastWeatherCallMillis = millis();
+  sendServerRequest(buildWeatherRequestPayload(region));
+}
+
+static bool isWeatherRequestPayload(const String &payload) {
+  return payload.indexOf("\"mode\":\"weather\"") >= 0;
+}
+
+static void allowWeatherRetry() {
+  lastWeatherCallMillis = millis() - WEATHER_INTERVAL;
 }
 
 static void ensureVisibleLedColor() {
@@ -871,7 +901,11 @@ void handleNextionCmd(const String &cmd) {
     if (offlineModeActive) {
       showPage(PAGE_WEATHER_OFF);
     } else if (currentMode == MODE_WEATHER) {
-      showWeatherPageByState();
+      markLocalStop();
+      clearWeatherState();
+      setSystemMode(MODE_READY, "Weather Mode Off");
+      syncDisplayModeToServer("ready");
+      showPage(PAGE_WEATHER_OFF);
     } else {
       showPage(PAGE_WEATHER_OFF);
     }
@@ -880,7 +914,10 @@ void handleNextionCmd(const String &cmd) {
     if (offlineModeActive) {
       showPage(PAGE_OFFLINE);
     } else if (currentMode == MODE_WEATHER) {
-      showWeatherPageByState();
+      showPage(PAGE_WEATHER);
+      beginWeatherRefresh();
+      requestWeatherRefresh(lastWeatherRegion);
+      syncDisplayModeToServer("weather");
     } else {
       showPage(PAGE_WEATHER);
       beginWeatherRefresh();
@@ -904,6 +941,7 @@ void handleNextionCmd(const String &cmd) {
   else if (cmd == "ST") {
     SystemMode modeBeforeStop = currentMode;
     lastManualPage = PAGE_MANUAL;
+    markLocalStop();
     setSystemMode(MODE_READY, "Stopped");
     pendingManualScent = "";
 
@@ -1276,9 +1314,8 @@ static void processServerResponse(const String& response) {
   if (targetRegion.length() > 0) {
     rememberWeatherRegion(targetRegion);
     if (currentMode == MODE_WEATHER && !hadSavedRegion) {
-      lastWeatherCallMillis = millis();
       deferWeatherActionForRegionSync = true;
-      sendServerRequest(buildWeatherRequestPayload(lastWeatherRegion));
+      requestWeatherRefresh(lastWeatherRegion);
     }
   }
 
@@ -1305,16 +1342,26 @@ static void processServerResponse(const String& response) {
   // 4. 분사 제어 명령 처리
   String serverActiveMode = doc["active_mode"] | "";
   serverActiveMode.trim();
+  int cmd = doc["spray"] | -1;
+  String resultText = doc["result_text"] | "";
+
+  bool isWeatherModeResponse = serverActiveMode == "weather" ||
+                               weatherText.length() > 0 ||
+                               targetRegion.length() > 0;
+  if (wasRecentlyStoppedLocally() && currentMode != MODE_WEATHER && isWeatherModeResponse) {
+    Serial.println(C_YELLOW "\r\n[Weather] Ignored stale weather response after local stop.\r\n" C_RESET);
+    return;
+  }
   static int lastSyncedManualScent = 0;
   if (serverActiveMode == "weather") {
     bool wasWeatherMode = currentMode == MODE_WEATHER;
     if (!wasWeatherMode) {
       setSystemMode(MODE_WEATHER, "Weather Mode");
       showWeatherPageByState();
-      lastWeatherCallMillis = millis();
-      sendServerRequest(buildWeatherRequestPayload(lastWeatherRegion));
+      requestWeatherRefresh(lastWeatherRegion);
     }
   } else if (serverActiveMode == "ready" || serverActiveMode == "off") {
+    markLocalStop();
     if (currentMode == MODE_WEATHER) {
       clearWeatherState();
       setSystemMode(MODE_READY, "Weather Mode Off");
@@ -1353,9 +1400,6 @@ static void processServerResponse(const String& response) {
     }
   }
 
-  int cmd = doc["spray"] | -1;
-  String resultText = doc["result_text"] | "";
-  
   if (!doc["music_tracks"].isNull()) {
     updateMusicMapping(doc["music_tracks"] | "");
   }
@@ -1363,6 +1407,7 @@ static void processServerResponse(const String& response) {
   if (deferWeatherActionForRegionSync) {
     Serial.println(C_YELLOW "\r\n[Weather] Region synced; skipping this bootstrap spray/music response.\r\n" C_RESET);
   } else if (cmd == 90) {
+    markLocalStop();
     clearWeatherState();
     setSystemMode(MODE_READY, "Stopped by Server");
     showPage(PAGE_WEATHER_OFF);
@@ -1373,8 +1418,9 @@ static void processServerResponse(const String& response) {
     triggerSpray(cmd, dur, music, txt, (currentMode == MODE_WEATHER));
   }
   // ★ [핵심 수정] 서버에서 명확하게 STOP 또는 OFF 명령이 내려왔을 때만 정지하도록 보강!
-  else if (cmd == 0 && (resultText == "STOP" || resultText == "OFF")) {
+  else if (isServerStopCommand(cmd, resultText, serverActiveMode)) {
     SystemMode modeBeforeStop = currentMode;
+    markLocalStop();
     setSystemMode(MODE_READY, "Stopped by Server");
     if (modeBeforeStop == MODE_WEATHER) {
       hasWeatherSnapshot = false;
@@ -1453,8 +1499,8 @@ void networkTaskLoop(void *pvParameters) {
 
       isCommunicate = true; 
       initNetworkSession(); 
-      HTTPClient http; 
-      http.setTimeout(10000); 
+      HTTPClient http;
+      http.setTimeout(20000);
       
       if (http.begin(sharedClient, serverName)) {
         http.addHeader("Content-Type", "application/json");
@@ -1464,10 +1510,12 @@ void networkTaskLoop(void *pvParameters) {
           String response = http.getString();
           processServerResponse(response); // 👉 분리된 함수로 응답 데이터 토스!
         } else {
+          if (isWeatherRequestPayload(payload)) allowWeatherRetry();
           Serial.printf(C_RED "⚠️ [Network] HTTP 에러 코드: %d\r\n" C_RESET, httpCode);
         }
         http.end();
       } else {
+        if (isWeatherRequestPayload(payload)) allowWeatherRetry();
         Serial.println(C_RED "⚠️ [Network] 서버 연결 실패" C_RESET);
       }
       isCommunicate = false;
@@ -1561,10 +1609,9 @@ void recordAndSendVoice() {
 }
 
 void autoWeatherScheduler() {
-  if (currentMode != MODE_WEATHER || isRunning) return; 
+  if (currentMode != MODE_WEATHER || isRunning) return;
   if (millis() - lastWeatherCallMillis >= WEATHER_INTERVAL) {
-    lastWeatherCallMillis = millis();
-    sendServerRequest(buildWeatherRequestPayload(lastWeatherRegion));
+    requestWeatherRefresh(lastWeatherRegion);
   }
 }
 
