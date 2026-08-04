@@ -280,6 +280,7 @@ void pollServer();
 void sendServerRequest(String payload);
 void rememberWeatherRegion(const String &region);
 String buildWeatherRequestPayload(const String &region);
+void requestWeatherRefresh(const String &region);
 void handleWebClient();
 void autoWeatherScheduler();
 void checkNextionInput();
