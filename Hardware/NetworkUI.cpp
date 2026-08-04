@@ -32,6 +32,7 @@ static const int PAGE_OFFLINE = 29;
 static const int PAGE_INTENSITY_LOW = 30;
 static const int PAGE_INTENSITY_MEDIUM = 31;
 static const int PAGE_INTENSITY_HIGH = 32;
+static const int PAGE_STARTUP_HOME = 33;
 static const int PAGE_LOW_FLUID = 80;
 
 static int lastManualPage = PAGE_MANUAL;
@@ -42,6 +43,8 @@ static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 30000;
 
 static String pendingManualScent = "";
 static unsigned long lastScentTouchTime = 0;
+static unsigned long manualModeOffMillis = 0;
+static int lastStoppedManualScent = 0;
 
 struct EncodedRegionText {
   const char *utf8;
@@ -355,7 +358,7 @@ void showStartupReadyPage() {
     showPage(PAGE_OFFLINE);
     return;
   }
-  showPage(PAGE_WEATHER_OFF);
+  showPage(PAGE_STARTUP_HOME);
 }
 
 static void setOfflineModeActive(bool active) {
@@ -555,6 +558,26 @@ String buildWeatherRequestPayload(const String &region) {
   return payload;
 }
 
+static String buildDisplayModePayload(const String &activeMode, int activeScent = 0) {
+  JsonDocument reqDoc;
+  reqDoc["action"] = "DISPLAY_MODE";
+  reqDoc["mode"] = "display";
+  reqDoc["active_mode"] = activeMode;
+  if (activeScent > 0) {
+    reqDoc["active_scent"] = activeScent;
+  }
+
+  String payload;
+  payload.reserve(96);
+  serializeJson(reqDoc, payload);
+  return payload;
+}
+
+static void syncDisplayModeToServer(const String &activeMode, int activeScent = 0) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  sendServerRequest(buildDisplayModePayload(activeMode, activeScent));
+}
+
 static String attachDeviceIdIfMissing(const String &payload) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
@@ -690,6 +713,7 @@ static void handleScentButton(const String &cmd) {
   if (!blendModeEnabled) {
     lastManualPage = PAGE_MANUAL_SCENT_BASE + scent;
     showPage(lastManualPage);
+    syncDisplayModeToServer("manual", scent);
     pendingManualScent = String(scent);
     lastScentTouchTime = millis();
     return;
@@ -707,6 +731,7 @@ static void handleScentButton(const String &cmd) {
   } else if (blendSelection.length() == 2) {
     lastManualPage = blendPairPage(blendSelection);
     showPage(lastManualPage);
+    syncDisplayModeToServer("manual", blendSelection.toInt());
     
     pendingManualScent = blendSelection;
     lastScentTouchTime = millis();
@@ -860,6 +885,7 @@ void handleNextionCmd(const String &cmd) {
       showPage(PAGE_WEATHER);
       beginWeatherRefresh();
       enterWeatherMode(true);
+      syncDisplayModeToServer("weather");
     }
   } 
   else if (cmd == "M1" || cmd == "Y1") {
@@ -886,8 +912,12 @@ void handleNextionCmd(const String &cmd) {
       hasTempHumiSnapshot = false;
       lastWeatherLabel = "";
       lastWeatherIconId = 0;
+      syncDisplayModeToServer("ready");
       showPage(PAGE_WEATHER_OFF);
     } else if (modeBeforeStop == MODE_MANUAL) {
+      lastStoppedManualScent = isManualScentPage(currentDisplayPage) ? (currentDisplayPage - PAGE_MANUAL_SCENT_BASE) : 0;
+      manualModeOffMillis = millis();
+      syncDisplayModeToServer("ready");
       showPage(PAGE_MANUAL);
     } else {
       showPage(PAGE_MODE_SELECT);
@@ -1219,7 +1249,7 @@ static void processServerResponse(const String& response) {
   JsonDocument doc;
   if (deserializeJson(doc, response)) return; 
 
-  // 1. 발향 강도 및 스피커 볼륨 설정
+  // 1. 발향 강도 및 스피커 볼륨 설정 (명령 실행 전 우선 처리)
   if (canApplyServerSettings() && !doc["intensity"].isNull()) {
     SprayIntensity(doc["intensity"] | 2);
   }
@@ -1241,11 +1271,13 @@ static void processServerResponse(const String& response) {
     targetRegion = doc["region"] | "";
   }
   bool hadSavedRegion = lastWeatherRegion.length() > 0;
+  bool deferWeatherActionForRegionSync = false;
 
   if (targetRegion.length() > 0) {
     rememberWeatherRegion(targetRegion);
     if (currentMode == MODE_WEATHER && !hadSavedRegion) {
       lastWeatherCallMillis = millis();
+      deferWeatherActionForRegionSync = true;
       sendServerRequest(buildWeatherRequestPayload(lastWeatherRegion));
     }
   }
@@ -1270,7 +1302,57 @@ static void processServerResponse(const String& response) {
     updateTempHumi(tempC, humi);
   }
 
-  // 4. [플로우차트 반영] 분사 제어 및 향 변경 (Same Scent vs Different Scent)
+  // 4. 분사 제어 명령 처리
+  String serverActiveMode = doc["active_mode"] | "";
+  serverActiveMode.trim();
+  static int lastSyncedManualScent = 0;
+  if (serverActiveMode == "weather") {
+    bool wasWeatherMode = currentMode == MODE_WEATHER;
+    if (!wasWeatherMode) {
+      setSystemMode(MODE_WEATHER, "Weather Mode");
+      showWeatherPageByState();
+      lastWeatherCallMillis = millis();
+      sendServerRequest(buildWeatherRequestPayload(lastWeatherRegion));
+    }
+  } else if (serverActiveMode == "ready" || serverActiveMode == "off") {
+    if (currentMode == MODE_WEATHER) {
+      clearWeatherState();
+      setSystemMode(MODE_READY, "Weather Mode Off");
+      showPage(PAGE_WEATHER_OFF);
+    } else if (currentMode == MODE_MANUAL) {
+      setSystemMode(MODE_READY, "Manual Mode Off");
+      lastManualPage = PAGE_MANUAL;
+    }
+    lastSyncedManualScent = 0;
+    manualModeOffMillis = 0;
+    lastStoppedManualScent = 0;
+  } else if (serverActiveMode == "manual") {
+    int activeScent = doc["active_scent"] | 0;
+    if (activeScent <= 0) {
+      activeScent = doc["spray"] | 0;
+    }
+    int firstScent = activeScent;
+    while (firstScent > 9) {
+      firstScent /= 10;
+    }
+
+    if (firstScent >= 1 && firstScent <= 4) {
+      if (lastStoppedManualScent == activeScent && millis() - manualModeOffMillis < 5000) {
+        return;
+      }
+      bool scentChanged = activeScent != lastSyncedManualScent;
+      lastSyncedManualScent = activeScent;
+      lastManualPage = PAGE_MANUAL_SCENT_BASE + firstScent;
+      if (currentMode != MODE_MANUAL || scentChanged) {
+        setSystemMode(MODE_MANUAL, "Manual Mode");
+        showPage(lastManualPage);
+      }
+    } else if (currentMode != MODE_MANUAL) {
+      setSystemMode(MODE_MANUAL, "Manual Mode");
+      showManualPageByState();
+    }
+  }
+
   int cmd = doc["spray"] | -1;
   String resultText = doc["result_text"] | "";
   
@@ -1278,59 +1360,36 @@ static void processServerResponse(const String& response) {
     updateMusicMapping(doc["music_tracks"] | "");
   }
 
-  if (cmd > 0) {
-    int dur = doc["duration"] | 3; 
-    int music = doc["music"] | 0; 
-    String txt = resultText.length() > 0 ? resultText : "추천 향 수신";
-    
-    // 🌸 앰비언트 모드일 때: <향이 같은가?> 판별
-    if (currentMode == MODE_AMBIENT) {
-      targetAmbientScent = cmd;
-      
-      // [YES] 기존 향과 동일한 경우 -> 즉시 정상 분사
-      if (lastAmbientScent == targetAmbientScent) {
-        Serial.printf(C_GREEN "✅ [향 유지] 동일한 %d번 향 유지. 정상 분사합니다.\r\n" C_RESET, targetAmbientScent);
-        triggerSpray(cmd, dur, music, txt, false);
-      } 
-      // [NO] 향이 변경된 경우 -> 15분 잔향 소거 쿨타임 체크 (피드백 상태)
-      else {
-        unsigned long elapsed = millis() - lastScentChangeTime;
-        if (lastAmbientScent != 0 && elapsed < Config::SCENT_PURGE_COOLTIME) {
-          Serial.printf(C_MAGENTA "⏳ [향 변경/잔향 소거] %d번 -> %d번 향 변경 감지! 15분 잔향 소거 대기 중 (%lu초 남음). 분사 보류, BGM 유지.\r\n" C_RESET,
-                        lastAmbientScent, targetAmbientScent, (Config::SCENT_PURGE_COOLTIME - elapsed) / 1000);
-          forceAllOff(); // 모터만 끄고 BGM/LED는 계속 유지
-        } else {
-          // 15분 지났거나 첫 진입인 경우 -> 새로운 향으로 교체 승인 및 분사
-          Serial.printf(C_GREEN "✨ [향 교체 완료] %d번 -> %d번 향으로 교체 및 분사 시작!\r\n" C_RESET, lastAmbientScent, targetAmbientScent);
-          lastAmbientScent = targetAmbientScent;
-          lastScentChangeTime = millis();
-          triggerSpray(cmd, dur, music, txt, false);
-        }
-      }
+  if (deferWeatherActionForRegionSync) {
+    Serial.println(C_YELLOW "\r\n[Weather] Region synced; skipping this bootstrap spray/music response.\r\n" C_RESET);
+  } else if (cmd == 90) {
+    clearWeatherState();
+    setSystemMode(MODE_READY, "Stopped by Server");
+    showPage(PAGE_WEATHER_OFF);
+  } else if (cmd > 0) {
+    int dur = doc["duration"] | 3;
+    int music = doc["music"] | 0;
+    String txt = resultText.length() > 0 ? resultText : "명령 수신";
+    triggerSpray(cmd, dur, music, txt, (currentMode == MODE_WEATHER));
+  }
+  // ★ [핵심 수정] 서버에서 명확하게 STOP 또는 OFF 명령이 내려왔을 때만 정지하도록 보강!
+  else if (cmd == 0 && (resultText == "STOP" || resultText == "OFF")) {
+    SystemMode modeBeforeStop = currentMode;
+    setSystemMode(MODE_READY, "Stopped by Server");
+    if (modeBeforeStop == MODE_WEATHER) {
+      hasWeatherSnapshot = false;
+      hasTempHumiSnapshot = false;
+      lastWeatherLabel = "";
+      lastWeatherIconId = 0;
+      showPage(PAGE_WEATHER_OFF);
     } else {
-      // 일반/수동/날씨 모드일 때
-      triggerSpray(cmd, dur, music, txt, (currentMode == MODE_WEATHER));
+      updateDisplay(0, "Stopped by Server");
     }
-  } else if (cmd == 0 && resultText != "OK") {
-    // 앰비언트/날씨 모드 중에는 spray=0 이어도 Ready 모드로 튕겨나가지 않음
-    if (currentMode != MODE_AMBIENT && currentMode != MODE_WEATHER) {
-      SystemMode modeBeforeStop = currentMode;
-      setSystemMode(MODE_READY, "Stopped by Server");
-      if (modeBeforeStop == MODE_WEATHER) {
-        hasWeatherSnapshot = false;
-        hasTempHumiSnapshot = false;
-        lastWeatherLabel = "";
-        lastWeatherIconId = 0;
-        showPage(PAGE_WEATHER_OFF);
-      } else {
-        updateDisplay(0, "Stopped by Server");
-      }
-      Serial.println(C_YELLOW "\r\n🛑 서버 명령으로 시스템 강제 정지\r\n" C_RESET);
-    }
+    Serial.println(C_YELLOW "\r\n🛑 서버 명령으로 시스템 강제 정지\r\n" C_RESET);
   }
   else if (!doc["music"].isNull()) {
     int track = doc["music"] | 0;
-    if (track > 0 && track <= 25) {
+    if (track > 0) {
       playSound(track);
       nexSend("t_music.txt=\"" + getTrackName(track) + "\"");
       updateDisplay(0, "Music Playing");
@@ -1374,7 +1433,7 @@ static void processServerResponse(const String& response) {
     Serial.printf(C_GREEN "\r\n🎨 서버 명령으로 LED 변경: R:%d G:%d B:%d 밝기:%d ON:%d\r\n" C_RESET,
                   ledR, ledG, ledB, ledBrightness, ledEnabled);
     
-    if (currentMode != MODE_SLEEP && !isWaitingForTestDb) {
+    if (currentMode != MODE_SLEEP && currentMode != MODE_VOICE && !isWaitingForTestDb) {
       showPrompt();
     }
   }
@@ -1429,7 +1488,77 @@ void sendServerRequest(String payload) {
   }
 }
 
-// --- 음성 인식 기능 제거됨 ---
+// --- 최적화 2: 오디오 버퍼 메모리 할당 방식 개선 (ESP-IDF API 적용) ---
+bool recordAudio(uint8_t** audioBuffer, uint32_t* totalSize) {
+  uint32_t dataSize = SAMPLE_RATE * RECORD_TIME * 2;
+  *totalSize = sizeof(WavHeader) + dataSize;
+  
+  if (ESP.getFreeHeap() < *totalSize + 20000) { 
+    updateDisplay(0, "Memory Full"); 
+    return false; 
+  }
+  Serial.printf(C_YELLOW "\r\n[Voice] 🎤 녹음 시작 (2초)...\r\n" C_RESET);
+  
+  // 일반 malloc 대신 단편화가 적은 8-bit Internal RAM 영역 명시적 할당
+  *audioBuffer = (uint8_t*)heap_caps_malloc(*totalSize, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL); 
+  if (*audioBuffer == NULL) return false;
+  
+  WavHeader header; memcpy(header.riff, "RIFF", 4); header.overall_size = *totalSize - 8; 
+  memcpy(header.wave, "WAVE", 4); memcpy(header.fmt_chunk_marker, "fmt ", 4); 
+  header.length_of_fmt = 16; header.format_type = 1; header.channels = 1; 
+  header.sample_rate = SAMPLE_RATE; header.byterate = SAMPLE_RATE * 2; 
+  header.block_align = 2; header.bits_per_sample = 16; 
+  memcpy(header.data_chunk_header, "data", 4); header.data_size = dataSize; 
+  memcpy(*audioBuffer, &header, sizeof(WavHeader));
+  
+  size_t bytesRead = 0; 
+  i2s_read(I2S_PORT, (void*)(*audioBuffer + sizeof(WavHeader)), dataSize, &bytesRead, portMAX_DELAY);
+  Serial.println(C_GREEN "→ ✅ 필터링 완료" C_RESET); 
+  return true;
+}
+
+void executeVoiceCommand(String jsonResponse) {
+  JsonDocument doc; if (deserializeJson(doc, jsonResponse)) { Serial.println(C_RED "⚠️ JSON 파싱 실패" C_RESET); return; }
+  String transcript = doc["transcript"] | "인식 실패"; String resultText = doc["result_text"] | "명령 수신";
+  int cmd = doc["spray"] | -1; int dur = doc["duration"] | 3; int music = doc["music"] | 0;
+  Serial.printf("\r\n" C_CYAN "[Voice Result]" C_RESET "\r\n 🗣️  인식: %s\r\n 🤖  서버: %s\r\n", transcript.c_str(), resultText.c_str());
+  if (cmd >= 1 && cmd <= 4) triggerSpray(cmd, dur, music, resultText, false);
+  else if (cmd == 0) { stopSystem(); updateDisplay(0, resultText); Serial.println(C_YELLOW "🛑 시스템 정지" C_RESET); }
+}
+
+// --- 최적화 3: HTTP 응답 데이터 메모리 예약 ---
+bool sendAudioToServer(uint8_t* audioBuffer, uint32_t totalSize, String& response) {
+  if (isCommunicate) { Serial.println(C_RED "→ ⚠️ Lock" C_RESET); return false; }
+  isCommunicate = true; Serial.println(C_GREEN "→ 🗣️ 전송 중..." C_RESET); updateDisplay(0, "Thinking...");
+  esp_task_wdt_delete(NULL); bool success = false; initNetworkSession();
+  HTTPClient http; http.setTimeout(15000); 
+  
+  if (http.begin(sharedClient, serverName)) {
+    http.addHeader("Content-Type", "audio/wav");
+    int httpCode = http.POST(audioBuffer, totalSize);
+    if (httpCode > 0) { 
+      response.reserve(512); // 대용량 응답 문자열 사전 할당
+      response = http.getString(); 
+      Serial.println(C_GREEN "→ ✅ 응답 수신 완료" C_RESET); 
+      success = true; 
+    } 
+    else Serial.printf(C_RED "→ ❌ HTTP %d\r\n" C_RESET, httpCode);
+    http.end();
+  }
+  esp_task_wdt_add(NULL); isCommunicate = false; return success;
+}
+
+void recordAndSendVoice() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  SystemMode prevMode = currentMode; currentMode = MODE_VOICE; 
+  uint8_t* audioBuffer = NULL; uint32_t totalSize = 0;
+  if (recordAudio(&audioBuffer, &totalSize)) {
+    String response = "";
+    if (sendAudioToServer(audioBuffer, totalSize, response)) executeVoiceCommand(response);
+  }
+  if (audioBuffer != NULL) free(audioBuffer);
+  currentMode = (prevMode == MODE_VOICE) ? MODE_READY : prevMode; showPrompt();
+}
 
 void autoWeatherScheduler() {
   if (currentMode != MODE_WEATHER || isRunning) return; 
