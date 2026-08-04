@@ -81,47 +81,17 @@ int activeStartHour   = 8;
 int activeEndHour     = 23;
 unsigned long lastPollTime = 0;
 const unsigned long POLL_INTERVAL = 2000;
-int musicMapping[4] = {1, 6, 11, 16}; // 기본값
+int musicMapping[4] = {1, 6, 11, 26}; // 기본값
 
 // ★ [추가] 슬롯별 플레이리스트 및 바통 터치 변수 정의
-String slotPlaylists[4] = {"1,2,3", "6,7,8", "11,12,13", "16,17,18"};
-int currentSlotTracks[10] = {1, 2, 3, 0};
-int currentSlotTracksCount = 3;
+String slotPlaylists[4] = {"1,2,3", "6,7,8", "11,12,13", "26"};
+int currentSlotTracks[10] = {26,0};
+int currentSlotTracksCount = 1;
 int currentPlaylistIdx = 0;
 
-// 🎵 곡 제목 데이터베이스 (모바일 앱의 TRACKS와 일치)
-const char* TRACK_NAMES[] = {
-  "재생 안 함",       // 0
-  "여행",             // 1
-  "Love Lee",         // 2
-  "바이,썸머",         // 3
-  "Ai Wo Tsutaetaidatoka", // 4
-  "사계 - 봄",        // 5
-  "숲",               // 6
-  "salty",            // 7
-  "서울의 잠 못 이루는 밤", // 8
-  "언제라도 어디에서라도", // 9
-  "사계 - 가을",       // 10
-  "비",               // 11
-  "소나기",           // 12
-  "잠 못 드는 밤 비는 내리고", // 13
-  "비 오는날 듣기좋은 노래", // 14
-  "사계 - 여름",       // 15
-  "첫 눈",            // 16
-  "겨울잠",           // 17
-  "첫 눈처럼 너에게 가겠다", // 18
-  "눈사람",           // 19
-  "사계 - 겨울",       // 20
-  "킬링벌스",         // 21
-  "밤바다",           // 22
-  "round and round",  // 23
-  "lemon tree",       // 24
-  "그때가좋았어"       // 25
-};
-
 String getTrackName(int trackNum) {
-  if (trackNum <= 0 || trackNum > 25) return "재생 안 함";
-  return String(TRACK_NAMES[trackNum]);
+  if (trackNum <= 0) return "재생 안 함";
+  return String(trackNum) + "번 트랙"; // 예: "26번 트랙", "27번 트랙"
 }
 
 // --- 오디오 및 앰비언트 모드 ---
