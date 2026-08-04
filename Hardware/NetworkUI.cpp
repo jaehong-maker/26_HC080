@@ -243,9 +243,12 @@ static bool isLedColorOff(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 static bool isServerStopCommand(int cmd, const String &resultText, const String &serverActiveMode) {
-  if (cmd != 0) return false;
-  return resultText == "STOP" || resultText == "OFF" ||
-         serverActiveMode == "ready" || serverActiveMode == "off";
+  if (serverActiveMode == "ready" || serverActiveMode == "off") return true;
+  if (cmd == 90) return true;
+  if (resultText == "STOP" || resultText == "OFF") return true;
+  if (resultText.indexOf("중지") >= 0 || resultText.indexOf("정지") >= 0) return true;
+  if (resultText.indexOf("꺼짐") >= 0 || resultText.indexOf("대기") >= 0) return true;
+  return false;
 }
 
 static void markLocalStop() {
@@ -1281,11 +1284,13 @@ void pollServer() {
 }
 
 // =================================================================
-// 📡 [수정됨] 서버 응답(JSON)을 해석하고 LED 설정까지 포함하여 실행
+// 📡 [수정됨] 서버 응답(JSON) 해석 및 모드/날씨 분기 처리
 // =================================================================
 static void processServerResponse(const String& response) {
   JsonDocument doc;
   if (deserializeJson(doc, response)) return; 
+
+  static int lastSyncedManualScent = 0;
 
   // 1. 발향 강도 및 스피커 볼륨 설정 (명령 실행 전 우선 처리)
   if (canApplyServerSettings() && !doc["intensity"].isNull()) {
@@ -1302,27 +1307,22 @@ static void processServerResponse(const String& response) {
     }
   }
 
-  // 2. 날씨 및 지역 정보 업데이트
+  // 2. 날씨 및 지역 정보 업데이트 (★ 화면 전환 없이 순수 데이터 저장만 수행)
   String weatherText = doc["weather"] | "";
   String targetRegion = doc["target_region"] | "";
   if (targetRegion.length() == 0 && lastWeatherRegion.length() == 0 && weatherText.length() > 0) {
     targetRegion = doc["region"] | "";
   }
-  bool hadSavedRegion = lastWeatherRegion.length() > 0;
-  bool deferWeatherActionForRegionSync = false;
 
   if (targetRegion.length() > 0) {
     rememberWeatherRegion(targetRegion);
-    if (currentMode == MODE_WEATHER && !hadSavedRegion) {
-      deferWeatherActionForRegionSync = true;
-      requestWeatherRefresh(lastWeatherRegion);
-    }
   }
 
   if (weatherText.length() > 0) {
     lastWeatherLabel = weatherText;
     lastWeatherIconId = weatherIconFromText(weatherText);
     hasWeatherSnapshot = hasValidWeatherText(lastWeatherLabel);
+    // 오직 현재 기기 모드가 날씨 모드일 때만 디스플레이 날씨 필드 갱신
     if (currentMode == MODE_WEATHER) {
       updateDisplay(lastWeatherIconId, "");
     }
@@ -1339,20 +1339,38 @@ static void processServerResponse(const String& response) {
     updateTempHumi(tempC, humi);
   }
 
-  // 4. 분사 제어 명령 처리
+  // 4. 분사 및 시스템 제어 명령 파싱
   String serverActiveMode = doc["active_mode"] | "";
   serverActiveMode.trim();
   int cmd = doc["spray"] | -1;
   String resultText = doc["result_text"] | "";
 
-  bool isWeatherModeResponse = serverActiveMode == "weather" ||
-                               weatherText.length() > 0 ||
-                               targetRegion.length() > 0;
-  if (wasRecentlyStoppedLocally() && currentMode != MODE_WEATHER && isWeatherModeResponse) {
-    Serial.println(C_YELLOW "\r\n[Weather] Ignored stale weather response after local stop.\r\n" C_RESET);
+  // ★ [최우선 정지 처리] active_mode가 ready/off이거나 정지 신호일 경우 현재 모드와 무관하게 즉시 정지
+  if (cmd == 0 || serverActiveMode == "ready" || serverActiveMode == "off" || cmd == 90 || isServerStopCommand(cmd, resultText, serverActiveMode)) {
+    SystemMode modeBeforeStop = currentMode;
+    markLocalStop();
+    clearWeatherState();
+    hasWeatherSnapshot = false;
+    hasTempHumiSnapshot = false;
+    lastWeatherLabel = "";
+    lastWeatherIconId = 0;
+    
+    setSystemMode(MODE_READY, "Stopped by Server");
+    
+    if (modeBeforeStop == MODE_WEATHER || currentDisplayPage == PAGE_WEATHER) {
+      showPage(PAGE_WEATHER_OFF);
+    } else {
+      updateDisplay(0, "Stopped by Server");
+    }
+    
+    lastSyncedManualScent = 0;
+    manualModeOffMillis = 0;
+    lastStoppedManualScent = 0;
+    Serial.println(C_YELLOW "\r\n🛑 [Server Sync] 서버 정지 신호 수신 (ready/off/spray:0): 시스템 강제 정지 완료\r\n" C_RESET);
     return;
   }
-  static int lastSyncedManualScent = 0;
+
+  // 5. 모드별 화면 전환 제어 (★ 오직 active_mode가 정확히 "weather"일 때만 날씨 모드 진입 허용)
   if (serverActiveMode == "weather") {
     bool wasWeatherMode = currentMode == MODE_WEATHER;
     if (!wasWeatherMode) {
@@ -1360,20 +1378,8 @@ static void processServerResponse(const String& response) {
       showWeatherPageByState();
       requestWeatherRefresh(lastWeatherRegion);
     }
-  } else if (serverActiveMode == "ready" || serverActiveMode == "off") {
-    markLocalStop();
-    if (currentMode == MODE_WEATHER) {
-      clearWeatherState();
-      setSystemMode(MODE_READY, "Weather Mode Off");
-      showPage(PAGE_WEATHER_OFF);
-    } else if (currentMode == MODE_MANUAL) {
-      setSystemMode(MODE_READY, "Manual Mode Off");
-      lastManualPage = PAGE_MANUAL;
-    }
-    lastSyncedManualScent = 0;
-    manualModeOffMillis = 0;
-    lastStoppedManualScent = 0;
-  } else if (serverActiveMode == "manual") {
+  } 
+  else if (serverActiveMode == "manual") {
     int activeScent = doc["active_scent"] | 0;
     if (activeScent <= 0) {
       activeScent = doc["spray"] | 0;
@@ -1404,53 +1410,27 @@ static void processServerResponse(const String& response) {
     updateMusicMapping(doc["music_tracks"] | "");
   }
 
-  if (deferWeatherActionForRegionSync) {
-    Serial.println(C_YELLOW "\r\n[Weather] Region synced; skipping this bootstrap spray/music response.\r\n" C_RESET);
-  } else if (cmd == 90) {
-    markLocalStop();
-    clearWeatherState();
-    setSystemMode(MODE_READY, "Stopped by Server");
-    showPage(PAGE_WEATHER_OFF);
-  } else if (cmd > 0) {
+  if (cmd > 0) {
     int dur = doc["duration"] | 3;
     int music = doc["music"] | 0;
     String txt = resultText.length() > 0 ? resultText : "명령 수신";
     triggerSpray(cmd, dur, music, txt, (currentMode == MODE_WEATHER));
-  }
-  // ★ [핵심 수정] 서버에서 명확하게 STOP 또는 OFF 명령이 내려왔을 때만 정지하도록 보강!
-  else if (isServerStopCommand(cmd, resultText, serverActiveMode)) {
-    SystemMode modeBeforeStop = currentMode;
-    markLocalStop();
-    setSystemMode(MODE_READY, "Stopped by Server");
-    if (modeBeforeStop == MODE_WEATHER) {
-      hasWeatherSnapshot = false;
-      hasTempHumiSnapshot = false;
-      lastWeatherLabel = "";
-      lastWeatherIconId = 0;
-      showPage(PAGE_WEATHER_OFF);
-    } else {
-      updateDisplay(0, "Stopped by Server");
-    }
-    Serial.println(C_YELLOW "\r\n🛑 서버 명령으로 시스템 강제 정지\r\n" C_RESET);
-  }
-  else if (!doc["music"].isNull()) {
+  } else if (!doc["music"].isNull() && doc["music"] > 0) {
     int track = doc["music"] | 0;
-    if (track > 0) {
-      playSound(track);
-      nexSend("t_music.txt=\"" + getTrackName(track) + "\"");
-      updateDisplay(0, "Music Playing");
-      Serial.printf(C_GREEN "\r\n🎵 서버 단독 명령으로 %d번 오디오 트랙을 재생합니다.\r\n" C_RESET, track);
-    }
+    playSound(track);
+    nexSend("t_music.txt=\"" + getTrackName(track) + "\"");
+    updateDisplay(0, "Music Playing");
+    Serial.printf(C_GREEN "\r\n🎵 서버 단독 명령으로 %d번 오디오 트랙을 재생합니다.\r\n" C_RESET, track);
   }
 
-  // 5. 타이머(스케줄러) 설정
+  // 6. 타이머(스케줄러) 설정
   if (!doc["timer_enabled"].isNull()) {
     schedulerEnabled = doc["timer_enabled"] | false;
     activeStartHour = doc["timer_start"] | 9;
     activeEndHour = doc["timer_end"] | 22;
   }
 
-  // 6. 서버 명령으로 LED 색상 및 밝기 실시간 변경
+  // 7. 서버 명령으로 LED 색상 및 밝기 실시간 변경
   if (canApplyServerSettings() && !doc["led_r"].isNull() && !doc["led_g"].isNull() && !doc["led_b"].isNull()) {
     uint8_t newR = constrain(doc["led_r"] | 255, 0, 255);
     uint8_t newG = constrain(doc["led_g"] | 255, 0, 255);
