@@ -400,8 +400,7 @@ void runAmbientMode() {
 
   unsigned long currentTime = millis();
   
-  // ★ [수정] BUSY 핀 HIGH(노래 끝남) 감지 로직 안정화
-  bool isSongFinished = (digitalRead(Config::PIN_BUSY) == HIGH && (currentTime - lastAmbientTime > 3000));
+  bool isSongFinished = (digitalRead(PIN_BUSY) == HIGH && (currentTime - lastAmbientTime > 3000)); // Config:: 삭제
   bool isOneHourPassed = (last1HourCheckTime > 0 && (currentTime - last1HourCheckTime >= Config::ONE_HOUR_MS));
 
   // -----------------------------------------------------------------------------------
