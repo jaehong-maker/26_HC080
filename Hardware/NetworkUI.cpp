@@ -243,12 +243,15 @@ static bool isLedColorOff(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 static bool isServerStopCommand(int cmd, const String &resultText, const String &serverActiveMode) {
-  // ★ [준선님 요청] cmd == 0 단독 정지 조건 제거
-  if (serverActiveMode == "ready" || serverActiveMode == "off") return true;
   if (cmd == 90) return true;
   if (resultText == "STOP" || resultText == "OFF") return true;
   if (resultText.indexOf("중지") >= 0 || resultText.indexOf("정지") >= 0) return true;
   if (resultText.indexOf("꺼짐") >= 0 || resultText.indexOf("대기") >= 0) return true;
+  
+  // ★ [앱 담당자 피드백 반영] 
+  // 분사 명령(cmd > 0)이 없을 때만 ready/off를 정지 신호로 인정합니다.
+  if (cmd <= 0 && (serverActiveMode == "ready" || serverActiveMode == "off")) return true;
+  
   return false; 
 }
 
@@ -392,11 +395,16 @@ static void showHomePageByWeatherState() {
 }
 
 void showStartupReadyPage() {
+  nexSend("sleep=0");
+  nexSend("dim=100");
+  clearWeatherState();
+  setSystemMode(MODE_READY, "Startup Ready");
+
   if (offlineModeActive) {
     showPage(PAGE_OFFLINE);
     return;
   }
-  showPage(PAGE_STARTUP_HOME);
+  showPage(PAGE_WEATHER_OFF);
 }
 
 static void setOfflineModeActive(bool active) {
@@ -554,6 +562,15 @@ static void updateWeatherFields() {
 
 static void refreshWeatherFieldsIfVisible() {
   if (currentMode == MODE_WEATHER && currentDisplayPage == PAGE_WEATHER) {
+    updateWeatherFields();
+  }
+}
+
+static void showWeatherPageForRefreshResponse(bool isWeatherRefreshResponse) {
+  if (!isWeatherRefreshResponse || currentMode != MODE_WEATHER) return;
+  if (currentDisplayPage != PAGE_WEATHER) {
+    showWeatherPageByState();
+  } else {
     updateWeatherFields();
   }
 }
@@ -817,6 +834,14 @@ static void setDisplayVolumeLevel(int level) {
   syncLocalVolumeToServer(displayLevel);
   showDisplayVolumePage(displayLevel);
   Serial.printf("\r\n[Display] Volume level: %d/10 (DFPlayer %d/30)\r\n", displayLevel, currentVolume);
+}
+
+static void applyServerVolumeWithoutPageChange(int volumeValue) {
+  int scaledVol = (volumeValue <= VOLUME_LEVEL_MAX) ? (volumeValue * 3) : volumeValue;
+  scaledVol = constrain(scaledVol, 0, 30);
+  if (scaledVol != currentVolume) {
+    changeVolume(scaledVol);
+  }
 }
 
 static void handleVolumeButton(const String &cmd) {
@@ -1256,7 +1281,6 @@ void pollServer() {
 
   if (now - lastSampleTime >= 3000) {
     lastSampleTime = now;
-    // ⚠️ 파트너님이 실수로 여길 바꾸셨었어요! 다시 currentDbLevel 로 복구합니다.
     dbSamples[sampleIdx] = currentDbLevel; 
     sampleIdx = (sampleIdx + 1) % 5;
   }
@@ -1307,9 +1331,7 @@ void pollServer() {
 // =================================================================
 // 📡 [수정됨] 서버 응답(JSON) 해석 및 모드/날씨 분기 처리
 // =================================================================
-// ★ [준선님 요청] 매개변수에 isPollRequest 플래그 추가 (기본값 true)
-static void processServerResponse(const String& response, bool isPollRequest = true) {
-  // ★ [준선님 요청] POLL 응답이 아니면(DISPLAY_MODE 등) 명령 처리 생략하고 ACK로만 처리
+static void processServerResponse(const String& response, bool isPollRequest = true, bool isWeatherRefreshResponse = false) {
   if (!isPollRequest) {
     return;
   }
@@ -1319,28 +1341,19 @@ static void processServerResponse(const String& response, bool isPollRequest = t
 
   static int lastSyncedManualScent = 0;
 
-  // 1. 발향 강도 및 스피커 볼륨 설정 (명령 실행 전 우선 처리)
   if (canApplyServerSettings() && !doc["intensity"].isNull()) {
     SprayIntensity(doc["intensity"] | 2);
   }
 
   if (canApplyServerSettings() && !doc["volume"].isNull()) {
-    int vol = doc["volume"] | 5;
-    int scaledVol = (vol <= VOLUME_LEVEL_MAX) ? (vol * 3) : vol;
-    scaledVol = constrain(scaledVol, 0, 30);
-    if (scaledVol != currentVolume) {
-      changeVolume(scaledVol);
-      showPage(VOLUME_PAGE_BASE + (scaledVol / 3));
-    }
+    applyServerVolumeWithoutPageChange(doc["volume"] | 5);
   }
 
-  // ★ [준선님 요청] 서버 JSON에서 명확한 앱 명령 플래그 추출
   bool isAppCmd = false;
   if (doc["app_command"] == true || doc["pending_cmd"] == true || doc["command_source"] == "app") {
     isAppCmd = true;
   }
 
-  // 2. 날씨 및 지역 정보 업데이트 (화면 전환 없이 순수 데이터 저장만 수행)
   String weatherText = doc["weather"] | "";
   String targetRegion = doc["target_region"] | "";
   if (targetRegion.length() == 0 && lastWeatherRegion.length() == 0 && weatherText.length() > 0) {
@@ -1360,7 +1373,6 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     }
   }
 
-  // 3. 온습도 업데이트
   float tempC = lastWeatherTempC;
   float humi = lastWeatherHumi;
   bool hasTemp = readJsonFloatField(doc, "temp", tempC) || readJsonFloatField(doc, "temperature", tempC);
@@ -1370,16 +1382,20 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   if (hasTemp || hasHumi) {
     updateTempHumi(tempC, humi);
   }
+  
   refreshWeatherFieldsIfVisible();
+  showWeatherPageForRefreshResponse(isWeatherRefreshResponse); 
 
-  // 4. 분사 및 시스템 제어 명령 파싱
   String serverActiveMode = doc["active_mode"] | "";
   serverActiveMode.trim();
   int cmd = doc["spray"] | -1;
   String resultText = doc["result_text"] | "";
 
-  // [최우선 정지 처리] active_mode가 ready/off이거나 정지 신호일 경우
-  if (serverActiveMode == "ready" || serverActiveMode == "off" || cmd == 90 || isServerStopCommand(cmd, resultText, serverActiveMode)) {
+  // =========================================================================
+  // ★ [치명적 버그 수정] cmd == 0 단독 정지 조건 완전 제거!
+  // 오직 isServerStopCommand() 가 true 일 때만 진짜 정지로 판단합니다.
+  // =========================================================================
+  if (isServerStopCommand(cmd, resultText, serverActiveMode)) {
     SystemMode modeBeforeStop = currentMode;
     markLocalStop();
     clearWeatherState();
@@ -1403,9 +1419,11 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     return;
   }
 
-  // 5. 모드별 화면 전환 제어 
-  // ★ [준선님 요청] isAppCmd(pending_cmd 등)가 true일 때만 강제 화면 전환 허용
-  if (isAppCmd) {
+  bool shouldChangeMode = isAppCmd;
+  if (serverActiveMode == "weather" && currentMode != MODE_WEATHER) shouldChangeMode = true;
+  if (serverActiveMode == "manual" && currentMode != MODE_MANUAL) shouldChangeMode = true;
+
+  if (shouldChangeMode) {
     if (serverActiveMode == "weather") {
       bool wasWeatherMode = currentMode == MODE_WEATHER;
       if (!wasWeatherMode) {
@@ -1440,13 +1458,12 @@ static void processServerResponse(const String& response, bool isPollRequest = t
         showManualPageByState();
       }
     }
-  } // isAppCmd 종료
+  }
 
   if (!doc["music_tracks"].isNull()) {
     updateMusicMapping(doc["music_tracks"] | "");
   }
 
-  // 분사 및 음악 재생은 명령(cmd)이 명확히 있을 때 실행
   if (cmd > 0) {
     int dur = doc["duration"] | 3;
     int music = doc["music"] | 0;
@@ -1460,14 +1477,12 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     Serial.printf(C_GREEN "\r\n🎵 서버 단독 명령으로 %d번 오디오 트랙을 재생합니다.\r\n" C_RESET, track);
   }
 
-  // 6. 타이머(스케줄러) 설정
   if (!doc["timer_enabled"].isNull()) {
     schedulerEnabled = doc["timer_enabled"] | false;
     activeStartHour = doc["timer_start"] | 9;
     activeEndHour = doc["timer_end"] | 22;
   }
 
-  // 7. 서버 명령으로 LED 색상 및 밝기 실시간 변경
   if (canApplyServerSettings() && !doc["led_r"].isNull() && !doc["led_g"].isNull() && !doc["led_b"].isNull()) {
     uint8_t newR = constrain(doc["led_r"] | 255, 0, 255);
     uint8_t newG = constrain(doc["led_g"] | 255, 0, 255);
@@ -1495,6 +1510,8 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   }
 }
 
+
+
 // =================================================================
 // 📡 [메인 태스크] 큐(Queue)에서 메시지를 꺼내 서버로 전송만 담당
 // =================================================================
@@ -1508,6 +1525,7 @@ void networkTaskLoop(void *pvParameters) {
       delete currentMsgPtr; // 메모리 누수 방지
 
       // ★ [준선님 요청] 기기가 보낸 페이로드를 확인하여 POLL 요청인지 판단
+      bool isWeatherRefreshResponse = isWeatherRequestPayload(payload);
       bool shouldProcessResponse = shouldProcessNetworkResponse(payload);
 
       isCommunicate = true; 
@@ -1522,7 +1540,7 @@ void networkTaskLoop(void *pvParameters) {
         if (httpCode == HTTP_CODE_OK) {
           String response = http.getString();
           // ★ [준선님 요청] POLL 여부를 같이 넘겨줌 (DISPLAY_MODE 응답은 무시하게 됨)
-          processServerResponse(response, shouldProcessResponse);
+          processServerResponse(response, shouldProcessResponse, isWeatherRefreshResponse);
         } else {
           if (isWeatherRequestPayload(payload)) allowWeatherRetry();
           Serial.printf(C_RED "⚠️ [Network] HTTP 에러 코드: %d\r\n" C_RESET, httpCode);
