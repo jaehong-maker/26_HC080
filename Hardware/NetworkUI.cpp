@@ -593,7 +593,8 @@ String buildWeatherRequestPayload(const String &region) {
   // 🔥 날씨 모드에서도 현재 무게 배열을 추가해서 서버로 같이 보냄!
   JsonArray wArray = reqDoc["weights"].to<JsonArray>();
   for (int i = 0; i < 4; i++) {
-    wArray.add((float)((int)(weights[i] * 10)) / 10.0);
+    float percent = calculateScentPercent(weights[i]); 
+    wArray.add(round(percent * 10.0f) / 10.0f);
   }
 
   String payload;
@@ -1661,6 +1662,7 @@ void initOTA() {
   });
   
   ArduinoOTA.onEnd([]() {
+    prefs.putBool("force_startup_page", true);
     updateDisplay(0, "Update Success!");
     Serial.println("\r\n[OTA] 무선 업데이트 완료!");
     esp_task_wdt_add(NULL); // 완료 시 감시견 복구 (안전을 위해)
