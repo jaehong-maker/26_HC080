@@ -9,6 +9,22 @@ static const int NEXTION_DIM_NORMAL = 100;
 static bool isDisplayDimmed = false;
 static bool shouldShowStartupReadyPage = false;
 
+static bool consumeStartupPageRequest() {
+  const String currentBuild = String(__DATE__) + " " + String(__TIME__);
+  String savedBuild = prefs.getString("firmware_build", "");
+  bool firstBootAfterUpdate = savedBuild != currentBuild;
+  bool forceStartupPage = prefs.getBool("force_startup_page", false);
+
+  if (firstBootAfterUpdate) {
+    prefs.putString("firmware_build", currentBuild);
+  }
+  if (forceStartupPage) {
+    prefs.remove("force_startup_page");
+  }
+
+  return firstBootAfterUpdate || forceStartupPage;
+}
+
 // --- 로드셀 데이터 준비 완료 인터럽트 (ISR) ---
 void IRAM_ATTR isr_hx0() { hxReady[0] = true; }
 void IRAM_ATTR isr_hx1() { hxReady[1] = true; }
@@ -180,9 +196,7 @@ void initSystem() {
   setSystemMode(MODE_READY, "System Ready");
   updateScentProgressBars();
 
-  bool forceStartupPage = prefs.getBool("force_startup_page", false);
-  if (forceStartupPage) {
-    prefs.remove("force_startup_page");
+  if (consumeStartupPageRequest()) {
     prefs.remove("pending_nextion_cmd");
     shouldShowStartupReadyPage = true;
   } else {
