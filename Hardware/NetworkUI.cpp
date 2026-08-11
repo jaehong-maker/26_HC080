@@ -270,6 +270,10 @@ static bool isWeatherRequestPayload(const String &payload) {
   return payload.indexOf("\"mode\":\"weather\"") >= 0;
 }
 
+static bool shouldProcessNetworkResponse(const String &payload) {
+  return payload.indexOf("\"POLL\"") >= 0 || isWeatherRequestPayload(payload);
+}
+
 static void allowWeatherRetry() {
   lastWeatherCallMillis = millis() - WEATHER_INTERVAL;
 }
@@ -546,6 +550,12 @@ static void updateWeatherFields() {
     sendEncodedWeatherBytes(WEATHER_UNKNOWN, sizeof(WEATHER_UNKNOWN));
   }
   sendCachedTempHumi();
+}
+
+static void refreshWeatherFieldsIfVisible() {
+  if (currentMode == MODE_WEATHER && currentDisplayPage == PAGE_WEATHER) {
+    updateWeatherFields();
+  }
 }
 
 // ★ 추가: MAC 주소 기반 고유 디바이스 ID 생성 함수
@@ -1262,14 +1272,23 @@ void pollServer() {
       JsonDocument doc; 
       doc["action"] = "POLL";
       doc["deviceId"] = deviceId;
-      
-      // ✅ 우리가 진짜로 바꿔야 했던 곳은 여기입니다! (lastWebMessage 로 변경 완료)
       doc["status"] = lastWebMessage; 
-      
       doc["db_level"] = avgDb; // 15초 평균값 보고
       doc["volume"] = currentVolume / 3; // 앱 규격(0~10)으로 변환하여 보고
       doc["led_br"] = ledEnabled ? ledBrightness : 0;
       
+      // ==========================================================
+      // ★ [앱 담당자 요청 반영] 현재 재생 중인 실제 트랙 번호를 보고
+      // ==========================================================
+      int currentPlayingTrack = 0;
+      if (currentMode == MODE_AMBIENT) {
+        currentPlayingTrack = currentAmbientTrack; // 앰비언트 모드일 때의 트랙
+      } else if (isRunning && currentSlotTracksCount > 0) {
+        currentPlayingTrack = currentSlotTracks[currentPlaylistIdx]; // 일반/날씨/수동 등 분사 시 플레이리스트 트랙
+      }
+      doc["music"] = currentPlayingTrack; 
+      // ==========================================================
+
       JsonArray wArray = doc["weights"].to<JsonArray>(); 
       for (int i = 0; i < 4; i++) {
         // 무게 퍼센트 계산 후 소수점 한자리로 정리 
@@ -1350,6 +1369,7 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   if (hasTemp || hasHumi) {
     updateTempHumi(tempC, humi);
   }
+  refreshWeatherFieldsIfVisible();
 
   // 4. 분사 및 시스템 제어 명령 파싱
   String serverActiveMode = doc["active_mode"] | "";
@@ -1487,7 +1507,7 @@ void networkTaskLoop(void *pvParameters) {
       delete currentMsgPtr; // 메모리 누수 방지
 
       // ★ [준선님 요청] 기기가 보낸 페이로드를 확인하여 POLL 요청인지 판단
-      bool isPollRequest = (payload.indexOf("\"POLL\"") >= 0);
+      bool shouldProcessResponse = shouldProcessNetworkResponse(payload);
 
       isCommunicate = true; 
       initNetworkSession(); 
@@ -1501,7 +1521,7 @@ void networkTaskLoop(void *pvParameters) {
         if (httpCode == HTTP_CODE_OK) {
           String response = http.getString();
           // ★ [준선님 요청] POLL 여부를 같이 넘겨줌 (DISPLAY_MODE 응답은 무시하게 됨)
-          processServerResponse(response, isPollRequest); 
+          processServerResponse(response, shouldProcessResponse);
         } else {
           if (isWeatherRequestPayload(payload)) allowWeatherRetry();
           Serial.printf(C_RED "⚠️ [Network] HTTP 에러 코드: %d\r\n" C_RESET, httpCode);
