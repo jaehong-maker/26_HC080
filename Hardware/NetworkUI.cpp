@@ -243,12 +243,13 @@ static bool isLedColorOff(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 static bool isServerStopCommand(int cmd, const String &resultText, const String &serverActiveMode) {
+  // ★ [준선님 요청] cmd == 0 단독 정지 조건 제거
   if (serverActiveMode == "ready" || serverActiveMode == "off") return true;
   if (cmd == 90) return true;
   if (resultText == "STOP" || resultText == "OFF") return true;
   if (resultText.indexOf("중지") >= 0 || resultText.indexOf("정지") >= 0) return true;
   if (resultText.indexOf("꺼짐") >= 0 || resultText.indexOf("대기") >= 0) return true;
-  return false;
+  return false; 
 }
 
 static void markLocalStop() {
@@ -1286,7 +1287,13 @@ void pollServer() {
 // =================================================================
 // 📡 [수정됨] 서버 응답(JSON) 해석 및 모드/날씨 분기 처리
 // =================================================================
-static void processServerResponse(const String& response) {
+// ★ [준선님 요청] 매개변수에 isPollRequest 플래그 추가 (기본값 true)
+static void processServerResponse(const String& response, bool isPollRequest = true) {
+  // ★ [준선님 요청] POLL 응답이 아니면(DISPLAY_MODE 등) 명령 처리 생략하고 ACK로만 처리
+  if (!isPollRequest) {
+    return;
+  }
+
   JsonDocument doc;
   if (deserializeJson(doc, response)) return; 
 
@@ -1307,7 +1314,13 @@ static void processServerResponse(const String& response) {
     }
   }
 
-  // 2. 날씨 및 지역 정보 업데이트 (★ 화면 전환 없이 순수 데이터 저장만 수행)
+  // ★ [준선님 요청] 서버 JSON에서 명확한 앱 명령 플래그 추출
+  bool isAppCmd = false;
+  if (doc["app_command"] == true || doc["pending_cmd"] == true || doc["command_source"] == "app") {
+    isAppCmd = true;
+  }
+
+  // 2. 날씨 및 지역 정보 업데이트 (화면 전환 없이 순수 데이터 저장만 수행)
   String weatherText = doc["weather"] | "";
   String targetRegion = doc["target_region"] | "";
   if (targetRegion.length() == 0 && lastWeatherRegion.length() == 0 && weatherText.length() > 0) {
@@ -1322,7 +1335,6 @@ static void processServerResponse(const String& response) {
     lastWeatherLabel = weatherText;
     lastWeatherIconId = weatherIconFromText(weatherText);
     hasWeatherSnapshot = hasValidWeatherText(lastWeatherLabel);
-    // 오직 현재 기기 모드가 날씨 모드일 때만 디스플레이 날씨 필드 갱신
     if (currentMode == MODE_WEATHER) {
       updateDisplay(lastWeatherIconId, "");
     }
@@ -1345,8 +1357,8 @@ static void processServerResponse(const String& response) {
   int cmd = doc["spray"] | -1;
   String resultText = doc["result_text"] | "";
 
-  // ★ [최우선 정지 처리] active_mode가 ready/off이거나 정지 신호일 경우 현재 모드와 무관하게 즉시 정지
-  if (cmd == 0 || serverActiveMode == "ready" || serverActiveMode == "off" || cmd == 90 || isServerStopCommand(cmd, resultText, serverActiveMode)) {
+  // [최우선 정지 처리] active_mode가 ready/off이거나 정지 신호일 경우
+  if (serverActiveMode == "ready" || serverActiveMode == "off" || cmd == 90 || isServerStopCommand(cmd, resultText, serverActiveMode)) {
     SystemMode modeBeforeStop = currentMode;
     markLocalStop();
     clearWeatherState();
@@ -1366,50 +1378,54 @@ static void processServerResponse(const String& response) {
     lastSyncedManualScent = 0;
     manualModeOffMillis = 0;
     lastStoppedManualScent = 0;
-    Serial.println(C_YELLOW "\r\n🛑 [Server Sync] 서버 정지 신호 수신 (ready/off/spray:0): 시스템 강제 정지 완료\r\n" C_RESET);
+    Serial.println(C_YELLOW "\r\n🛑 [Server Sync] 서버 정지 신호 수신: 시스템 강제 정지 완료\r\n" C_RESET);
     return;
   }
 
-  // 5. 모드별 화면 전환 제어 (★ 오직 active_mode가 정확히 "weather"일 때만 날씨 모드 진입 허용)
-  if (serverActiveMode == "weather") {
-    bool wasWeatherMode = currentMode == MODE_WEATHER;
-    if (!wasWeatherMode) {
-      setSystemMode(MODE_WEATHER, "Weather Mode");
-      showWeatherPageByState();
-      requestWeatherRefresh(lastWeatherRegion);
-    }
-  } 
-  else if (serverActiveMode == "manual") {
-    int activeScent = doc["active_scent"] | 0;
-    if (activeScent <= 0) {
-      activeScent = doc["spray"] | 0;
-    }
-    int firstScent = activeScent;
-    while (firstScent > 9) {
-      firstScent /= 10;
-    }
+  // 5. 모드별 화면 전환 제어 
+  // ★ [준선님 요청] isAppCmd(pending_cmd 등)가 true일 때만 강제 화면 전환 허용
+  if (isAppCmd) {
+    if (serverActiveMode == "weather") {
+      bool wasWeatherMode = currentMode == MODE_WEATHER;
+      if (!wasWeatherMode) {
+        setSystemMode(MODE_WEATHER, "Weather Mode");
+        showWeatherPageByState();
+        requestWeatherRefresh(lastWeatherRegion);
+      }
+    } 
+    else if (serverActiveMode == "manual") {
+      int activeScent = doc["active_scent"] | 0;
+      if (activeScent <= 0) {
+        activeScent = doc["spray"] | 0;
+      }
+      int firstScent = activeScent;
+      while (firstScent > 9) {
+        firstScent /= 10;
+      }
 
-    if (firstScent >= 1 && firstScent <= 4) {
-      if (lastStoppedManualScent == activeScent && millis() - manualModeOffMillis < 5000) {
-        return;
-      }
-      bool scentChanged = activeScent != lastSyncedManualScent;
-      lastSyncedManualScent = activeScent;
-      lastManualPage = PAGE_MANUAL_SCENT_BASE + firstScent;
-      if (currentMode != MODE_MANUAL || scentChanged) {
+      if (firstScent >= 1 && firstScent <= 4) {
+        if (lastStoppedManualScent == activeScent && millis() - manualModeOffMillis < 5000) {
+          return;
+        }
+        bool scentChanged = activeScent != lastSyncedManualScent;
+        lastSyncedManualScent = activeScent;
+        lastManualPage = PAGE_MANUAL_SCENT_BASE + firstScent;
+        if (currentMode != MODE_MANUAL || scentChanged) {
+          setSystemMode(MODE_MANUAL, "Manual Mode");
+          showPage(lastManualPage);
+        }
+      } else if (currentMode != MODE_MANUAL) {
         setSystemMode(MODE_MANUAL, "Manual Mode");
-        showPage(lastManualPage);
+        showManualPageByState();
       }
-    } else if (currentMode != MODE_MANUAL) {
-      setSystemMode(MODE_MANUAL, "Manual Mode");
-      showManualPageByState();
     }
-  }
+  } // isAppCmd 종료
 
   if (!doc["music_tracks"].isNull()) {
     updateMusicMapping(doc["music_tracks"] | "");
   }
 
+  // 분사 및 음악 재생은 명령(cmd)이 명확히 있을 때 실행
   if (cmd > 0) {
     int dur = doc["duration"] | 3;
     int music = doc["music"] | 0;
@@ -1455,27 +1471,23 @@ static void processServerResponse(const String& response) {
     prefs.putUChar("ledB", ledB);
     prefs.putBool("ledEnabled", ledEnabled);
     setLedColor(ledEnabled ? ledR : 0, ledEnabled ? ledG : 0, ledEnabled ? ledB : 0);
-
-    Serial.printf(C_GREEN "\r\n🎨 서버 명령으로 LED 변경: R:%d G:%d B:%d 밝기:%d ON:%d\r\n" C_RESET,
-                  ledR, ledG, ledB, ledBrightness, ledEnabled);
-    
-    if (currentMode != MODE_SLEEP && currentMode != MODE_VOICE && !isWaitingForTestDb) {
-      showPrompt();
-    }
   }
 }
 
 // =================================================================
-// 📡 [메인 태스크] 큐(Queue)에서 메시지를 꺼내 서버로 전송만 담당 (다이어트 성공!)
+// 📡 [메인 태스크] 큐(Queue)에서 메시지를 꺼내 서버로 전송만 담당
 // =================================================================
 void networkTaskLoop(void *pvParameters) {
   for (;;) {
     String* currentMsgPtr;
     
-    // 큐에 보낼 메시지가 들어올 때까지 대기 (CPU 점유율 0%)
+    // 큐에 보낼 메시지가 들어올 때까지 대기
     if (xQueueReceive(networkQueue, &currentMsgPtr, portMAX_DELAY) == pdTRUE) {
       String payload = *currentMsgPtr;
       delete currentMsgPtr; // 메모리 누수 방지
+
+      // ★ [준선님 요청] 기기가 보낸 페이로드를 확인하여 POLL 요청인지 판단
+      bool isPollRequest = (payload.indexOf("\"POLL\"") >= 0);
 
       isCommunicate = true; 
       initNetworkSession(); 
@@ -1488,7 +1500,8 @@ void networkTaskLoop(void *pvParameters) {
         
         if (httpCode == HTTP_CODE_OK) {
           String response = http.getString();
-          processServerResponse(response); // 👉 분리된 함수로 응답 데이터 토스!
+          // ★ [준선님 요청] POLL 여부를 같이 넘겨줌 (DISPLAY_MODE 응답은 무시하게 됨)
+          processServerResponse(response, isPollRequest); 
         } else {
           if (isWeatherRequestPayload(payload)) allowWeatherRetry();
           Serial.printf(C_RED "⚠️ [Network] HTTP 에러 코드: %d\r\n" C_RESET, httpCode);
@@ -1503,7 +1516,6 @@ void networkTaskLoop(void *pvParameters) {
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
-
 // 입구컷 안 당하게 큐에 넣는 방식으로 변경
 void sendServerRequest(String payload) {
   if (WiFi.status() != WL_CONNECTED) return;
