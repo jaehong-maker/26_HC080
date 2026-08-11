@@ -180,12 +180,19 @@ void initSystem() {
   setSystemMode(MODE_READY, "System Ready");
   updateScentProgressBars();
 
-  String pendingNextionCmd = prefs.getString("pending_nextion_cmd", "");
-  if (pendingNextionCmd.length() > 0) {
+  bool forceStartupPage = prefs.getBool("force_startup_page", false);
+  if (forceStartupPage) {
+    prefs.remove("force_startup_page");
     prefs.remove("pending_nextion_cmd");
-    handleNextionCmd(pendingNextionCmd);
-  } else {
     shouldShowStartupReadyPage = true;
+  } else {
+    String pendingNextionCmd = prefs.getString("pending_nextion_cmd", "");
+    if (pendingNextionCmd.length() > 0) {
+      prefs.remove("pending_nextion_cmd");
+      handleNextionCmd(pendingNextionCmd);
+    } else {
+      shouldShowStartupReadyPage = true;
+    }
   }
 
   xTaskCreatePinnedToCore(networkTaskLoop, "NetworkTask", 8192, NULL, 1, &NetworkTaskHandle, 1);
