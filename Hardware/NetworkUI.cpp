@@ -199,6 +199,13 @@ static bool isBlendPage(int pageId);
 static bool pendingPageUpdate = false;
 static unsigned long pageTransitionTime = 0;
 static int transitioningPageId = 0;
+static bool pendingWeatherFieldUpdate = false;
+static bool pendingWeatherLoadingUpdate = false;
+
+static void scheduleWeatherFieldUpdate(bool loading) {
+  pendingWeatherFieldUpdate = true;
+  pendingWeatherLoadingUpdate = loading;
+}
 
 static void showPage(int pageId) {
   currentDisplayPage = pageId;
@@ -243,15 +250,12 @@ static bool isLedColorOff(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 static bool isServerStopCommand(int cmd, const String &resultText, const String &serverActiveMode) {
+  // ★ [준선님 요청] cmd == 0 단독 정지 조건 제거
+  if (serverActiveMode == "ready" || serverActiveMode == "off") return true;
   if (cmd == 90) return true;
   if (resultText == "STOP" || resultText == "OFF") return true;
   if (resultText.indexOf("중지") >= 0 || resultText.indexOf("정지") >= 0) return true;
   if (resultText.indexOf("꺼짐") >= 0 || resultText.indexOf("대기") >= 0) return true;
-  
-  // ★ [앱 담당자 피드백 반영] 
-  // 분사 명령(cmd > 0)이 없을 때만 ready/off를 정지 신호로 인정합니다.
-  if (cmd <= 0 && (serverActiveMode == "ready" || serverActiveMode == "off")) return true;
-  
   return false; 
 }
 
@@ -262,6 +266,16 @@ static void markLocalStop() {
 static bool wasRecentlyStoppedLocally() {
   return lastLocalStopMillis > 0 &&
          millis() - lastLocalStopMillis < WEATHER_RESPONSE_IGNORE_AFTER_STOP_MS;
+}
+
+static bool isWeatherLikeResponse(const String &serverActiveMode,
+                                  const String &weatherText,
+                                  const String &targetRegion,
+                                  bool isWeatherRefreshResponse) {
+  return isWeatherRefreshResponse ||
+         serverActiveMode == "weather" ||
+         weatherText.length() > 0 ||
+         targetRegion.length() > 0;
 }
 
 void requestWeatherRefresh(const String &region) {
@@ -334,6 +348,59 @@ static int blendPairPage(const String &selection) {
   return PAGE_BLEND_HOME;
 }
 
+static void showManualPageByState();
+
+static bool isValidBlendCommand(int activeScent) {
+  if (activeScent < 10 || activeScent > 44) return false;
+  String value = String(activeScent);
+  if (value.length() != 2) return false;
+
+  int first = value.charAt(0) - '0';
+  int second = value.charAt(1) - '0';
+  return first >= 1 && first <= 4 &&
+         second >= 1 && second <= 4 &&
+         first != second;
+}
+
+static void clearBlendSelectionOnly() {
+  blendSelection = "";
+  pendingManualScent = "";
+}
+
+static void showManualPageForServerScent(int activeScent) {
+  if (isValidBlendCommand(activeScent)) {
+    blendModeEnabled = true;
+    blendSprayActive = true;
+    blendSelection = "";
+    nexSend("b_blend.txt=\"blendOFF\"");
+    lastManualPage = blendPairPage(String(activeScent));
+    showPage(lastManualPage);
+    return;
+  }
+
+  int firstScent = activeScent;
+  while (firstScent > 9) {
+    firstScent /= 10;
+  }
+
+  if (firstScent < 1 || firstScent > 4) {
+    showManualPageByState();
+    return;
+  }
+
+  if (blendModeEnabled) {
+    blendSprayActive = false;
+    blendSelection = String(firstScent);
+    lastManualPage = blendSinglePage(firstScent);
+  } else {
+    blendSprayActive = false;
+    blendSelection = "";
+    lastManualPage = PAGE_MANUAL_SCENT_BASE + firstScent;
+  }
+
+  showPage(lastManualPage);
+}
+
 static void showWeatherLoadingFields();
 static void updateWeatherFields();
 
@@ -373,9 +440,9 @@ static void showManualPageByState() {
 static void showWeatherPageByState() {
   showPage(PAGE_WEATHER);
   if (currentMode == MODE_WEATHER) {
-    updateWeatherFields();
+    scheduleWeatherFieldUpdate(false);
   } else {
-    showWeatherLoadingFields();
+    scheduleWeatherFieldUpdate(true);
   }
 }
 
@@ -534,7 +601,7 @@ static void beginWeatherRefresh() {
   hasTempHumiSnapshot = false;
   lastWeatherLabel = "";
   lastWeatherIconId = 0;
-  showWeatherLoadingFields();
+  scheduleWeatherFieldUpdate(true);
 }
 
 static void updateWeatherFields() {
@@ -570,6 +637,8 @@ static void showWeatherPageForRefreshResponse(bool isWeatherRefreshResponse) {
   if (!isWeatherRefreshResponse || currentMode != MODE_WEATHER) return;
   if (currentDisplayPage != PAGE_WEATHER) {
     showWeatherPageByState();
+  } else if (pendingPageUpdate) {
+    scheduleWeatherFieldUpdate(false);
   } else {
     updateWeatherFields();
   }
@@ -735,7 +804,11 @@ void checkNextionInput() {
   }
 
   if (pendingManualScent.length() > 0 && millis() - lastScentTouchTime > 300) {
-    runManualMode(pendingManualScent);
+    String scentToRun = pendingManualScent;
+    runManualMode(scentToRun);
+    if (blendModeEnabled) {
+      blendSprayActive = scentToRun.length() >= 2;
+    }
     pendingManualScent = "";
   }
 }
@@ -747,6 +820,7 @@ static void toggleBlendMode() {
   blendModeEnabled = !blendModeEnabled;
   blendSelection = "";
   blendSprayActive = false;
+  pendingManualScent = "";
 
   if (blendModeEnabled) {
     nexSend("b_blend.txt=\"blendOFF\"");
@@ -773,6 +847,8 @@ static void handleScentButton(const String &cmd) {
 
   // 일반 모드일 경우 즉시 분사
   if (!blendModeEnabled) {
+    clearBlendSelectionOnly();
+    blendSprayActive = false;
     lastManualPage = PAGE_MANUAL_SCENT_BASE + scent;
     showPage(lastManualPage);
     syncDisplayModeToServer("manual", scent);
@@ -783,8 +859,29 @@ static void handleScentButton(const String &cmd) {
 
   // 블렌딩 모드일 경우 번호 조합
   String scentStr = String(scent);
-  if (blendSelection.indexOf(scentStr) == -1) {
+
+  if (blendSprayActive && isRunning) {
+    stopSystem();
+    blendModeEnabled = true;
+    blendSprayActive = false;
+    nexSend("b_blend.txt=\"blendOFF\"");
+    blendSelection = scentStr;
+    lastManualPage = blendSinglePage(scent);
+    showPage(lastManualPage);
+    return;
+  }
+
+  if (blendSelection.indexOf(scentStr) >= 0) {
+    blendSelection = scentStr;
+    lastManualPage = blendSinglePage(scent);
+    showPage(lastManualPage);
+    return;
+  }
+
+  if (blendSelection.length() == 1) {
     blendSelection += scentStr;
+  } else {
+    blendSelection = scentStr;
   }
 
   if (blendSelection.length() == 1) {
@@ -798,6 +895,7 @@ static void handleScentButton(const String &cmd) {
     pendingManualScent = blendSelection;
     lastScentTouchTime = millis();
     blendSelection = "";
+    blendSprayActive = true;
   }
 }
 
@@ -1049,6 +1147,10 @@ void updateDisplay(int iconID, String text) {
   nexSend("p0.pic=" + String(iconID));
 
   if (currentMode == MODE_WEATHER) {
+    if (currentDisplayPage == PAGE_WEATHER && pendingPageUpdate) {
+      scheduleWeatherFieldUpdate(false);
+      return;
+    }
     updateWeatherFields();
     return;
   }
@@ -1067,9 +1169,20 @@ void updateClockDisplay() {
     pendingPageUpdate = false;
     sendClockDisplayNow();
     
-    if (transitioningPageId == PAGE_MANUAL || transitioningPageId == PAGE_DEVICE_STATUS || 
+    if (transitioningPageId == PAGE_MANUAL || transitioningPageId == PAGE_DEVICE_STATUS ||
         isManualScentPage(transitioningPageId) || isBlendPage(transitioningPageId)) {
       updateScentProgressBars();
+    }
+
+    if (transitioningPageId == PAGE_WEATHER && pendingWeatherFieldUpdate) {
+      pendingWeatherFieldUpdate = false;
+      if (pendingWeatherLoadingUpdate) {
+        showWeatherLoadingFields();
+      } else {
+        updateWeatherFields();
+      }
+    } else if (transitioningPageId != PAGE_WEATHER) {
+      pendingWeatherFieldUpdate = false;
     }
   }
 
@@ -1092,6 +1205,10 @@ void updateTempHumi(float tempC, float humi) {
   lastWeatherTempC = tempC;
   lastWeatherHumi = humi;
   hasTempHumiSnapshot = true;
+  if (currentMode == MODE_WEATHER && currentDisplayPage == PAGE_WEATHER && pendingPageUpdate) {
+    scheduleWeatherFieldUpdate(false);
+    return;
+  }
   setTempFont(TEMP_FONT_NORMAL);
   nexSend("t_temp.txt=\"" + String(tempC, 1) + "C\"");
   nexSend("t_humi.txt=\"" + String(humi, 0) + "%\"");
@@ -1281,6 +1398,7 @@ void pollServer() {
 
   if (now - lastSampleTime >= 3000) {
     lastSampleTime = now;
+    // ⚠️ 파트너님이 실수로 여길 바꾸셨었어요! 다시 currentDbLevel 로 복구합니다.
     dbSamples[sampleIdx] = currentDbLevel; 
     sampleIdx = (sampleIdx + 1) % 5;
   }
@@ -1339,21 +1457,7 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   JsonDocument doc;
   if (deserializeJson(doc, response)) return; 
 
-  static int lastSyncedManualScent = 0;
-
-  if (canApplyServerSettings() && !doc["intensity"].isNull()) {
-    SprayIntensity(doc["intensity"] | 2);
-  }
-
-  if (canApplyServerSettings() && !doc["volume"].isNull()) {
-    applyServerVolumeWithoutPageChange(doc["volume"] | 5);
-  }
-
-  bool isAppCmd = false;
-  if (doc["app_command"] == true || doc["pending_cmd"] == true || doc["command_source"] == "app") {
-    isAppCmd = true;
-  }
-
+  // 1. 날씨 및 지역 정보 업데이트 (공통 수행)
   String weatherText = doc["weather"] | "";
   String targetRegion = doc["target_region"] | "";
   if (targetRegion.length() == 0 && lastWeatherRegion.length() == 0 && weatherText.length() > 0) {
@@ -1386,15 +1490,33 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   refreshWeatherFieldsIfVisible();
   showWeatherPageForRefreshResponse(isWeatherRefreshResponse); 
 
+  // =========================================================================
+  // ★ 문제의 "날씨 API 응답 강제 종료" 방어벽 삭제 완료!
+  // 이제 날씨 API 응답에 담겨오는 인공지능 분사 명령이 아래로 정상적으로 흘러갑니다.
+  // =========================================================================
+
+  // 2. 발향 강도 및 스피커 볼륨 설정
+  static int lastSyncedManualScent = 0;
+
+  if (canApplyServerSettings() && !doc["intensity"].isNull()) {
+    SprayIntensity(doc["intensity"] | 2);
+  }
+
+  if (canApplyServerSettings() && !doc["volume"].isNull()) {
+    applyServerVolumeWithoutPageChange(doc["volume"] | 5);
+  }
+
+  bool isAppCmd = false;
+  if (doc["app_command"] == true || doc["pending_cmd"] == true || doc["command_source"] == "app") {
+    isAppCmd = true;
+  }
+
   String serverActiveMode = doc["active_mode"] | "";
   serverActiveMode.trim();
   int cmd = doc["spray"] | -1;
   String resultText = doc["result_text"] | "";
 
-  // =========================================================================
-  // ★ [치명적 버그 수정] cmd == 0 단독 정지 조건 완전 제거!
-  // 오직 isServerStopCommand() 가 true 일 때만 진짜 정지로 판단합니다.
-  // =========================================================================
+  // 3. 최우선 정지 처리
   if (isServerStopCommand(cmd, resultText, serverActiveMode)) {
     SystemMode modeBeforeStop = currentMode;
     markLocalStop();
@@ -1419,6 +1541,7 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     return;
   }
 
+  // 4. 모드별 화면 전환 제어 
   bool shouldChangeMode = isAppCmd;
   if (serverActiveMode == "weather" && currentMode != MODE_WEATHER) shouldChangeMode = true;
   if (serverActiveMode == "manual" && currentMode != MODE_MANUAL) shouldChangeMode = true;
@@ -1464,6 +1587,7 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     updateMusicMapping(doc["music_tracks"] | "");
   }
 
+  // 5. ★ 분사 및 음악 재생 (이제 정상 작동!)
   if (cmd > 0) {
     int dur = doc["duration"] | 3;
     int music = doc["music"] | 0;
@@ -1509,8 +1633,6 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     setLedColor(ledEnabled ? ledR : 0, ledEnabled ? ledG : 0, ledEnabled ? ledB : 0);
   }
 }
-
-
 
 // =================================================================
 // 📡 [메인 태스크] 큐(Queue)에서 메시지를 꺼내 서버로 전송만 담당
