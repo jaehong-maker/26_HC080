@@ -36,7 +36,7 @@ static const int PAGE_STARTUP_HOME = 33;
 static const int PAGE_LOW_FLUID = 80;
 
 static int lastManualPage = PAGE_MANUAL;
-static int currentDisplayPage = PAGE_WEATHER_OFF;
+static int currentDisplayPage = PAGE_STARTUP_HOME;
 static bool offlineModeActive = false;
 static unsigned long lastLocalSettingsMillis = 0;
 static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 30000;
@@ -266,6 +266,10 @@ static void markLocalStop() {
   lastLocalStopMillis = millis();
 }
 
+static void clearLocalStopMark() {
+  lastLocalStopMillis = 0;
+}
+
 static bool wasRecentlyStoppedLocally() {
   return lastLocalStopMillis > 0 &&
          millis() - lastLocalStopMillis < WEATHER_RESPONSE_IGNORE_AFTER_STOP_MS;
@@ -453,6 +457,7 @@ static void exitBlendModeToManual(bool stopRunningBlend) {
   showPage(PAGE_MANUAL);
 }
 
+static void setTempFont(int fontId);
 static void showWeatherLoadingFields();
 static void updateWeatherFields();
 
@@ -489,11 +494,24 @@ static void showManualPageByState() {
   showPage(currentManualPage());
 }
 
+static void clearWeatherDisplayFields() {
+  nexSend("t_region.txt=\"\"");
+  nexSend("t_weather.txt=\"\"");
+  setTempFont(TEMP_FONT_NORMAL);
+  nexSend("t_temp.txt=\"\"");
+  nexSend("t_humi.txt=\"\"");
+}
+
+static void showWeatherOffPage() {
+  showPage(PAGE_WEATHER_OFF);
+  clearWeatherDisplayFields();
+}
+
 static void showInitialHomePage() {
   if (offlineModeActive) {
     showPage(PAGE_OFFLINE);
   } else {
-    showPage(PAGE_WEATHER_OFF);
+    showPage(PAGE_STARTUP_HOME);
   }
 }
 
@@ -517,7 +535,7 @@ static void showHomePageByWeatherState() {
   if (currentMode == MODE_WEATHER) {
     showWeatherPageByState();
   } else {
-    showPage(PAGE_WEATHER_OFF);
+    showWeatherOffPage();
   }
 }
 
@@ -540,7 +558,7 @@ static void setOfflineModeActive(bool active) {
     }
     showPage(PAGE_OFFLINE);
   } else {
-    showPage(PAGE_WEATHER_OFF);
+    showWeatherOffPage();
   }
 }
 
@@ -692,7 +710,7 @@ static void refreshWeatherFieldsIfVisible() {
 static void showWeatherPageForRefreshResponse(bool isWeatherRefreshResponse) {
   if (!isWeatherRefreshResponse || currentMode != MODE_WEATHER) return;
   if (currentDisplayPage != PAGE_WEATHER) {
-    showWeatherPageByState();
+    return;
   } else if (pendingPageUpdate) {
     scheduleWeatherFieldUpdate(false);
   } else {
@@ -1111,32 +1129,35 @@ void handleNextionCmd(const String &cmd) {
   }
   else if (cmd == "M2") {
     if (offlineModeActive) {
-      showPage(PAGE_WEATHER_OFF);
+      showWeatherOffPage();
     } else if (currentMode == MODE_WEATHER || currentDisplayPage == PAGE_WEATHER) {
       markLocalStop();
       clearWeatherState();
       setSystemMode(MODE_READY, "Weather Mode Off");
       syncDisplayModeToServer("ready");
-      showPage(PAGE_WEATHER_OFF);
+      showWeatherOffPage();
     } else {
-      showPage(PAGE_WEATHER_OFF);
+      showWeatherOffPage();
     }
   }
   else if (cmd == "Y3") {
     if (offlineModeActive) {
       showPage(PAGE_OFFLINE);
     } else if (currentMode == MODE_WEATHER) {
+      clearLocalStopMark();
       showPage(PAGE_WEATHER);
       beginWeatherRefresh();
+      syncDisplayModeToServer("weather");
       requestWeatherRefresh(lastWeatherRegion);
-      syncDisplayModeToServer("weather");
     } else {
+      clearLocalStopMark();
       showPage(PAGE_WEATHER);
       beginWeatherRefresh();
-      enterWeatherMode(true);
+      enterWeatherMode(false);
       syncDisplayModeToServer("weather");
+      requestWeatherRefresh(lastWeatherRegion);
     }
-  } 
+  }
   else if (cmd == "M1" || cmd == "Y1") {
     showManualPageByState();
     if (currentMode != MODE_WEATHER) {
@@ -1163,7 +1184,7 @@ void handleNextionCmd(const String &cmd) {
       lastWeatherLabel = "";
       lastWeatherIconId = 0;
       syncDisplayModeToServer("ready");
-      showPage(PAGE_WEATHER_OFF);
+      showWeatherOffPage();
     } else if (modeBeforeStop == MODE_MANUAL) {
       lastStoppedManualScent = isManualScentPage(currentDisplayPage) ? (currentDisplayPage - PAGE_MANUAL_SCENT_BASE) : 0;
       manualModeOffMillis = millis();
@@ -1460,7 +1481,11 @@ void connectWiFi() {
       int returnPage = prefs.getInt("wifi_return_page", PAGE_WEATHER_OFF);
       prefs.remove("wifi_return_page");
       if (returnPage == PAGE_WIFI_RESET) returnPage = PAGE_WEATHER_OFF;
-      showPage(returnPage);
+      if (returnPage == PAGE_WEATHER_OFF) {
+        showWeatherOffPage();
+      } else {
+        showPage(returnPage);
+      }
     }
   }
 
@@ -1618,8 +1643,13 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     cmd <= 4 &&
     serverActiveMode != "weather";
 
+  bool isActiveWeatherRefreshResponse =
+    isWeatherRefreshResponse &&
+    currentMode == MODE_WEATHER &&
+    isWeatherLikeResponse(serverActiveMode, weatherText, targetRegion, isWeatherRefreshResponse);
+
   // 3. 최우선 정지 처리
-  if (isServerStopCommand(cmd, resultText, serverActiveMode)) {
+  if (!isActiveWeatherRefreshResponse && isServerStopCommand(cmd, resultText, serverActiveMode)) {
     SystemMode modeBeforeStop = currentMode;
     markLocalStop();
     clearWeatherState();
@@ -1631,7 +1661,7 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     setSystemMode(MODE_READY, "Stopped by Server");
     
     if (modeBeforeStop == MODE_WEATHER || currentDisplayPage == PAGE_WEATHER) {
-      showPage(PAGE_WEATHER_OFF);
+      showWeatherOffPage();
     } else {
       updateDisplay(0, "Stopped by Server");
     }
@@ -1913,12 +1943,37 @@ void changeVolume(int vol) {
 void initOTA() { 
   ArduinoOTA.setHostname("SmartDiffuser"); 
   ArduinoOTA.setPassword("1234"); 
-  ArduinoOTA.begin();
+  
+  ArduinoOTA.onStart([]() {
+    esp_task_wdt_delete(NULL); // 업데이트 시작: 감시견 취침
+    forceAllOff(); 
+    updateDisplay(0, "OTA Updating...");
+    Serial.println("\r\n[OTA] 무선 업데이트 시작...");
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    prefs.putBool("force_startup_page", true);
+    updateDisplay(0, "Update Success!");
+    Serial.println("\r\n[OTA] 무선 업데이트 완료!");
+    esp_task_wdt_add(NULL); // 완료 시 감시견 복구 (안전을 위해)
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    int percent = (progress / (total / 100));
+    updateDisplay(0, String("OTA ") + String(percent) + "%");
+    Serial.printf("[OTA] 진행률: %u%%\r", percent);
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    updateDisplay(0, "OTA Error!");
+    Serial.printf("\r\n[OTA] 에러 발생 코드: [%u]\r\n", error);
+    
+    // ★ 최종 수정: 에러 발생 시 감시견을 어설프게 건드리지 않고, 1.5초 뒤 깔끔하게 재부팅!
+    delay(1500);
+    ESP.restart(); 
+  });
+  
+  ArduinoOTA.begin(); 
 }
 
-// =========================================================
-// 👇 통째로 날아가서 에러를 발생시킨 범인입니다. 꼭 추가해 주세요!
-// =========================================================
-void handleOTA() {
-  ArduinoOTA.handle();
-}
+void handleOTA() { ArduinoOTA.handle(); }
