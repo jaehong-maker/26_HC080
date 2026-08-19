@@ -42,6 +42,9 @@ static unsigned long lastLocalSettingsMillis = 0;
 static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 30000;
 static unsigned long lastLocalStopMillis = 0;
 static const unsigned long WEATHER_RESPONSE_IGNORE_AFTER_STOP_MS = 15000;
+static bool hasRecentSprayActivityForHomeReturn = false;
+static unsigned long sprayIdleStartMillis = 0;
+static const unsigned long SPRAY_IDLE_HOME_DELAY_MS = 5000;
 
 static String pendingManualScent = "";
 static unsigned long lastScentTouchTime = 0;
@@ -350,21 +353,51 @@ static int blendPairPage(const String &selection) {
 
 static void showManualPageByState();
 
-static bool isValidBlendCommand(int activeScent) {
-  if (activeScent < 10 || activeScent > 44) return false;
-  String value = String(activeScent);
-  if (value.length() != 2) return false;
+static bool isValidBlendSelection(const String &selection) {
+  if (selection.length() != 2) return false;
 
-  int first = value.charAt(0) - '0';
-  int second = value.charAt(1) - '0';
+  int first = selection.charAt(0) - '0';
+  int second = selection.charAt(1) - '0';
   return first >= 1 && first <= 4 &&
          second >= 1 && second <= 4 &&
          first != second;
 }
 
+static bool isValidBlendCommand(int activeScent) {
+  return isValidBlendSelection(String(activeScent));
+}
+
+static String makeBlendPair(const String &firstScent, const String &secondScent) {
+  if (firstScent.length() != 1 || secondScent.length() != 1 || firstScent == secondScent) {
+    return "";
+  }
+
+  char first = firstScent.charAt(0);
+  char second = secondScent.charAt(0);
+  if (first < '1' || first > '4' || second < '1' || second > '4') return "";
+  if (first > second) {
+    char tmp = first;
+    first = second;
+    second = tmp;
+  }
+
+  String pair = "";
+  pair += first;
+  pair += second;
+  return pair;
+}
+
 static void clearBlendSelectionOnly() {
   blendSelection = "";
   pendingManualScent = "";
+}
+
+static bool isBlendSelectionInProgress() {
+  return blendModeEnabled && !blendSprayActive && blendSelection.length() == 1;
+}
+
+static bool isBlendUiActive() {
+  return blendModeEnabled || isBlendPage(currentDisplayPage);
 }
 
 static void showManualPageForServerScent(int activeScent) {
@@ -399,6 +432,25 @@ static void showManualPageForServerScent(int activeScent) {
   }
 
   showPage(lastManualPage);
+}
+
+static void exitBlendModeToManual(bool stopRunningBlend) {
+  if (stopRunningBlend && blendSprayActive) {
+    forceAllOff();
+    myDFPlayer.stop();
+    isRunning = false;
+    isSpraying = false;
+    for (int i = 0; i < 4; i++) activeNozzles[i] = false;
+  }
+
+  blendModeEnabled = false;
+  blendSelection = "";
+  blendSprayActive = false;
+  pendingManualScent = "";
+  currentMode = MODE_MANUAL;
+  nexSend("b_blend.txt=\"blendON\"");
+  lastManualPage = PAGE_MANUAL;
+  showPage(PAGE_MANUAL);
 }
 
 static void showWeatherLoadingFields();
@@ -437,6 +489,14 @@ static void showManualPageByState() {
   showPage(currentManualPage());
 }
 
+static void showInitialHomePage() {
+  if (offlineModeActive) {
+    showPage(PAGE_OFFLINE);
+  } else {
+    showPage(PAGE_WEATHER_OFF);
+  }
+}
+
 static void showWeatherPageByState() {
   showPage(PAGE_WEATHER);
   if (currentMode == MODE_WEATHER) {
@@ -467,11 +527,7 @@ void showStartupReadyPage() {
   clearWeatherState();
   setSystemMode(MODE_READY, "Startup Ready");
 
-  if (offlineModeActive) {
-    showPage(PAGE_OFFLINE);
-    return;
-  }
-  showPage(PAGE_WEATHER_OFF);
+  showInitialHomePage();
 }
 
 static void setOfflineModeActive(bool active) {
@@ -804,6 +860,11 @@ void checkNextionInput() {
   }
 
   if (pendingManualScent.length() > 0 && millis() - lastScentTouchTime > 300) {
+    if (isBlendSelectionInProgress() && pendingManualScent.length() < 2) {
+      pendingManualScent = "";
+      return;
+    }
+
     String scentToRun = pendingManualScent;
     runManualMode(scentToRun);
     if (blendModeEnabled) {
@@ -817,22 +878,21 @@ void checkNextionInput() {
 // 🖥️ [분리된 헬퍼 함수 1] 블렌딩 모드(BM) 켜기/끄기 토글 처리
 // =================================================================
 static void toggleBlendMode() {
-  blendModeEnabled = !blendModeEnabled;
+  if (blendModeEnabled || isBlendPage(currentDisplayPage)) {
+    exitBlendModeToManual(true);
+    Serial.println("\r\n[BLEND] OFF");
+    return;
+  }
+
+  blendModeEnabled = true;
   blendSelection = "";
   blendSprayActive = false;
   pendingManualScent = "";
 
-  if (blendModeEnabled) {
-    nexSend("b_blend.txt=\"blendOFF\"");
-    lastManualPage = PAGE_BLEND_HOME;
-    showPage(PAGE_BLEND_HOME);
-    Serial.println("\r\n[BLEND] ON");
-  } else {
-    nexSend("b_blend.txt=\"blendON\"");
-    lastManualPage = PAGE_MANUAL;
-    showPage(PAGE_MANUAL);
-    Serial.println("\r\n[BLEND] OFF");
-  }
+  nexSend("b_blend.txt=\"blendOFF\"");
+  lastManualPage = PAGE_BLEND_HOME;
+  showPage(PAGE_BLEND_HOME);
+  Serial.println("\r\n[BLEND] ON");
 }
 
 // =================================================================
@@ -843,10 +903,11 @@ static void handleScentButton(const String &cmd) {
   if (scent < 1 || scent > 4) return;
 
   Serial.printf("\r\n[S BUTTON] %s\r\n", cmd.c_str());
-  currentMode = MODE_MANUAL;
+  String scentStr = String(scent);
 
   // 일반 모드일 경우 즉시 분사
-  if (!blendModeEnabled) {
+  if (!isBlendUiActive()) {
+    currentMode = MODE_MANUAL;
     clearBlendSelectionOnly();
     blendSprayActive = false;
     lastManualPage = PAGE_MANUAL_SCENT_BASE + scent;
@@ -857,13 +918,15 @@ static void handleScentButton(const String &cmd) {
     return;
   }
 
-  // 블렌딩 모드일 경우 번호 조합
-  String scentStr = String(scent);
+  blendModeEnabled = true;
 
-  if (blendSprayActive && isRunning) {
-    stopSystem();
+  if (blendSprayActive) {
+    if (isRunning) {
+      stopSystem();
+    }
     blendModeEnabled = true;
     blendSprayActive = false;
+    pendingManualScent = "";
     nexSend("b_blend.txt=\"blendOFF\"");
     blendSelection = scentStr;
     lastManualPage = blendSinglePage(scent);
@@ -871,32 +934,30 @@ static void handleScentButton(const String &cmd) {
     return;
   }
 
-  if (blendSelection.indexOf(scentStr) >= 0) {
+  if (blendSelection.length() == 0 || blendSelection == scentStr) {
     blendSelection = scentStr;
     lastManualPage = blendSinglePage(scent);
     showPage(lastManualPage);
     return;
   }
 
-  if (blendSelection.length() == 1) {
-    blendSelection += scentStr;
-  } else {
+  String pair = makeBlendPair(blendSelection, scentStr);
+  if (!isValidBlendSelection(pair)) {
     blendSelection = scentStr;
-  }
-
-  if (blendSelection.length() == 1) {
     lastManualPage = blendSinglePage(scent);
     showPage(lastManualPage);
-  } else if (blendSelection.length() == 2) {
-    lastManualPage = blendPairPage(blendSelection);
-    showPage(lastManualPage);
-    syncDisplayModeToServer("manual", blendSelection.toInt());
-    
-    pendingManualScent = blendSelection;
-    lastScentTouchTime = millis();
-    blendSelection = "";
-    blendSprayActive = true;
+    return;
   }
+
+  lastManualPage = blendPairPage(pair);
+  showPage(lastManualPage);
+  currentMode = MODE_MANUAL;
+  syncDisplayModeToServer("manual", pair.toInt());
+
+  pendingManualScent = pair;
+  lastScentTouchTime = millis();
+  blendSelection = "";
+  blendSprayActive = true;
 }
 
 // =================================================================
@@ -1004,17 +1065,30 @@ void handleNextionCmd(const String &cmd) {
 
   // ★ 2. 글로벌 UI 쿨타임 방어 (버튼 연속 터치 버그 방지)
   static unsigned long lastValidCmdMillis = 0;
+  static String lastScentCmd = "";
+  static unsigned long lastScentCmdMillis = 0;
   bool isVolumeCmd = cmd.startsWith("V"); // 볼륨 슬라이더는 연속 입력 허용
-  unsigned long cooldown = isVolumeCmd ? 50 : 1000; // 일반 버튼은 1초(1000ms) 쿨타임 적용
+  bool isScentCmd = cmd.startsWith("S");
+  bool isBlendScentCmd = isScentCmd && isBlendUiActive();
+  unsigned long cooldown = isVolumeCmd ? 50 : 1000;
 
   // 쿨타임을 무시하고 즉시 반응해야 하는 화면 전환/모드 변경 커맨드들
-  bool isNoCooldownCmd = (cmd == "ST" || cmd == "WR" || cmd == "BM" || cmd == "DS" || cmd == "OF" || cmd.startsWith("M") || cmd.startsWith("Y"));
+  bool isNoCooldownCmd = (isBlendScentCmd || cmd == "ST" || cmd == "WR" || cmd == "BM" || cmd == "DS" || cmd == "OF" || cmd.startsWith("M") || cmd.startsWith("Y"));
 
   if (!isNoCooldownCmd && millis() - lastValidCmdMillis < cooldown) {
     Serial.printf("\r\n[UI] 쿨타임 방어: %s 명령 무시됨\r\n", cmd.c_str());
     return;
   }
   lastValidCmdMillis = millis();
+
+  if (isBlendScentCmd) {
+    if (cmd == lastScentCmd && millis() - lastScentCmdMillis < 250) {
+      Serial.printf("\r\n[UI] 블렌드 중복 터치 방어: %s 명령 무시됨\r\n", cmd.c_str());
+      return;
+    }
+    lastScentCmd = cmd;
+    lastScentCmdMillis = millis();
+  }
 
   Serial.printf("\r\n[Nextion] CMD: %s\r\n", cmd.c_str());
 
@@ -1038,7 +1112,7 @@ void handleNextionCmd(const String &cmd) {
   else if (cmd == "M2") {
     if (offlineModeActive) {
       showPage(PAGE_WEATHER_OFF);
-    } else if (currentMode == MODE_WEATHER) {
+    } else if (currentMode == MODE_WEATHER || currentDisplayPage == PAGE_WEATHER) {
       markLocalStop();
       clearWeatherState();
       setSystemMode(MODE_READY, "Weather Mode Off");
@@ -1164,6 +1238,27 @@ void updateDisplay(int iconID, String text) {
 static bool volumeNeedsSave = false;
 static unsigned long lastVolumeChangeTime = 0;
 
+static void returnHomeAfterSprayIdle() {
+  if (isSpraying) {
+    hasRecentSprayActivityForHomeReturn = true;
+    sprayIdleStartMillis = 0;
+    return;
+  }
+
+  if (!hasRecentSprayActivityForHomeReturn) return;
+
+  if (sprayIdleStartMillis == 0) {
+    sprayIdleStartMillis = millis();
+    return;
+  }
+
+  if (millis() - sprayIdleStartMillis < SPRAY_IDLE_HOME_DELAY_MS) return;
+
+  hasRecentSprayActivityForHomeReturn = false;
+  sprayIdleStartMillis = 0;
+  showInitialHomePage();
+}
+
 void updateClockDisplay() {
   if (pendingPageUpdate && millis() - pageTransitionTime >= 80) {
     pendingPageUpdate = false;
@@ -1193,6 +1288,8 @@ void updateClockDisplay() {
   }
 
   static unsigned long lastClockUpdate = 0;
+
+  returnHomeAfterSprayIdle();
 
   // 1초마다 한 번씩만 업데이트 (과부하 방지)
   if (millis() - lastClockUpdate < 1000) return;
@@ -1515,6 +1612,11 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   serverActiveMode.trim();
   int cmd = doc["spray"] | -1;
   String resultText = doc["result_text"] | "";
+  bool suppressManualSingleDuringBlendSelection =
+    isBlendSelectionInProgress() &&
+    cmd >= 1 &&
+    cmd <= 4 &&
+    serverActiveMode != "weather";
 
   // 3. 최우선 정지 처리
   if (isServerStopCommand(cmd, resultText, serverActiveMode)) {
@@ -1542,6 +1644,16 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   }
 
   // 4. 모드별 화면 전환 제어 
+  bool ignoreWeatherAfterLocalStop =
+    wasRecentlyStoppedLocally() &&
+    currentMode != MODE_WEATHER &&
+    isWeatherLikeResponse(serverActiveMode, weatherText, targetRegion, isWeatherRefreshResponse);
+
+  if (ignoreWeatherAfterLocalStop) {
+    Serial.println(C_YELLOW "\r\n[Weather] Ignored stale weather response after local stop\r\n" C_RESET);
+    return;
+  }
+
   bool shouldChangeMode = isAppCmd;
   if (serverActiveMode == "weather" && currentMode != MODE_WEATHER) shouldChangeMode = true;
   if (serverActiveMode == "manual" && currentMode != MODE_MANUAL) shouldChangeMode = true;
@@ -1560,21 +1672,24 @@ static void processServerResponse(const String& response, bool isPollRequest = t
       if (activeScent <= 0) {
         activeScent = doc["spray"] | 0;
       }
-      int firstScent = activeScent;
-      while (firstScent > 9) {
-        firstScent /= 10;
-      }
 
-      if (firstScent >= 1 && firstScent <= 4) {
+      suppressManualSingleDuringBlendSelection =
+        suppressManualSingleDuringBlendSelection ||
+        (isBlendSelectionInProgress() &&
+         activeScent >= 1 &&
+         activeScent <= 4 &&
+         !isValidBlendCommand(activeScent));
+
+      if (!suppressManualSingleDuringBlendSelection &&
+          ((activeScent >= 1 && activeScent <= 4) || isValidBlendCommand(activeScent))) {
         if (lastStoppedManualScent == activeScent && millis() - manualModeOffMillis < 5000) {
           return;
         }
         bool scentChanged = activeScent != lastSyncedManualScent;
         lastSyncedManualScent = activeScent;
-        lastManualPage = PAGE_MANUAL_SCENT_BASE + firstScent;
         if (currentMode != MODE_MANUAL || scentChanged) {
           setSystemMode(MODE_MANUAL, "Manual Mode");
-          showPage(lastManualPage);
+          showManualPageForServerScent(activeScent);
         }
       } else if (currentMode != MODE_MANUAL) {
         setSystemMode(MODE_MANUAL, "Manual Mode");
@@ -1588,12 +1703,17 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   }
 
   // 5. ★ 분사 및 음악 재생 (이제 정상 작동!)
-  if (cmd > 0) {
+  bool shouldRunSpray = cmd > 0;
+  if (suppressManualSingleDuringBlendSelection && cmd >= 1 && cmd <= 4) {
+    shouldRunSpray = false;
+  }
+
+  if (shouldRunSpray) {
     int dur = doc["duration"] | 3;
     int music = doc["music"] | 0;
     String txt = resultText.length() > 0 ? resultText : "명령 수신";
     triggerSpray(cmd, dur, music, txt, (currentMode == MODE_WEATHER));
-  } else if (!doc["music"].isNull() && doc["music"] > 0) {
+  } else if (!suppressManualSingleDuringBlendSelection && !doc["music"].isNull() && doc["music"] > 0) {
     int track = doc["music"] | 0;
     playSound(track);
     nexSend("t_music.txt=\"" + getTrackName(track) + "\"");
@@ -1793,37 +1913,12 @@ void changeVolume(int vol) {
 void initOTA() { 
   ArduinoOTA.setHostname("SmartDiffuser"); 
   ArduinoOTA.setPassword("1234"); 
-  
-  ArduinoOTA.onStart([]() {
-    esp_task_wdt_delete(NULL); // 업데이트 시작: 감시견 취침
-    forceAllOff(); 
-    updateDisplay(0, "OTA Updating...");
-    Serial.println("\r\n[OTA] 무선 업데이트 시작...");
-  });
-  
-  ArduinoOTA.onEnd([]() {
-    prefs.putBool("force_startup_page", true);
-    updateDisplay(0, "Update Success!");
-    Serial.println("\r\n[OTA] 무선 업데이트 완료!");
-    esp_task_wdt_add(NULL); // 완료 시 감시견 복구 (안전을 위해)
-  });
-  
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    int percent = (progress / (total / 100));
-    updateDisplay(0, String("OTA ") + String(percent) + "%");
-    Serial.printf("[OTA] 진행률: %u%%\r", percent);
-  });
-  
-  ArduinoOTA.onError([](ota_error_t error) {
-    updateDisplay(0, "OTA Error!");
-    Serial.printf("\r\n[OTA] 에러 발생 코드: [%u]\r\n", error);
-    
-    // ★ 최종 수정: 에러 발생 시 감시견을 어설프게 건드리지 않고, 1.5초 뒤 깔끔하게 재부팅!
-    delay(1500);
-    ESP.restart(); 
-  });
-  
-  ArduinoOTA.begin(); 
+  ArduinoOTA.begin();
 }
 
-void handleOTA() { ArduinoOTA.handle(); }
+// =========================================================
+// 👇 통째로 날아가서 에러를 발생시킨 범인입니다. 꼭 추가해 주세요!
+// =========================================================
+void handleOTA() {
+  ArduinoOTA.handle();
+}
