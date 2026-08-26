@@ -1,0 +1,13 @@
+{
+  "appId": "com.diffuser.hoon.app",
+  "appName": "SmartDiffuser",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}
