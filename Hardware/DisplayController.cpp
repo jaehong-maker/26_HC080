@@ -5,7 +5,7 @@ bool hasWeatherSnapshot = false;
 bool hasTempHumiSnapshot = false;
 float lastWeatherTempC = 0.0f;
 float lastWeatherHumi = 0.0f;
-int currentDisplayPage = PAGE_STARTUP_HOME;
+int currentDisplayPage = PAGE_WEATHER_OFF;
 unsigned long manualModeOffMillis = 0;
 int lastStoppedManualScent = 0;
 bool offlineModeActive = false;
@@ -26,9 +26,6 @@ static bool pendingWeatherFieldUpdate = false;
 static bool pendingWeatherLoadingUpdate = false;
 
 static unsigned long lastScentTouchTime = 0;
-static bool hasRecentSprayActivityForHomeReturn = false;
-static unsigned long sprayIdleStartMillis = 0;
-static const unsigned long SPRAY_IDLE_HOME_DELAY_MS = 5000;
 static bool volumeNeedsSave = false;
 static unsigned long lastVolumeChangeTime = 0;
 
@@ -211,8 +208,11 @@ static void exitBlendModeToManual(bool stopRunningBlend) {
 // =================================================================
 static void setTempFont(int fontId) { nexSend("t_temp.font=" + String(fontId)); }
 static void clearWeatherDisplayFields() { nexSend("t_region.txt=\"\""); nexSend("t_weather.txt=\"\""); setTempFont(TEMP_FONT_NORMAL); nexSend("t_temp.txt=\"\""); nexSend("t_humi.txt=\"\""); }
-void showWeatherOffPage() { showPage(PAGE_WEATHER_OFF); clearWeatherDisplayFields(); }
-static void showInitialHomePage() { if (offlineModeActive) showPage(PAGE_OFFLINE); else showPage(PAGE_STARTUP_HOME); }
+void showWeatherOffPage() {
+  showPage(PAGE_WEATHER_OFF);
+  clearWeatherDisplayFields();
+}
+static void showInitialHomePage() { if (offlineModeActive) showPage(PAGE_OFFLINE); else showWeatherOffPage(); }
 void showWeatherPageByState() { showPage(PAGE_WEATHER); if (currentMode == MODE_WEATHER) scheduleWeatherFieldUpdate(false); else scheduleWeatherFieldUpdate(true); }
 void clearWeatherState() { hasWeatherSnapshot = false; hasTempHumiSnapshot = false; lastWeatherLabel = ""; lastWeatherIconId = 0; }
 static void showHomePageByWeatherState() { if (currentMode == MODE_WEATHER) showWeatherPageByState(); else showWeatherOffPage(); }
@@ -261,17 +261,24 @@ static void sendCachedTempHumi() {
   nexSend("t_temp.txt=\"" + String(lastWeatherTempC, 1) + "C\""); nexSend("t_humi.txt=\"" + String(lastWeatherHumi, 0) + "%\"");
 }
 static void showWeatherLoadingFields() { nexSend("t_region.txt=\"\""); nexSend("t_weather.txt=\"\""); setTempFont(TEMP_FONT_LOADING); nexSend("t_temp.txt=\"Loading\""); nexSend("t_humi.txt=\"\""); }
-void beginWeatherRefresh() { hasWeatherSnapshot = false; hasTempHumiSnapshot = false; lastWeatherLabel = ""; lastWeatherIconId = 0; scheduleWeatherFieldUpdate(true); }
+static void updateWeatherFields();
+static void refreshWeatherFieldsOnVisiblePage(bool loading) {
+  if (currentDisplayPage != PAGE_WEATHER) return;
+  if (!loading && currentMode != MODE_WEATHER) return;
+  if (pendingPageUpdate) { scheduleWeatherFieldUpdate(loading); return; }
+  if (loading) showWeatherLoadingFields(); else updateWeatherFields();
+}
+void beginWeatherRefresh() { hasWeatherSnapshot = false; hasTempHumiSnapshot = false; lastWeatherLabel = ""; lastWeatherIconId = 0; refreshWeatherFieldsOnVisiblePage(true); }
 static void updateWeatherFields() {
   String regionText = lastWeatherRegion; regionText.trim(); String weatherText = lastWeatherLabel; weatherText.trim();
   if (!hasWeatherSnapshot || !hasValidWeatherText(weatherText)) { showWeatherLoadingFields(); return; }
   if (regionText.length() == 0) nexSend("t_region.txt=\"\""); else if (!sendEncodedRegionText(regionText)) nexSend("t_region.txt=\"\"");
   if (!sendEncodedWeatherText(weatherText)) sendEncodedWeatherBytes(WEATHER_UNKNOWN, sizeof(WEATHER_UNKNOWN)); sendCachedTempHumi();
 }
-void refreshWeatherFieldsIfVisible() { if (currentMode == MODE_WEATHER && currentDisplayPage == PAGE_WEATHER) updateWeatherFields(); }
+void refreshWeatherFieldsIfVisible() { refreshWeatherFieldsOnVisiblePage(false); }
 void showWeatherPageForRefreshResponse(bool isWeatherRefreshResponse) {
   if (!isWeatherRefreshResponse || currentMode != MODE_WEATHER) return;
-  if (currentDisplayPage != PAGE_WEATHER) return; else if (pendingPageUpdate) scheduleWeatherFieldUpdate(false); else updateWeatherFields();
+  refreshWeatherFieldsOnVisiblePage(false);
 }
 
 // =================================================================
@@ -358,7 +365,7 @@ void handleNextionCmd(const String &cmd) {
   else if (cmd == "IM") showPage(currentIntensityPage());
   else if (cmd == "WR") { prefs.putInt("wifi_return_page", currentDisplayPage); showPage(PAGE_WIFI_RESET); }
   else if (cmd == "M2") { if (offlineModeActive) showWeatherOffPage(); else if (currentMode == MODE_WEATHER || currentDisplayPage == PAGE_WEATHER) { markLocalStop(); clearWeatherState(); setSystemMode(MODE_READY, "Weather Mode Off"); syncDisplayModeToServer("ready"); showWeatherOffPage(); } else showWeatherOffPage(); }
-  else if (cmd == "Y3") { if (offlineModeActive) showPage(PAGE_OFFLINE); else if (currentMode == MODE_WEATHER) { clearLocalStopMark(); showPage(PAGE_WEATHER); beginWeatherRefresh(); syncDisplayModeToServer("weather"); requestWeatherRefresh(""); } else { clearLocalStopMark(); showPage(PAGE_WEATHER); beginWeatherRefresh(); enterWeatherMode(false); syncDisplayModeToServer("weather"); requestWeatherRefresh(""); } }
+  else if (cmd == "Y3") { if (offlineModeActive) showPage(PAGE_OFFLINE); else if (currentMode == MODE_WEATHER) { clearLocalStopMark(); markLocalWeatherStart(); showPage(PAGE_WEATHER); beginWeatherRefresh(); syncDisplayModeToServer("weather"); requestWeatherRefresh(lastWeatherRegion); } else { clearLocalStopMark(); markLocalWeatherStart(); showPage(PAGE_WEATHER); beginWeatherRefresh(); enterWeatherMode(false); syncDisplayModeToServer("weather"); requestWeatherRefresh(lastWeatherRegion); } }
   else if (cmd == "M1" || cmd == "Y1") { showManualPageByState(); if (currentMode != MODE_WEATHER) setSystemMode(MODE_MANUAL, "Manual Mode"); } 
   else if (cmd == "M3" || cmd == "Y2") { showPage(PAGE_DEVICE_STATUS); updateScentProgressBars(); if (currentMode != MODE_WEATHER) setSystemMode(MODE_SETTING, "Setting Mode"); } 
   else if (cmd == "ST") {
@@ -376,22 +383,14 @@ void handleNextionCmd(const String &cmd) {
 }
 
 void updateDisplay(int iconID, String text) { 
-  if (currentMode == MODE_WEATHER && lastWeatherIconId >= 1 && lastWeatherIconId <= 4) iconID = lastWeatherIconId;
+  if (currentMode == MODE_WEATHER && currentDisplayPage == PAGE_WEATHER && lastWeatherIconId >= 1 && lastWeatherIconId <= 4) iconID = lastWeatherIconId;
   nexSend("p0.pic=" + String(iconID));
-  if (currentMode == MODE_WEATHER) { if (currentDisplayPage == PAGE_WEATHER && pendingPageUpdate) scheduleWeatherFieldUpdate(false); else updateWeatherFields(); }
+  refreshWeatherFieldsOnVisiblePage(false);
 }
 
 // =================================================================
 // 🕒 디스플레이 데이터 자동 갱신 및 터미널 출력
 // =================================================================
-static void returnHomeAfterSprayIdle() {
-  if (isSpraying) { hasRecentSprayActivityForHomeReturn = true; sprayIdleStartMillis = 0; return; }
-  if (!hasRecentSprayActivityForHomeReturn) return;
-  if (sprayIdleStartMillis == 0) { sprayIdleStartMillis = millis(); return; }
-  if (millis() - sprayIdleStartMillis < SPRAY_IDLE_HOME_DELAY_MS) return;
-  hasRecentSprayActivityForHomeReturn = false; sprayIdleStartMillis = 0; showInitialHomePage();
-}
-
 void updateClockDisplay() {
   if (pendingPageUpdate && millis() - pageTransitionTime >= 80) {
     pendingPageUpdate = false; sendClockDisplayNow();
@@ -399,14 +398,13 @@ void updateClockDisplay() {
     if (transitioningPageId == PAGE_WEATHER && pendingWeatherFieldUpdate) { pendingWeatherFieldUpdate = false; if (pendingWeatherLoadingUpdate) showWeatherLoadingFields(); else updateWeatherFields(); } else if (transitioningPageId != PAGE_WEATHER) pendingWeatherFieldUpdate = false;
   }
   if (volumeNeedsSave && millis() - lastVolumeChangeTime > 3000) { prefs.putInt("volume", currentVolume); volumeNeedsSave = false; Serial.println(C_CYAN "[System] 볼륨 자동 저장 완료" C_RESET); }
-  static unsigned long lastClockUpdate = 0; returnHomeAfterSprayIdle();
+  static unsigned long lastClockUpdate = 0;
   if (millis() - lastClockUpdate < 1000) return; lastClockUpdate = millis(); sendClockDisplayNow();
 }
 
 void updateTempHumi(float tempC, float humi) {
   lastWeatherTempC = tempC; lastWeatherHumi = humi; hasTempHumiSnapshot = true;
-  if (currentMode == MODE_WEATHER && currentDisplayPage == PAGE_WEATHER && pendingPageUpdate) { scheduleWeatherFieldUpdate(false); return; }
-  setTempFont(TEMP_FONT_NORMAL); nexSend("t_temp.txt=\"" + String(tempC, 1) + "C\""); nexSend("t_humi.txt=\"" + String(humi, 0) + "%\"");
+  refreshWeatherFieldsOnVisiblePage(false);
 }
 
 void updateProgressBar(int val) { updateProgressBar(1, val); }
