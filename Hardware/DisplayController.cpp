@@ -364,7 +364,12 @@ void handleNextionCmd(const String &cmd) {
   else if (cmd == "DS") { showPage(PAGE_DEVICE_STATUS); updateScentProgressBars(); }
   else if (cmd == "IM") showPage(currentIntensityPage());
   else if (cmd == "WR") { prefs.putInt("wifi_return_page", currentDisplayPage); showPage(PAGE_WIFI_RESET); }
-  else if (cmd == "M2") { if (offlineModeActive) showWeatherOffPage(); else if (currentMode == MODE_WEATHER || currentDisplayPage == PAGE_WEATHER) { markLocalStop(); clearWeatherState(); setSystemMode(MODE_READY, "Weather Mode Off"); syncDisplayModeToServer("ready"); showWeatherOffPage(); } else showWeatherOffPage(); }
+  else if (cmd == "M2") {
+    if (offlineModeActive) showWeatherOffPage();
+    else if (currentMode == MODE_WEATHER && currentDisplayPage == PAGE_WEATHER) { markLocalStop(); clearWeatherState(); setSystemMode(MODE_READY, "Weather Mode Off"); syncDisplayModeToServer("ready"); showWeatherOffPage(); }
+    else if (currentMode == MODE_WEATHER) showWeatherPageByState();
+    else showWeatherOffPage();
+  }
   else if (cmd == "Y3") { if (offlineModeActive) showPage(PAGE_OFFLINE); else if (currentMode == MODE_WEATHER) { clearLocalStopMark(); markLocalWeatherStart(); showPage(PAGE_WEATHER); beginWeatherRefresh(); syncDisplayModeToServer("weather"); requestWeatherRefresh(lastWeatherRegion); } else { clearLocalStopMark(); markLocalWeatherStart(); showPage(PAGE_WEATHER); beginWeatherRefresh(); enterWeatherMode(false); syncDisplayModeToServer("weather"); requestWeatherRefresh(lastWeatherRegion); } }
   else if (cmd == "M1" || cmd == "Y1") { showManualPageByState(); if (currentMode != MODE_WEATHER) setSystemMode(MODE_MANUAL, "Manual Mode"); } 
   else if (cmd == "M3" || cmd == "Y2") { showPage(PAGE_DEVICE_STATUS); updateScentProgressBars(); if (currentMode != MODE_WEATHER) setSystemMode(MODE_SETTING, "Setting Mode"); } 
