@@ -259,6 +259,7 @@ void changeVolume(int vol);
 // --- NetworkUI.cpp ---
 void markLocalStop();
 void clearLocalStopMark();
+void markLocalWeatherStart();
 void markLocalSettingsChanged();
 void connectWiFi();
 void manageWiFi();
