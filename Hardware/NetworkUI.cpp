@@ -4,19 +4,26 @@ static WiFiClientSecure sharedClient;
 static bool isSessionInit = false;
 
 static unsigned long lastLocalSettingsMillis = 0;
-static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 30000;
+static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 3000;
 static unsigned long lastLocalStopMillis = 0;
 static const unsigned long WEATHER_RESPONSE_IGNORE_AFTER_STOP_MS = 15000;
+static unsigned long lastLocalWeatherStartMillis = 0;
+static const unsigned long WEATHER_STOP_IGNORE_AFTER_START_MS = 3000;
 
 void markLocalSettingsChanged() { lastLocalSettingsMillis = millis(); }
 void markLocalStop() { lastLocalStopMillis = millis(); }
 void clearLocalStopMark() { lastLocalStopMillis = 0; }
+void markLocalWeatherStart() { lastLocalWeatherStartMillis = millis(); }
 
 static bool canApplyServerSettings() {
   return lastLocalSettingsMillis == 0 || (millis() - lastLocalSettingsMillis >= LOCAL_SETTINGS_PROTECT_MS);
 }
 static bool wasRecentlyStoppedLocally() {
   return lastLocalStopMillis > 0 && millis() - lastLocalStopMillis < WEATHER_RESPONSE_IGNORE_AFTER_STOP_MS;
+}
+
+static bool wasWeatherStartedLocallyRecently() {
+  return lastLocalWeatherStartMillis > 0 && millis() - lastLocalWeatherStartMillis < WEATHER_STOP_IGNORE_AFTER_START_MS;
 }
 
 static bool isServerStopCommand(int cmd, const String &resultText, const String &serverActiveMode) {
@@ -187,7 +194,38 @@ void pollServer() {
 
 static void processServerResponse(const String& response, bool isPollRequest = true, bool isWeatherRefreshResponse = false) {
   if (!isPollRequest) return;
-  JsonDocument doc; if (deserializeJson(doc, response)) return; 
+  JsonDocument doc; if (deserializeJson(doc, response)) return;
+
+  // 🟢 1. 앱 명령(마패) 확인 및 LED "최우선" 동기화 (함수 맨 위로 끌어올림!)
+  bool isAppCmd = (doc["app_command"] == true || doc["pending_cmd"] == true || doc["command_source"] == "app");
+  bool shouldApplySettings = canApplyServerSettings() || isAppCmd;
+
+  bool hasLedData = !doc["led_r"].isNull() || !doc["ledR"].isNull() || 
+                    !doc["led_g"].isNull() || !doc["ledG"].isNull() || 
+                    !doc["led_b"].isNull() || !doc["ledB"].isNull() || 
+                    !doc["led_bright"].isNull() || !doc["led_br"].isNull();
+
+  // 어떤 상황이든 LED 데이터가 오면 가장 먼저 묻지도 따지지도 않고 바꿉니다!
+  if (shouldApplySettings && hasLedData) {
+    uint8_t newR = ledR; uint8_t newG = ledG; uint8_t newB = ledB; int newBright = ledBrightness;
+    if (!doc["led_r"].isNull()) newR = constrain(doc["led_r"] | newR, 0, 255);
+    else if (!doc["ledR"].isNull()) newR = constrain(doc["ledR"] | newR, 0, 255);
+    if (!doc["led_g"].isNull()) newG = constrain(doc["led_g"] | newG, 0, 255);
+    else if (!doc["ledG"].isNull()) newG = constrain(doc["ledG"] | newG, 0, 255);
+    if (!doc["led_b"].isNull()) newB = constrain(doc["led_b"] | newB, 0, 255);
+    else if (!doc["ledB"].isNull()) newB = constrain(doc["ledB"] | newB, 0, 255);
+    if (!doc["led_bright"].isNull()) newBright = constrain(doc["led_bright"] | newBright, 0, 255);
+    else if (!doc["led_br"].isNull()) newBright = constrain(doc["led_br"] | newBright, 0, 255);
+    
+    ledR = newR; ledG = newG; ledB = newB; ledBrightness = newBright; 
+    ledEnabled = newBright > 0 && !(ledR == 0 && ledG == 0 && ledB == 0);
+    prefs.putInt("ledBright", ledBrightness); prefs.putUChar("ledR", ledR); prefs.putUChar("ledG", ledG); prefs.putUChar("ledB", ledB); prefs.putBool("ledEnabled", ledEnabled);
+    setLedColor(ledEnabled ? ledR : 0, ledEnabled ? ledG : 0, ledEnabled ? ledB : 0);
+  }
+
+  // 🟢 2. 모드 및 서버 상태 파싱
+  String serverActiveMode = doc["active_mode"] | ""; serverActiveMode.trim();
+  int cmd = doc["spray"] | -1; String resultText = doc["result_text"] | "";
 
   String weatherText = doc["weather"] | ""; String targetRegion = doc["target_region"] | "";
   if (targetRegion.length() == 0 && doc.containsKey("region")) targetRegion = doc["region"].as<String>();
@@ -206,16 +244,18 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   
   refreshWeatherFieldsIfVisible(); showWeatherPageForRefreshResponse(isWeatherRefreshResponse); 
 
+  // 🟢 3. 기타 세팅 및 모드 전환 로직
   static int lastSyncedManualScent = 0;
-  if (canApplyServerSettings() && !doc["intensity"].isNull()) SprayIntensity(doc["intensity"] | 2);
-  if (canApplyServerSettings() && !doc["volume"].isNull()) applyServerVolumeWithoutPageChange(doc["volume"] | 5);
+  if (shouldApplySettings && !doc["intensity"].isNull()) SprayIntensity(doc["intensity"] | 2);
+  if (shouldApplySettings && !doc["volume"].isNull()) applyServerVolumeWithoutPageChange(doc["volume"] | 5);
 
-  bool isAppCmd = (doc["app_command"] == true || doc["pending_cmd"] == true || doc["command_source"] == "app");
-  String serverActiveMode = doc["active_mode"] | ""; serverActiveMode.trim();
-  int cmd = doc["spray"] | -1; String resultText = doc["result_text"] | "";
-  
   bool suppressManualSingleDuringBlendSelection = isBlendSelectionInProgress() && cmd >= 1 && cmd <= 4 && serverActiveMode != "weather";
   bool isActiveWeatherRefreshResponse = isWeatherRefreshResponse && currentMode == MODE_WEATHER && isWeatherLikeResponse(serverActiveMode, weatherText, targetRegion, isWeatherRefreshResponse);
+  bool isPassiveReadyOrOffStatus = !isAppCmd && cmd <= 0 && resultText.length() == 0 && (serverActiveMode == "ready" || serverActiveMode == "off");
+  bool responseHasWeatherData = hasValidWeatherText(weatherText) || hasTemp || hasHumi || targetRegion.length() > 0;
+  bool ignorePassiveReadyAfterWeatherStart = currentMode == MODE_WEATHER && isPassiveReadyOrOffStatus && (wasWeatherStartedLocallyRecently() || isWeatherRefreshResponse || responseHasWeatherData);
+
+  if (ignorePassiveReadyAfterWeatherStart) { return; }
 
   if (!isActiveWeatherRefreshResponse && isServerStopCommand(cmd, resultText, serverActiveMode)) {
     SystemMode modeBeforeStop = currentMode; markLocalStop(); clearWeatherState(); setSystemMode(MODE_READY, "Stopped by Server");
@@ -223,7 +263,7 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     lastSyncedManualScent = 0; manualModeOffMillis = 0; lastStoppedManualScent = 0; Serial.println(C_YELLOW "\r\n🛑 [Server Sync] 서버 정지 신호 수신\r\n" C_RESET); return;
   }
 
-  if (wasRecentlyStoppedLocally() && currentMode != MODE_WEATHER && isWeatherLikeResponse(serverActiveMode, weatherText, targetRegion, isWeatherRefreshResponse)) return;
+  if (!isAppCmd && wasRecentlyStoppedLocally() && currentMode != MODE_WEATHER && isWeatherLikeResponse(serverActiveMode, weatherText, targetRegion, isWeatherRefreshResponse)) return;
 
   bool shouldChangeMode = isAppCmd;
   if (serverActiveMode == "weather" && currentMode != MODE_WEATHER) shouldChangeMode = true;
@@ -231,16 +271,25 @@ static void processServerResponse(const String& response, bool isPollRequest = t
 
   if (shouldChangeMode) {
     if (serverActiveMode == "weather") {
-      if (currentMode != MODE_WEATHER) { setSystemMode(MODE_WEATHER, "Weather Mode"); showWeatherPageByState(); requestWeatherRefresh(lastWeatherRegion); }
+      if (currentMode != MODE_WEATHER) {
+        stopSystem();
+        setSystemMode(MODE_WEATHER, "Weather Mode"); showWeatherPageByState(); requestWeatherRefresh(lastWeatherRegion);
+      }
     } 
     else if (serverActiveMode == "manual") {
       int activeScent = doc["active_scent"] | 0; if (activeScent <= 0) activeScent = doc["spray"] | 0;
       suppressManualSingleDuringBlendSelection = suppressManualSingleDuringBlendSelection || (isBlendSelectionInProgress() && activeScent >= 1 && activeScent <= 4 && !isValidBlendCommand(activeScent));
       if (!suppressManualSingleDuringBlendSelection && ((activeScent >= 1 && activeScent <= 4) || isValidBlendCommand(activeScent))) {
-        if (lastStoppedManualScent == activeScent && millis() - manualModeOffMillis < 5000) return;
+        if (!isAppCmd && lastStoppedManualScent == activeScent && millis() - manualModeOffMillis < 5000) return;
         bool scentChanged = activeScent != lastSyncedManualScent; lastSyncedManualScent = activeScent;
-        if (currentMode != MODE_MANUAL || scentChanged) { setSystemMode(MODE_MANUAL, "Manual Mode"); showManualPageForServerScent(activeScent); }
-      } else if (currentMode != MODE_MANUAL) { setSystemMode(MODE_MANUAL, "Manual Mode"); showManualPageByState(); }
+        if (currentMode != MODE_MANUAL || scentChanged) {
+          stopSystem();
+          setSystemMode(MODE_MANUAL, "Manual Mode"); showManualPageForServerScent(activeScent);
+        }
+      } else if (currentMode != MODE_MANUAL) {
+        stopSystem();
+        setSystemMode(MODE_MANUAL, "Manual Mode"); showManualPageByState();
+      }
     }
   }
 
@@ -256,14 +305,6 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   }
 
   if (!doc["timer_enabled"].isNull()) { schedulerEnabled = doc["timer_enabled"] | false; activeStartHour = doc["timer_start"] | 9; activeEndHour = doc["timer_end"] | 22; }
-
-  if (canApplyServerSettings() && !doc["led_r"].isNull() && !doc["led_g"].isNull() && !doc["led_b"].isNull()) {
-    uint8_t newR = constrain(doc["led_r"] | 255, 0, 255); uint8_t newG = constrain(doc["led_g"] | 255, 0, 255); uint8_t newB = constrain(doc["led_b"] | 255, 0, 255);
-    int newBright = ledBrightness; if (!doc["led_bright"].isNull()) newBright = constrain(doc["led_bright"] | 150, 0, 255); else if (!doc["led_br"].isNull()) newBright = constrain(doc["led_br"] | 150, 0, 255);
-    ledR = newR; ledG = newG; ledB = newB; ledBrightness = newBright; ledEnabled = newBright > 0 && !(ledR == 0 && ledG == 0 && ledB == 0);
-    prefs.putInt("ledBright", ledBrightness); prefs.putUChar("ledR", ledR); prefs.putUChar("ledG", ledG); prefs.putUChar("ledB", ledB); prefs.putBool("ledEnabled", ledEnabled);
-    setLedColor(ledEnabled ? ledR : 0, ledEnabled ? ledG : 0, ledEnabled ? ledB : 0);
-  }
 }
 
 void networkTaskLoop(void *pvParameters) {
