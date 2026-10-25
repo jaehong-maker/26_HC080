@@ -311,16 +311,28 @@ static void toggleBlendMode() {
   if (blendModeEnabled || (currentDisplayPage >= PAGE_BLEND_HOME && currentDisplayPage <= 19)) { exitBlendModeToManual(true); Serial.println("\r\n[BLEND] OFF"); return; }
   blendModeEnabled = true; blendSelection = ""; blendSprayActive = false; pendingManualScent = ""; nexSend("b_blend.txt=\"blendOFF\""); lastManualPage = PAGE_BLEND_HOME; showPage(PAGE_BLEND_HOME); Serial.println("\r\n[BLEND] ON");
 }
+
+static void enterManualSprayFromDisplay() {
+  bool leavingWeatherMode = currentMode == MODE_WEATHER;
+  currentMode = MODE_MANUAL;
+  if (!leavingWeatherMode) return;
+
+  markLocalStop();
+  stopSystem();
+  clearWeatherState();
+  Serial.println(C_CYAN "\r\n[Display] Weather spray stopped before manual spray\r\n" C_RESET);
+}
+
 static void handleScentButton(const String &cmd) {
   int scent = cmd.substring(1).toInt(); if (scent < 1 || scent > 4) return;
   Serial.printf("\r\n[S BUTTON] %s\r\n", cmd.c_str()); String scentStr = String(scent);
-  if (!isBlendUiActive()) { currentMode = MODE_MANUAL; clearBlendSelectionOnly(); blendSprayActive = false; lastManualPage = PAGE_MANUAL_SCENT_BASE + scent; showPage(lastManualPage); syncDisplayModeToServer("manual", scent); pendingManualScent = String(scent); lastScentTouchTime = millis(); return; }
+  if (!isBlendUiActive()) { enterManualSprayFromDisplay(); clearBlendSelectionOnly(); blendSprayActive = false; lastManualPage = PAGE_MANUAL_SCENT_BASE + scent; showPage(lastManualPage); syncDisplayModeToServer("manual", scent); pendingManualScent = String(scent); lastScentTouchTime = millis(); return; }
   blendModeEnabled = true;
   if (blendSprayActive) { if (isRunning) stopSystem(); blendModeEnabled = true; blendSprayActive = false; pendingManualScent = ""; nexSend("b_blend.txt=\"blendOFF\""); blendSelection = scentStr; lastManualPage = blendSinglePage(scent); showPage(lastManualPage); return; }
   if (blendSelection.length() == 0 || blendSelection == scentStr) { blendSelection = scentStr; lastManualPage = blendSinglePage(scent); showPage(lastManualPage); return; }
   String pair = makeBlendPair(blendSelection, scentStr);
   if (!isValidBlendSelection(pair)) { blendSelection = scentStr; lastManualPage = blendSinglePage(scent); showPage(lastManualPage); return; }
-  lastManualPage = blendPairPage(pair); showPage(lastManualPage); currentMode = MODE_MANUAL; syncDisplayModeToServer("manual", pair.toInt()); pendingManualScent = pair; lastScentTouchTime = millis(); blendSelection = ""; blendSprayActive = true;
+  enterManualSprayFromDisplay(); blendModeEnabled = true; lastManualPage = blendPairPage(pair); showPage(lastManualPage); syncDisplayModeToServer("manual", pair.toInt()); pendingManualScent = pair; lastScentTouchTime = millis(); blendSelection = ""; blendSprayActive = true;
 }
 
 static int currentIntensityPage() { if (currentIntensity == 1) return PAGE_INTENSITY_LOW; if (currentIntensity == 2) return PAGE_INTENSITY_MEDIUM; if (currentIntensity == 3) return PAGE_INTENSITY_HIGH; return PAGE_INTENSITY_HOME; }

@@ -4,7 +4,7 @@ static WiFiClientSecure sharedClient;
 static bool isSessionInit = false;
 
 static unsigned long lastLocalSettingsMillis = 0;
-static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 3000;
+static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 30000;
 static unsigned long lastLocalStopMillis = 0;
 static const unsigned long WEATHER_RESPONSE_IGNORE_AFTER_STOP_MS = 15000;
 static unsigned long lastLocalWeatherStartMillis = 0;
@@ -196,6 +196,11 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   if (!isPollRequest) return;
   JsonDocument doc; if (deserializeJson(doc, response)) return;
 
+  if (isWeatherRefreshResponse && currentMode != MODE_WEATHER) {
+    Serial.println(C_YELLOW "\r\n[Weather] Ignored stale response after leaving weather mode\r\n" C_RESET);
+    return;
+  }
+
   // 🟢 1. 앱 명령(마패) 확인 및 LED "최우선" 동기화 (함수 맨 위로 끌어올림!)
   bool isAppCmd = (doc["app_command"] == true || doc["pending_cmd"] == true || doc["command_source"] == "app");
   bool shouldApplySettings = canApplyServerSettings() || isAppCmd;
@@ -253,9 +258,15 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   bool isActiveWeatherRefreshResponse = isWeatherRefreshResponse && currentMode == MODE_WEATHER && isWeatherLikeResponse(serverActiveMode, weatherText, targetRegion, isWeatherRefreshResponse);
   bool isPassiveReadyOrOffStatus = !isAppCmd && cmd <= 0 && resultText.length() == 0 && (serverActiveMode == "ready" || serverActiveMode == "off");
   bool responseHasWeatherData = hasValidWeatherText(weatherText) || hasTemp || hasHumi || targetRegion.length() > 0;
-  bool ignorePassiveReadyAfterWeatherStart = currentMode == MODE_WEATHER && isPassiveReadyOrOffStatus && (wasWeatherStartedLocallyRecently() || isWeatherRefreshResponse || responseHasWeatherData);
+  bool ignorePassiveReadyAfterWeatherStart =
+    currentMode == MODE_WEATHER &&
+    isPassiveReadyOrOffStatus &&
+    (wasWeatherStartedLocallyRecently() || isWeatherRefreshResponse || responseHasWeatherData);
 
-  if (ignorePassiveReadyAfterWeatherStart) { return; }
+  if (ignorePassiveReadyAfterWeatherStart) {
+    Serial.println(C_YELLOW "\r\n[Weather] Ignored passive ready/off status while weather mode is active\r\n" C_RESET);
+    return;
+  }
 
   if (!isActiveWeatherRefreshResponse && isServerStopCommand(cmd, resultText, serverActiveMode)) {
     SystemMode modeBeforeStop = currentMode; markLocalStop(); clearWeatherState(); setSystemMode(MODE_READY, "Stopped by Server");
