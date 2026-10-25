@@ -3,12 +3,14 @@
 
 import json
 import logging
+import statistics
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import time
 
 import db_utils
 import api_utils
+import config
 from .common import _to_decimal_list
 
 logger = logging.getLogger()
@@ -19,20 +21,122 @@ def handle_device(action, mode, body, device_id, normalized_weights):
         implicit_like_result = db_utils.apply_due_implicit_like(device_id)
         
         if not is_app_request:
+            previous_state = db_utils.get_device_state(device_id) or {}
             current_w = normalized_weights[0]
             current_db = int(body.get("db_level", 0))
             logger.debug(f"[POLL_HARDWARE] ID:{device_id} Weights:{normalized_weights} DB:{current_db}")
+
+            now_epoch = int(time.time())
+            window_seconds = int(getattr(config, "AMBIENT_ANALYSIS_WINDOW_SECONDS", 180))
+            gap_reset_seconds = int(getattr(config, "AMBIENT_SAMPLE_GAP_RESET_SECONDS", 10))
+            max_samples = int(getattr(config, "AMBIENT_MAX_SAMPLES", 600))
+            last_sample_time = int(previous_state.get("db_last_sample_time", 0))
+            window_started_at = int(previous_state.get("db_window_started_at", now_epoch))
+            previous_samples = previous_state.get("db_samples", [])
+            sample_records = []
+
+            if last_sample_time <= 0 or now_epoch - last_sample_time > gap_reset_seconds:
+                window_started_at = now_epoch
+            elif isinstance(previous_samples, list):
+                cutoff_epoch = now_epoch - window_seconds
+                for sample in previous_samples:
+                    if not isinstance(sample, dict):
+                        continue
+                    try:
+                        sample_time = int(sample.get("timestamp", 0))
+                        sample_value = float(sample.get("value", 0))
+                    except Exception:
+                        continue
+                    if sample_time >= cutoff_epoch:
+                        sample_records.append({"timestamp": sample_time, "value": sample_value})
+
+            sample_records.append({"timestamp": now_epoch, "value": float(current_db)})
+            sample_records = sample_records[-max_samples:]
+            sample_values = [sample["value"] for sample in sample_records]
+            db_avg = round(sum(sample_values) / len(sample_values), 2)
+            db_stddev = round(statistics.pstdev(sample_values), 2) if len(sample_values) > 1 else 0.0
+            window_ready = now_epoch - window_started_at >= window_seconds
+            previous_db = int(previous_state.get("db_level", current_db))
+            spike_delta = int(getattr(config, "AMBIENT_SPIKE_DELTA_DB", 15))
+            is_spike = (
+                last_sample_time > 0
+                and abs(current_db - previous_db) >= spike_delta
+            )
+            noise_type = "불규칙적(대화/활동)" if db_stddev > 8.0 else "안정적(음악/정적)"
+
+            high_threshold = float(getattr(config, "AMBIENT_HIGH_THRESHOLD_DB", 40))
+            rule_version = int(previous_state.get("ambient_noise_rule_version", 0) or 0)
+            previous_sustained_loud = (
+                bool(previous_state.get("ambient_sustained_loud", False))
+                if rule_version == 2 else False
+            )
+            loud_since = (
+                int(previous_state.get("ambient_loud_since", 0) or 0)
+                if rule_version == 2 else 0
+            )
+            ambient_active = previous_state.get("active_mode") == "ambient"
+            continuity_broken = (
+                last_sample_time <= 0
+                or now_epoch - last_sample_time > gap_reset_seconds
+            )
+
+            # A music change is allowed only after the *current* sound level
+            # has remained at or above the threshold continuously for the
+            # whole window. A short spike starts no recommendation.
+            if not ambient_active or current_db < high_threshold:
+                loud_since = 0
+                sustained_loud = False
+            else:
+                if continuity_broken or loud_since <= 0:
+                    loud_since = now_epoch
+                    previous_sustained_loud = False
+                sustained_loud = bool(
+                    previous_sustained_loud
+                    or now_epoch - loud_since >= window_seconds
+                )
+
+            became_sustained_loud = sustained_loud and not previous_sustained_loud
+            effective_db = float(previous_state.get("ambient_effective_db", 40))
+            if became_sustained_loud:
+                effective_db = db_avg
             
-            update_exp = "set weight_g = :wg, weights = :w, db_level = :db"
+            update_exp = (
+                "set weight_g = :wg, weights = :w, db_level = :db, "
+                "db_samples = :samples, db_avg = :avg, db_stddev = :std, "
+                "noise_type = :nt, is_spike = :sp, db_window_started_at = :ws, "
+                "db_last_sample_time = :ls, db_window_ready = :wr, "
+                "ambient_sustained_loud = :sl, ambient_effective_db = :edb, "
+                "ambient_loud_since = :als, ambient_noise_rule_version = :arv"
+            )
             exp_vals = {
                 ':wg': Decimal(str(current_w)),
                 ':w': _to_decimal_list(normalized_weights),
-                ':db': current_db
+                ':db': current_db,
+                ':samples': [
+                    {
+                        "timestamp": Decimal(str(sample["timestamp"])),
+                        "value": Decimal(str(sample["value"])),
+                    }
+                    for sample in sample_records
+                ],
+                ':avg': Decimal(str(db_avg)),
+                ':std': Decimal(str(db_stddev)),
+                ':nt': noise_type,
+                ':sp': bool(is_spike),
+                ':ws': window_started_at,
+                ':ls': now_epoch,
+                ':wr': bool(window_ready),
+                ':sl': bool(sustained_loud),
+                ':edb': Decimal(str(effective_db)),
+                ':als': int(loud_since),
+                ':arv': 2,
             }
             
             # 기기가 현재 재생 중인 곡 번호 업데이트
             current_music = body.get("music")
-            if current_music is not None:
+            # Ambient music is server-owned. Do not let a slightly delayed
+            # device POLL overwrite a newly selected server track.
+            if current_music is not None and previous_state.get("active_mode") != "ambient":
                 update_exp += ", current_music = :cm"
                 exp_vals[':cm'] = int(current_music)
 
@@ -44,6 +148,33 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                 )
             except Exception as e:
                 logger.error(f"무게 및 소음 DB 업데이트 실패: {e}")
+
+            if previous_state.get("active_mode") == "ambient":
+                previous_context = str(previous_state.get("ambient_context", ""))
+                should_reevaluate = became_sustained_loud or not previous_context
+                if should_reevaluate:
+                    try:
+                        from .ambient_handler import handle_ambient
+                        handle_ambient(
+                            "ambient",
+                            {
+                                "db_level": current_db,
+                                "db_avg": db_avg,
+                                "db_1hr_avg": db_avg,
+                                "db_stddev": db_stddev,
+                                "is_spike": is_spike,
+                                "effective_db": effective_db,
+                                "window_ready": window_ready,
+                                "sustained_loud": sustained_loud,
+                                "music_only": bool(became_sustained_loud),
+                                "weights": normalized_weights,
+                                "duration": getattr(config, "AMBIENT_DURATION_SECONDS", 3),
+                            },
+                            device_id,
+                            normalized_weights,
+                        )
+                    except Exception as e:
+                        logger.error(f"[AMBIENT_AUTO_RECOMMEND_ERROR] ID:{device_id} {e}")
 
         state = db_utils.get_device_state(device_id) or {}
         
@@ -73,7 +204,11 @@ def handle_device(action, mode, body, device_id, normalized_weights):
         
         current_spray = int(state.get('current_spray', 0))
         active_spray = spray_code if spray_code > 0 else current_spray
-        music_code = db_utils.get_music_track(device_id, active_spray, is_pump=True) if active_spray > 0 else 0
+        active_mode = state.get('active_mode', 'ready')
+        if active_mode == "ambient":
+            music_code = int(state.get("current_music", 0))
+        else:
+            music_code = db_utils.get_music_track(device_id, active_spray, is_pump=True) if active_spray > 0 else 0
         
         # [BUG FIX] 음악 무한 재시작 방지 로직
         # 기기는 0이 아닌 music 값을 받으면 무조건 트랙을 처음부터 다시 재생합니다.
@@ -91,7 +226,8 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                     )
                 except: pass
         else:
-            if active_spray > 0 and music_code > 0 and music_code != last_sent_music:
+            can_send_music = active_mode == "ambient" or active_spray > 0
+            if can_send_music and music_code > 0 and music_code != last_sent_music:
                 final_music_code = music_code
                 try:
                     db_utils.state_table.update_item(
@@ -110,10 +246,13 @@ def handle_device(action, mode, body, device_id, normalized_weights):
         led_b = int(state.get('led_b', 255))
         led_br = int(state.get('led_br', 150))
         db_level = int(state.get('db_level', 0))
+        db_avg = float(state.get('db_avg', db_level))
+        db_stddev = float(state.get('db_stddev', 0))
+        noise_type = str(state.get('noise_type', '분석 전'))
+        is_spike = bool(state.get('is_spike', False))
         volume = int(state.get('volume', 5)) 
 
         mapping_dict = db_utils.get_spray_mapping(device_id)
-        active_mode = state.get('active_mode', 'ready')
         is_weather = (active_mode == 'weather')
         
         response_body = {
@@ -135,6 +274,14 @@ def handle_device(action, mode, body, device_id, normalized_weights):
             "led_br": led_br,
             "led_bright": led_br,
             "db_level": db_level,
+            "db_avg": round(db_avg, 2),
+            "db_stddev": round(db_stddev, 2),
+            "noise_type": noise_type,
+            "is_spike": is_spike,
+            "db_window_ready": bool(state.get("db_window_ready", False)),
+            "ambient_sustained_loud": bool(state.get("ambient_sustained_loud", False)),
+            "ambient_effective_db": float(state.get("ambient_effective_db", 40)),
+            "ambient_context": state.get("ambient_context", ""),
             "weights": final_weights,
             "mapping": mapping_dict,
             "music_tracks": state.get('music_tracks', '1_6_11_16'),

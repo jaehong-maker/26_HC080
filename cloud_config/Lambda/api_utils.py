@@ -20,6 +20,43 @@ logger = logging.getLogger()
 s3 = boto3.client("s3")
 transcribe = boto3.client('transcribe')
 
+
+def _sanitize_diary_led(led_dict):
+    """감정 일기 모드의 노란색 LED만 주황색으로 보정함."""
+    try:
+        raw_red = int(led_dict.get("led_r", -1))
+        raw_green = int(led_dict.get("led_g", -1))
+        raw_blue = int(led_dict.get("led_b", -1))
+        raw_brightness = int(led_dict.get("led_bright", -1))
+        if min(raw_red, raw_green, raw_blue, raw_brightness) < 0:
+            return led_dict
+
+        red = max(0, min(255, raw_red))
+        green = max(0, min(255, raw_green))
+        blue = max(0, min(255, raw_blue))
+        brightness = max(0, min(255, raw_brightness))
+
+        is_yellow = (
+            red >= 180
+            and green >= 170
+            and blue <= 100
+            and abs(red - green) <= 100
+        )
+        if is_yellow:
+            logger.info(
+                f"[DIARY_LED_COLOR_GUARD] ({red}, {green}, {blue}) -> (255, 100, 0)"
+            )
+            return {
+                "led_r": 255,
+                "led_g": 100,
+                "led_b": 0,
+                "led_bright": brightness,
+            }
+    except Exception as e:
+        logger.warning(f"Diary LED color guard error: {e}")
+    return led_dict
+
+
 # Gemini AI에게 감정 일기 분석 및 추천을 요청함
 def ask_gemini_recommendation(diary_text, user_history_text, slot_info_str="1번 슬롯, 2번 슬롯, 3번 슬롯, 4번 슬롯"):
     """
@@ -43,20 +80,20 @@ def ask_gemini_recommendation(diary_text, user_history_text, slot_info_str="1번
     
     이 일기를 분석하여 기분 전환에 가장 도움이 될만한 향기를 추천해줘.
     중요한 조건: 
-    1. [절대 규칙] 과거의 선호도(취향 데이터)는 무시하셔도 좋습니다. "오늘 사용자가 작성한 일기의 감정(스트레스, 분노, 우울함 등)"을 해소하는 것이 100배 더 중요함.
-    2. 과거에 '선호'했던 향기라도 오늘 감정 해소에 적합하지 않다면 **절대로** 추천하지 마세요. 감정 해소에 완벽한 향기를 최우선으로 고르세요.
+    1. 일기의 감정에 적합한 향기 후보를 먼저 판단한 뒤, 그 후보 안에서는 사용자의 AI_DIARY 선호도 점수를 반드시 반영하세요.
+    2. 양수 점수가 높은 향기를 우선하고 음수 점수의 향기는 가능한 피하되, 감정과 전혀 맞지 않는 향기를 점수만으로 추천하지 마세요.
     3. 단일 향기가 어울리면 1개만 고르고 시너지가 나면 2개를 블렌딩해라.
     4. 반드시 [현재 디퓨저에 장착된 향기 목록]에 명시된 향기 고유 번호 중에서만 골라주어야 한다. 장착되지 않은 향기는 절대 추천 금지.
     5. 추천할 향기의 고유 번호를 숫자로 대답해줘. (예: 1번 향기 1개면 1, 1번 향기와 3번 향기를 블렌딩하면 13, 2번과 4번이면 24). 그 숫자를 'kind' 필드에 넣어!! (슬롯 번호가 아니라 향기 고유 번호야!)
-    6. 감정에 따라 조명 색상(led_r, led_g, led_b)도 매우 다양하게 추천해줘. 단, 기기(LED) 특성상 빛이 연하게(하얗게) 보일 수 있으므로 파스텔톤을 피하고 매우 진한 색상이 되도록 해줘! (RGB 중 가장 큰 값은 무조건 255에 가깝게, 작은 값은 0에 가깝게 원색 위주로 설정할 것)
+    6. 감정에 따라 조명 색상(led_r, led_g, led_b)도 다양하게 추천해줘. 단, 글자가 잘 보이지 않으므로 노란색은 절대 추천하지 마. 노란색이 가장 어울리는 감정이라면 노란색 대신 주황색을 추천해. 다른 색상은 제한하지 않으며, 기기 특성상 연하게 보일 수 있으므로 파스텔톤을 피하고 진한 색상으로 설정해.
     7. 오늘 하루 사용자의 감정을 요약한 짧은 문장을 'emotion_summary' 필드에 작성해줘.
     8. 사용자의 핵심 감정을 나타내는 단어(예: 피곤함, 우울함, 행복함, 짜증남)를 'emotion_tag' 필드에 작성해줘.
     9. 중요★ 'reason' 필드에 향기를 추천하는 이유를 적을 때 절대 번호(예: 1번 시트러스, 2번 라벤더)를 언급하지 마! 반드시 향기 이름(예: 시트러스 향과 라벤더 향)으로 자연스럽게 적어주세요.
     10. [매우 중요/금지어] 생성하는 모든 텍스트('reason', 'emotion_summary' 등) 내부에 "정지", "중지", "대기", "꺼짐", "멈춰", "스톱" 이라는 단어를 절대 사용하지 마세요. (기기 오작동을 유발할 수 있습니다. 대신 "해소", "완화", "휴식" 등의 단어로 대체하세요.)
     
     반드시 아래와 같은 순수 JSON 형태로만 대답하고 다른 설명글은 절대 쓰지 마: 
-    (주의사항: 아래 예시의 값(15, 255, 100, 0)은 단지 예시일 뿐, 그대로 베끼지 말고, 매번 새롭게 분석하여 다채로운 값을 넣어줘!):
-    {{"kind": 15, "led_r": 255, "led_g": 100, "led_b": 0, "led_bright": 200, "emotion_summary": "오늘 하루 감정은 짜증과 피곤함임.", "emotion_tag": "피곤함", "reason": "사용자의 일기 내용을 분석한 결과, 피로를 풀어줄 시트러스 향과 마음을 진정시킬 라벤더 향기를 추천함. 또한 편안한 오렌지빛 조명으로 설정하였습니다."}}
+    (주의사항: 아래 값은 형식 예시일 뿐 그대로 베끼지 말고, 감정에 맞춰 매번 다채롭게 정해줘.):
+    {{"kind": 15, "led_r": 0, "led_g": 100, "led_b": 255, "led_bright": 200, "emotion_summary": "오늘 하루 감정은 짜증과 피곤함임.", "emotion_tag": "피곤함", "reason": "사용자의 일기 내용을 분석한 결과, 피로를 풀어줄 시트러스 향과 마음을 진정시킬 라벤더 향기를 추천함. 또한 편안한 푸른빛 조명으로 설정하였습니다."}}
     """
 
     payload = json.dumps({
@@ -87,6 +124,7 @@ def ask_gemini_recommendation(diary_text, user_history_text, slot_info_str="1번
                     "led_b": int(result_json.get("led_b", -1)),
                     "led_bright": int(result_json.get("led_bright", -1))
                 }
+                led_dict = _sanitize_diary_led(led_dict)
                 
                 logger.info(f"[Gemini API 성공] 추천 코드(kind): {kind_str}, 이유: {reason}, 조명: {led_dict}, 감정요약: {emotion_summary}, 감정태그: {emotion_tag}")
                 return kind_str, reason, led_dict, emotion_summary, emotion_tag
@@ -378,9 +416,9 @@ def ask_gemini_audio_analysis(audio_b64, mime_type, user_history_text="", slot_i
     [역할: 스마트 디퓨저 음성 비서]
     제공된 오디오 데이터를 정밀하게 분석하여 다음 규칙에 따라 JSON으로만 응답해줘.
 
-    [참고용: 사용자의 과거 향기 취향 데이터]
+    [사용자의 AI_VOICE 향기 선호도 데이터]
     {user_history_text}
-    (주의: 이 데이터는 단순 참고용임. 오늘 기분에 더 완벽히 맞는 향기가 있다면 철저히 무시하세요.)
+    (점수가 높을수록 선호하고, 음수 점수는 싫어하는 향기입니다.)
 
     [현재 디퓨저에 장착된 향기 목록]
     {slot_info_str}
@@ -388,7 +426,8 @@ def ask_gemini_audio_analysis(audio_b64, mime_type, user_history_text="", slot_i
     1. **음성 인식 (STT)**: 사용자가 말한 내용을 정확히 'transcript'에 적어줘.
        - 만약 오디오에 사람의 목소리가 들리지 않거나, 배경 소음만 있다면 반드시 'transcript'를 "SILENCE"라고 적어줘. (이 경우 동작은 0)
     2. **향기 분석 (kind)**: 발화 내용(기분, 장소, 직접 요청 등)에 따라 가장 어울리는 향기 번호를 선택해.
-       - [절대 규칙] 과거 취향 데이터보다 "사용자가 방금 음성으로 말한 기분이나 상태"를 해소하는 것이 100배 더 중요함. 과거 취향은 잊어버리셔도 좋습니다. 현재 감정에 가장 완벽한 향기를 고르세요.
+       - 사용자가 향기 이름/번호를 직접 지정했거나 정지를 요청한 경우에는 그 명령을 최우선으로 그대로 수행해.
+       - 사용자가 특정 향기를 지정하지 않고 기분이나 상황에 맞는 향기를 요청한 경우에는 AI_VOICE 선호도 점수를 반드시 반영해. 적합한 후보 중 양수 점수가 높은 향기를 우선하고, 음수 점수의 향기는 가능한 피해야 해.
        - 0: 정지 명령 (꺼, 멈춰 등)
        - 단일 향기가 어울리면 1개만 고르고 시너지가 나면 2개를 블렌딩해라.
        - 반드시 [현재 디퓨저에 장착된 향기 목록]에 명시된 향기 고유 번호 중에서만 골라주어야 한다. 장착되지 않은 향기는 절대 추천 금지.
@@ -468,16 +507,17 @@ def ask_gemini_voice_analysis(transcript, user_history_text="", slot_info_str=""
     
     명령 내용: "{transcript}"
 
-    [참고용: 사용자의 과거 향기 취향 데이터]
+    [사용자의 AI_VOICE 향기 선호도 데이터]
     {user_history_text}
-    (주의: 이 데이터는 단순 참고용임. 오늘 기분에 더 완벽히 맞는 향기가 있다면 철저히 무시하세요.)
+    (점수가 높을수록 선호하고, 음수 점수는 싫어하는 향기입니다.)
 
     [현재 디퓨저에 장착된 향기 목록]
     {slot_info_str}
 
     [규칙]
     1. 사용자의 감정, 상황, 직접 요청 등을 파악하여 가장 어울리는 향기 번호를 'kind'에 넣을 것.
-       - [절대 규칙] 과거 취향 데이터보다 "사용자가 방금 말한 기분이나 상태"를 해소하는 것이 100배 더 중요함. 과거 취향은 잊어버리셔도 좋습니다. 현재 감정에 가장 완벽한 향기를 고르세요.
+       - 사용자가 향기 이름/번호를 직접 지정했거나 정지를 요청한 경우에는 그 명령을 최우선으로 그대로 수행해.
+       - 사용자가 특정 향기를 지정하지 않고 기분이나 상황에 맞는 향기를 요청한 경우에는 AI_VOICE 선호도 점수를 반드시 반영해. 적합한 후보 중 양수 점수가 높은 향기를 우선하고, 음수 점수의 향기는 가능한 피해야 해.
        - 단일 향기가 어울리면 1개만 고르고 시너지가 나면 2개를 블렌딩해라.
        - 반드시 [현재 디퓨저에 장착된 향기 목록]에 명시된 향기 고유 번호 중에서만 골라주어야 한다. 장착되지 않은 향기는 절대 추천 금지.
        - 추천할 향기의 고유 번호를 숫자로 대답해줘. (예: 1번 향기 1개면 1, 1번 향기와 3번 향기를 블렌딩하면 13). 그 숫자를 'kind' 필드에 넣어!!
