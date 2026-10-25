@@ -527,6 +527,107 @@ def save_feedback(device_id, context, kind_code, weight_change, email=None):
         return False
 
 
+_IMPLICIT_LIKE_FIELDS = (
+    "pending_implicit_context",
+    "pending_implicit_kind",
+    "pending_implicit_email",
+    "pending_implicit_due",
+    "pending_implicit_token",
+)
+
+
+def cancel_implicit_like(device_id):
+    try:
+        state_table.update_item(
+            Key={"deviceId": device_id},
+            UpdateExpression="REMOVE " + ", ".join(_IMPLICIT_LIKE_FIELDS),
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Implicit Like Cancel Error: {e}")
+        return False
+
+
+def schedule_implicit_like(device_id, context, kind_code, email=None, delay_seconds=600):
+    try:
+        kind_no = int(kind_code)
+        if kind_no not in _kind_ids() or not str(context or "").strip():
+            return False
+
+        target_email = email or _get_email_by_device_id(device_id) or ""
+        due_epoch = int(_get_kst_now().timestamp()) + max(0, int(delay_seconds))
+        token = uuid.uuid4().hex
+        state_table.update_item(
+            Key={"deviceId": device_id},
+            UpdateExpression=(
+                "SET pending_implicit_context = :ctx, pending_implicit_kind = :kind, "
+                "pending_implicit_email = :email, pending_implicit_due = :due, "
+                "pending_implicit_token = :token"
+            ),
+            ExpressionAttributeValues={
+                ":ctx": str(context),
+                ":kind": kind_no,
+                ":email": str(target_email),
+                ":due": due_epoch,
+                ":token": token,
+            },
+        )
+        logger.info(
+            f"[IMPLICIT_LIKE_SCHEDULED] ID:{device_id} Context:{context} "
+            f"Kind:{kind_no} Due:{due_epoch}"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Implicit Like Schedule Error: {e}")
+        return False
+
+
+def apply_due_implicit_like(device_id, now_epoch=None):
+    try:
+        response = state_table.get_item(Key={"deviceId": device_id}, ConsistentRead=True)
+        item = response.get("Item") or {}
+        due_epoch = _parse_int(item.get("pending_implicit_due"), 0)
+        current_epoch = int(now_epoch) if now_epoch is not None else int(_get_kst_now().timestamp())
+        if due_epoch <= 0 or current_epoch < due_epoch:
+            return None
+
+        context = str(item.get("pending_implicit_context") or "").strip()
+        kind_no = _parse_int(item.get("pending_implicit_kind"), 0)
+        email = str(item.get("pending_implicit_email") or "").strip() or None
+        token = str(item.get("pending_implicit_token") or "").strip()
+        if not context or kind_no not in _kind_ids() or not token:
+            cancel_implicit_like(device_id)
+            return None
+
+        try:
+            state_table.update_item(
+                Key={"deviceId": device_id},
+                UpdateExpression="REMOVE " + ", ".join(_IMPLICIT_LIKE_FIELDS),
+                ConditionExpression=(
+                    "pending_implicit_token = :token AND pending_implicit_due = :due"
+                ),
+                ExpressionAttributeValues={":token": token, ":due": due_epoch},
+            )
+        except Exception as e:
+            error_code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+            if error_code == "ConditionalCheckFailedException":
+                return None
+            raise
+
+        if not save_feedback(device_id, context, kind_no, 1, email):
+            logger.error(
+                f"[IMPLICIT_LIKE_SAVE_FAILED] ID:{device_id} Context:{context} Kind:{kind_no}"
+            )
+            return None
+
+        result = {"context": context, "kind": kind_no, "value": 1}
+        logger.info(f"[IMPLICIT_LIKE_APPLIED] ID:{device_id} {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Implicit Like Apply Error: {e}")
+        return None
+
+
 # get_personalized_scent 처리를 담당함
 def get_personalized_scent(device_id, context, default_kind, email=None):
     try:

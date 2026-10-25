@@ -16,6 +16,7 @@ logger = logging.getLogger()
 def handle_device(action, mode, body, device_id, normalized_weights):
     if action == "POLL":
         is_app_request = True if body.get("email") else False
+        implicit_like_result = db_utils.apply_due_implicit_like(device_id)
         
         if not is_app_request:
             current_w = normalized_weights[0]
@@ -139,6 +140,10 @@ def handle_device(action, mode, body, device_id, normalized_weights):
             "music_tracks": state.get('music_tracks', '1_6_11_16'),
             "result_text": "" if spray_code in [0, -1] else f"명령:{spray_code}"
         }
+        if implicit_like_result:
+            response_body["implicit_like_applied"] = True
+            response_body["implicit_like_context"] = implicit_like_result["context"]
+            response_body["implicit_like_kind"] = implicit_like_result["kind"]
         if is_weather:
             response_body["weather"] = state.get('weather', '')
             response_body["temp"] = state.get('temp', '')

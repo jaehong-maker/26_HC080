@@ -77,6 +77,9 @@ def handle_feedback(action, mode, body, device_id):
             except Exception as e:
                 return {"statusCode": 500, "body": str(e)}
 
+        # 명시적인 새 피드백이 들어오면 이전 대체 향의 자동 +1 예약을 취소함
+        db_utils.cancel_implicit_like(device_id)
+
         try:
             data_str = str(body.get("data") or "").strip()
             parts = data_str.split("_", 1)
@@ -150,15 +153,25 @@ def handle_feedback(action, mode, body, device_id):
                     candidates = [s for s in [1, 2, 3, 4] if s != spray_no]
                     
                 new_spray = random.choice(candidates)
+                new_kind = db_utils.get_kind_from_spray(device_id, new_spray) or new_spray
                 db_utils.manage_mailbox(device_id, new_spray)
+                implicit_like_scheduled = db_utils.schedule_implicit_like(
+                    device_id,
+                    ctx,
+                    new_kind,
+                    u_email,
+                    delay_seconds=600,
+                )
                 
                 return {
                     "statusCode": 200,
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({
-                        "message": f"싫어요 반영! {new_spray}번 칸 향기로 우회 학습",
+                        "message": f"싫어요 반영! {new_spray}번 칸 향기로 대체 분사",
                         "spray": new_spray,
-                        "context": ctx
+                        "context": ctx,
+                        "implicit_like_scheduled": implicit_like_scheduled,
+                        "implicit_like_after_seconds": 600
                     }, ensure_ascii=False)
                 }
 
