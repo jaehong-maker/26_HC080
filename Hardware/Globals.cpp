@@ -128,7 +128,7 @@ void SprayIntensity(int intensityVal) {
     currentIntensity = constrain(intensityVal, 1, 3);
     if (currentIntensity == 1) REST_TIME = 9000;      
     else if (currentIntensity == 2) REST_TIME = 6000; 
-    else REST_TIME = 5000;
+    else REST_TIME = 3000;
 
     prefs.putInt("intensity", currentIntensity);
 }

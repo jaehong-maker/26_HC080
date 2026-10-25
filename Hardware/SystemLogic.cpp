@@ -216,6 +216,9 @@ void initSystem() {
 // --- 메인 루프 ---
 void runSystem() {
   esp_task_wdt_reset(); 
+  // Service every mode before display, audio and network work can delay the loop.
+  monitorWeight();
+  runSprayLogic();
   handleOTA(); 
   checkNextionInput(); 
   if (shouldShowStartupReadyPage) {
@@ -229,7 +232,6 @@ void runSystem() {
 
   if (currentMode == MODE_AMBIENT) { 
     runAmbientMode(); 
-    monitorWeight(); 
     pollServer();    
     checkSerialInput(); 
     vTaskDelay(WDT_YIELD_TIME_MS);
@@ -249,13 +251,11 @@ void runSystem() {
   handleWebClient(); 
   autoWeatherScheduler(); 
   pollServer(); 
-  monitorWeight();
   
   runAutoCleaning(); 
   checkFluidLevels(); 
 
   if (currentMode == MODE_DEMO) runAutoDemoLoop(); 
-  else if (isRunning) { runSprayLogic(); checkSafety(); } 
 
   checkSerialInput();
 
@@ -521,14 +521,34 @@ static const float MIN_SPRAY_SCENT_PERCENT = 15.0f;
 static bool stopLowFluidActiveNozzles();
 
 void runSprayLogic() { 
-  updateClockDisplay();
+  checkSafety();
   if (!isRunning) return;
+
+  if (stopLowFluidActiveNozzles()) return;
+
+  if (isSpraying) {
+    if (millis() - prevMotorMillis >= sprayDuration) {
+      forceAllOff();
+      isSpraying = false;
+      prevMotorMillis = millis();
+    }
+  } else if (currentMode != MODE_DEMO && millis() - prevMotorMillis >= REST_TIME) {
+    forceAllOff();
+    for (int i = 0; i < 4; i++) {
+      if (activeNozzles[i]) {
+        int pin = getPinFromCommand(i + 1);
+        if (pin != -1) digitalWrite(pin, LOW);
+      }
+    }
+    isSpraying = true;
+    prevMotorMillis = millis();
+  }
 
   // ★ 1. 동료분의 쿨다운 아이디어 추가
   static unsigned long lastTrackChangeTime = 0;
 
   // 🎵 일반/수동 모드 플레이리스트 연속 재생 검사
-  if (currentMode != MODE_AMBIENT && millis() - startTimeMillis > 3000) {
+  if (currentMode != MODE_AMBIENT && currentMode != MODE_DEMO && millis() - startTimeMillis > 3000) {
     
     // ★ 2. 트랙 변경 후 최소 0.5초(500ms)가 지나야만 BUSY 핀 검사
     if (millis() - lastTrackChangeTime > 500) {
@@ -553,49 +573,47 @@ void runSprayLogic() {
       }
     }
   }
-
-  if (stopLowFluidActiveNozzles()) return;
-
-  if (isSpraying) {
-    if (millis() - prevMotorMillis >= sprayDuration) {
-      forceAllOff();
-      isSpraying = false; 
-      prevMotorMillis = millis();
-    }
-  } else {
-    if (millis() - prevMotorMillis >= REST_TIME) {
-      if (stopLowFluidActiveNozzles()) return;
-      forceAllOff(); 
-      for (int i = 0; i < 4; i++) {
-        if (activeNozzles[i]) {
-          int pin = getPinFromCommand(i + 1);
-          if (pin != -1) digitalWrite(pin, LOW);
-        }
-      }
-      isSpraying = true; 
-      prevMotorMillis = millis();
-    }
-  }
 }
 
 void runAutoDemoLoop() { 
-  if (millis() - prevDemoMillis >= 4000) {
-    prevDemoMillis = millis(); forceAllOff(); demoStep++;
+  if (currentMode != MODE_DEMO || millis() - prevDemoMillis < 4000) return;
+  checkSafety();
+  if (currentMode != MODE_DEMO) return;
+
+  prevDemoMillis = millis();
+  for (int attempt = 0; attempt < 4; attempt++) {
+    demoStep++;
     if (demoStep > 4) demoStep = 1;
-    int targetPin = getPinFromCommand(demoStep);
-    if (targetPin != -1) {
-      digitalWrite(targetPin, LOW);
-      lastNozzleSprayTime[demoStep - 1] = millis(); 
+    if (calculateScentPercent(weights[demoStep - 1]) < MIN_SPRAY_SCENT_PERCENT) continue;
+
+    triggerSpray(demoStep, 4, 0, "Demo Mode", false);
+    if (isRunning) {
+      playSound(demoStep);
+      return;
     }
-    playSound(demoStep); updateDisplay(demoStep, "Demo Mode");
   }
+
+  setSystemMode(MODE_READY, "Demo Stopped: Low Fluid");
+  showLowFluidPage();
 }
 
 void checkSafety() {
-  if (millis() - startTimeMillis > MAX_RUN_TIME) { setSystemMode(MODE_READY, "Safety Timeout"); }
+  bool automaticMode = currentMode == MODE_AMBIENT || currentMode == MODE_DEMO;
+  if (!isRunning && !automaticMode) return;
+  if (millis() - startTimeMillis >= (unsigned long)MAX_RUN_TIME) {
+    setSystemMode(MODE_READY, "Safety Timeout");
+  }
 }
 
 void setSystemMode(SystemMode mode, String msg) { 
+  if (mode != currentMode && (mode == MODE_AMBIENT || mode == MODE_DEMO)) {
+    stopSystem();
+    startTimeMillis = millis();
+    if (mode == MODE_DEMO) {
+      demoStep = 0;
+      prevDemoMillis = millis() - 4000UL;
+    }
+  }
   currentMode = mode;
   if (msg != "") {
     Serial.printf(C_CYAN "\r\n[Mode] %s\r\n" C_RESET, msg.c_str());
@@ -731,6 +749,9 @@ static bool stopLowFluidActiveNozzles() {
         isSpraying = false;
         blendSelection = "";
         blendSprayActive = false;
+        if (currentMode == MODE_AMBIENT || currentMode == MODE_DEMO) {
+            setSystemMode(MODE_READY, "Low Fluid! Stopped");
+        }
         updateDisplay(0, "Low Fluid! Stopped");
         showLowFluidPage(lastLowFluidCartridge);
         return true;
@@ -801,6 +822,8 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
 
   isRunning = true; 
   isSpraying = true; 
+  // Automatic modes retain their session deadline across nozzle changes.
+  if (currentMode != MODE_AMBIENT && currentMode != MODE_DEMO) startTimeMillis = millis();
   sprayDuration = dur * 1000;
   prevMotorMillis = millis(); 
   
@@ -812,11 +835,10 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
   }
   
   // 🎵 오직 서버에서 내려준 음악 데이터만 믿고 재생하는 깔끔한 로직
-  if (currentMode != MODE_AMBIENT && cmd >= 1 && cmd <= 34) {
+  if (currentMode != MODE_AMBIENT && currentMode != MODE_DEMO && cmd >= 1 && cmd <= 34) {
     if (!isAlreadyRunningSameCmd) {
       currentSlotTracksCount = 0;
       currentPlaylistIdx = 0;
-      startTimeMillis = millis();
 
       // ★ [우선순위 1] 단독 재생 로직(아이묭 버그 원인) 삭제! 무조건 플레이리스트를 파싱하도록 변경
       // [우선순위 2] 서버가 갱신해둔 해당 카트리지의 플레이리스트(slotPlaylists)를 읽어옵니다.
