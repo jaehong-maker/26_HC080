@@ -154,8 +154,8 @@ void forceAllOff() {
 
 void applyNozzleHardwareState() {
     for (int i = 0; i < 4; i++) {
-        int state = (isSpraying && activeNozzles[i]) ? LOW : HIGH;
-        digitalWrite(Config::SPRAY_PINS[i], state);
+        if (isSpraying && activeNozzles[i]) enableNozzleIfSensorValid(i);
+        else digitalWrite(Config::SPRAY_PINS[i], HIGH);
     }
 }
 
@@ -183,13 +183,17 @@ void resetManualState() {
 
 void checkSensorHealth() {
     Serial.println(C_YELLOW "\r\n[Diagnosis] 시스템 자가 진단 시작..." C_RESET);
-    delay(500); 
 
     isAudioOk = true; 
     Serial.println(C_GREEN "✅ [Audio] 스피커 연결 확인 (호환 칩 응답 무시 적용)" C_RESET);
 
+    unsigned long diagnosisStart = millis();
+    while (millis() - diagnosisStart < 1000UL) {
+        monitorWeight();
+        esp_task_wdt_reset();
+        delay(5);
+    }
     for (int i = 0; i < 4; i++) {
-        isSensorOk[i] = scales[i].wait_ready_timeout(500); 
         if (!isSensorOk[i]) Serial.printf(C_RED "⚠️ [Warning] 로드셀 %d번 연결 불량!\r\n" C_RESET, i + 1);
         else Serial.printf(C_GREEN "✅ [LoadCell %d] 연결 확인\r\n" C_RESET, i + 1);
     }
@@ -200,68 +204,232 @@ void checkSensorHealth() {
 // [4] 무게 센서 (로드셀) 데이터 처리
 // ===================================================================================
 
-void monitorWeight() {
-  bool updated = false;
-  unsigned long currentTime = millis();
-  bool forcePoll = (currentTime - lastWeightCheckTime > 250);
+namespace {
+constexpr uint8_t ALL_LOADCELLS = 0x0f;
+constexpr unsigned long READY_WAIT_MS = 250;
+constexpr unsigned long SAMPLE_MAX_AGE_MS = 1500;
+constexpr unsigned long TARE_TIMEOUT_MS = 4000;
+constexpr int TARE_SAMPLES = 10;
+portMUX_TYPE loadcellStateMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE loadcellClockMux = portMUX_INITIALIZER_UNLOCKED;
+bool loadcellsInitialized = false;
+bool loadcellCalibrating = false;
+bool offsetKnown[4] = {};
+bool sampleSeen[4] = {};
+bool sensorFaultLatched[4] = {};
+bool firstWeight[4] = {true, true, true, true};
+unsigned long lastSampleMillis[4] = {};
+bool waitingForReady = false;
+unsigned long readyWaitStart = 0;
 
-  // ★ 지수 이동 평균 가중치 (0.15)
-  const float alpha = 0.15f; 
-  static bool isFirstRead[4] = {true, true, true, true}; // 부팅 후 첫 읽기 확인 플래그
+bool measurementValidLocked(int i, unsigned long now) {
+  return loadcellsInitialized && !loadcellCalibrating && offsetKnown[i] &&
+         !sensorFaultLatched[i] && sampleSeen[i] && isSensorOk[i] &&
+         now - lastSampleMillis[i] <= SAMPLE_MAX_AGE_MS;
+}
 
-  for (int i = 0; i < 4; i++) {
-    if (hxReady[i] || forcePoll) {
-      hxReady[i] = false; 
-      
-      if (scales[i].is_ready()) { 
-        float currentRawWeight = scales[i].get_units(1);
-        
-        // 1. 하드웨어 스파이크(튀는 값) 노이즈 무시
-        if (currentRawWeight > 5000.0 || currentRawWeight < -500.0) continue;
-        
-        // 2. 지수 이동 평균(EMA) 필터 적용 (첫 번째 읽기면 필터 생략하고 즉시 적용)
-        if (isFirstRead[i]) {
-            weights[i] = currentRawWeight;
-            isFirstRead[i] = false;
-        } else {
-            weights[i] = (currentRawWeight * alpha) + (weights[i] * (1.0f - alpha));
-        }
-        
-        // 3. 데드존 처리: 0.5g 미만의 미세한 값은 0.0g으로 고정
-        if (abs(weights[i]) < 0.5f) {
-          weights[i] = 0.0f;
-        }
-        
-        updated = true;
+void latchSensorFault(int i) {
+  portENTER_CRITICAL(&loadcellStateMux);
+  sensorFaultLatched[i] = true;
+  isSensorOk[i] = false;
+  digitalWrite(Config::SPRAY_PINS[i], HIGH);
+  portEXIT_CRITICAL(&loadcellStateMux);
+  weights[i] = 0.0f;
+  firstWeight[i] = true;
+}
+
+void resetLoadcellBus() {
+  // A shared power-down/reset realigns all four ADCs to channel A, gain 128.
+  digitalWrite(LOADCELL_SCK[0], HIGH);
+  delayMicroseconds(80);
+  digitalWrite(LOADCELL_SCK[0], LOW);
+  waitingForReady = false;
+}
+
+uint8_t readLoadcellFrame(int32_t raw[4]) {
+  uint8_t ready = 0;
+  for (int i = 0; i < 4; ++i) {
+    raw[i] = 0;
+    if (digitalRead(LOADCELL_DT[i]) == LOW) ready |= (1U << i);
+  }
+  if (!ready) { waitingForReady = false; return 0; }
+  if (!waitingForReady) { waitingForReady = true; readyWaitStart = millis(); }
+  if (ready != ALL_LOADCELLS && millis() - readyWaitStart < READY_WAIT_MS) return 0;
+  waitingForReady = false;
+
+  // Never call HX711::read/get_units/tare individually on this shared clock.
+  // Keep each high pulse below 50 us, including protection from interrupts.
+  portENTER_CRITICAL(&loadcellClockMux);
+  for (int bit = 0; bit < 24; ++bit) {
+    digitalWrite(LOADCELL_SCK[0], HIGH);
+    delayMicroseconds(1);
+    for (int i = 0; i < 4; ++i) raw[i] = (raw[i] << 1) | digitalRead(LOADCELL_DT[i]);
+    digitalWrite(LOADCELL_SCK[0], LOW);
+    delayMicroseconds(1);
+  }
+  digitalWrite(LOADCELL_SCK[0], HIGH); // Pulse 25: next conversion A / gain 128.
+  delayMicroseconds(1);
+  digitalWrite(LOADCELL_SCK[0], LOW);
+  delayMicroseconds(1);
+  uint8_t completed = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (digitalRead(LOADCELL_DT[i]) == HIGH) completed |= (1U << i);
+  }
+  portEXIT_CRITICAL(&loadcellClockMux);
+
+  uint8_t valid = ready & completed;
+  for (int i = 0; i < 4; ++i) {
+    if (raw[i] & 0x800000) raw[i] -= 0x1000000;
+    if (raw[i] == -8388608 || raw[i] == 8388607) valid &= ~(1U << i);
+    // A channel that missed shared clocks must be reset/tared before reuse.
+    if (!(valid & (1U << i))) latchSensorFault(i);
+  }
+  return valid;
+}
+
+uint8_t calibrateLoadcells(uint8_t requested, bool persist) {
+  stopSystem();
+  portENTER_CRITICAL(&loadcellStateMux);
+  loadcellCalibrating = true;
+  for (int i = 0; i < 4; ++i) { sampleSeen[i] = false; isSensorOk[i] = false; }
+  portEXIT_CRITICAL(&loadcellStateMux);
+  resetLoadcellBus();
+  int64_t sums[4] = {};
+  uint8_t counts[4] = {};
+  uint8_t success = 0;
+  unsigned long started = millis();
+  while (millis() - started < TARE_TIMEOUT_MS && (success & requested) != requested) {
+    int32_t raw[4];
+    uint8_t valid = readLoadcellFrame(raw);
+    for (int i = 0; i < 4; ++i) {
+      if ((requested & valid & (1U << i)) && counts[i] < TARE_SAMPLES) {
+        sums[i] += raw[i];
+        if (++counts[i] == TARE_SAMPLES) success |= (1U << i);
       }
     }
+    esp_task_wdt_reset();
+    delay(1);
   }
-  
-  if (forcePoll) lastWeightCheckTime = currentTime;
+  for (int i = 0; i < 4; ++i) {
+    if (!(requested & (1U << i))) continue;
+    bool ok = success & (1U << i);
+    if (ok) {
+      long offset = (long)(sums[i] / TARE_SAMPLES);
+      scales[i].set_offset(offset);
+      if (persist) prefs.putLong(("off_" + String(i)).c_str(), offset);
+    }
+    portENTER_CRITICAL(&loadcellStateMux);
+    offsetKnown[i] = ok;
+    sensorFaultLatched[i] = !ok;
+    portEXIT_CRITICAL(&loadcellStateMux);
+    Serial.printf("[LoadCell %d] tare %s\r\n", i + 1, ok ? "OK" : "TIMEOUT / INVALID");
+  }
+  resetWeightFilters();
+  portENTER_CRITICAL(&loadcellStateMux);
+  loadcellCalibrating = false;
+  portEXIT_CRITICAL(&loadcellStateMux);
+  return success;
+}
+} // namespace
 
+void initializeLoadcells() {
+  uint8_t missing = 0;
+  for (int i = 0; i < 4; ++i) {
+    scales[i].begin(LOADCELL_DT[i], LOADCELL_SCK[i]);
+    scales[i].set_scale(calibration_factor);
+    String key = "off_" + String(i);
+    offsetKnown[i] = prefs.isKey(key.c_str()); // Zero is also a valid saved offset.
+    if (offsetKnown[i]) scales[i].set_offset(prefs.getLong(key.c_str(), 0));
+    else missing |= (1U << i);
+    isSensorOk[i] = false;
+  }
+  loadcellsInitialized = true;
+  resetLoadcellBus();
+  if (missing) calibrateLoadcells(missing, false);
+}
+
+uint8_t tareLoadcells() { return calibrateLoadcells(ALL_LOADCELLS, true); }
+
+bool isLoadcellMeasurementValid(int channel) {
+  if (channel < 0 || channel >= 4) return false;
+  portENTER_CRITICAL(&loadcellStateMux);
+  bool valid = measurementValidLocked(channel, millis());
+  portEXIT_CRITICAL(&loadcellStateMux);
+  return valid;
+}
+
+bool enableNozzleIfSensorValid(int channel) {
+  if (channel < 0 || channel >= 4) return false;
+  portENTER_CRITICAL(&loadcellStateMux);
+  bool valid = measurementValidLocked(channel, millis());
+  digitalWrite(Config::SPRAY_PINS[channel], valid ? LOW : HIGH);
+  portEXIT_CRITICAL(&loadcellStateMux);
+  return valid;
+}
+
+void enforceLoadcellSafety() {
+  portENTER_CRITICAL(&loadcellStateMux);
+  unsigned long now = millis();
+  for (int i = 0; i < 4; ++i) {
+    if (!measurementValidLocked(i, now)) {
+      // An operating channel remains blocked until a successful tare or reboot.
+      if (!loadcellCalibrating && activeNozzles[i]) sensorFaultLatched[i] = true;
+      isSensorOk[i] = false;
+      digitalWrite(Config::SPRAY_PINS[i], HIGH);
+    }
+  }
+  portEXIT_CRITICAL(&loadcellStateMux);
+}
+
+void monitorWeight() {
+  if (!loadcellsInitialized) return;
+  int32_t raw[4];
+  uint8_t valid = readLoadcellFrame(raw);
+  for (int i = 0; i < 4; ++i) {
+    if (!(valid & (1U << i))) continue;
+    float scale = scales[i].get_scale();
+    float value = ((double)raw[i] - scales[i].get_offset()) / scale;
+    if (!isfinite(scale) || scale == 0 || !isfinite(value) || value > 5000 || value < -500) {
+      latchSensorFault(i);
+      continue;
+    }
+    portENTER_CRITICAL(&loadcellStateMux);
+    bool usable = offsetKnown[i] && !sensorFaultLatched[i] && !loadcellCalibrating;
+    if (usable) {
+      sampleSeen[i] = true;
+      lastSampleMillis[i] = millis();
+      isSensorOk[i] = true;
+    }
+    portEXIT_CRITICAL(&loadcellStateMux);
+    if (usable) {
+      weights[i] = firstWeight[i] ? value : value * 0.15f + weights[i] * 0.85f;
+      firstWeight[i] = false;
+      if (fabsf(weights[i]) < 0.5f) weights[i] = 0;
+    }
+  }
+  enforceLoadcellSafety();
+  for (int i = 0; i < 4; ++i) {
+    if (!isLoadcellMeasurementValid(i)) { weights[i] = 0; firstWeight[i] = true; }
+  }
   static unsigned long lastUiUpdate = 0;
-  if ((updated || forcePoll) && (currentTime - lastUiUpdate > 250)) {
-    lastUiUpdate = currentTime;
+  if (millis() - lastUiUpdate >= 250UL) {
+    lastUiUpdate = millis();
     updateScentProgressBars();
   }
 }
 
-/**
- * [New] 영점 조절 시 필터링된 무게 값을 즉시 0으로 초기화하는 함수
- */
 void resetWeightFilters() {
-    for (int i = 0; i < 4; i++) {
-        weights[i] = 0.0f;
-    }
+  portENTER_CRITICAL(&loadcellStateMux);
+  for (int i = 0; i < 4; ++i) { sampleSeen[i] = false; isSensorOk[i] = false; }
+  portEXIT_CRITICAL(&loadcellStateMux);
+  for (int i = 0; i < 4; ++i) { weights[i] = 0; firstWeight[i] = true; }
 }
 
 void printCalibrationInfo() {
-  Serial.printf("보정값: %.1f | W1:%.1f W2:%.1f W3:%.1f W4:%.1f (g)\r\n", 
-              calibration_factor, 
-              scales[0].get_units(2), scales[1].get_units(2), 
-              scales[2].get_units(2), scales[3].get_units(2));
+  // Diagnostics use the same cached frame; never advance the shared clock here.
+  Serial.printf("Calibration %.1f | W1:%.1f W2:%.1f W3:%.1f W4:%.1f (g)\r\n",
+                calibration_factor, weights[0], weights[1], weights[2], weights[3]);
 }
-
 // ===================================================================================
 // [5] 오디오 (마이크 수음, 스피커 및 앰비언트 분석)
 // ===================================================================================
@@ -366,6 +534,7 @@ void checkBackgroundNoise() {
 
 void sensorTaskLoop(void *parameter) {
   for (;;) {
+    enforceLoadcellSafety();
     if (currentMode != MODE_REACTIVE && currentMode != MODE_DASHBOARD && currentMode != MODE_VISUAL) {
         checkBackgroundNoise();
     }

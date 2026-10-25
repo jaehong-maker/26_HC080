@@ -272,6 +272,8 @@ void autoWeatherScheduler();
 void initOTA();
 void handleOTA();
 void networkTaskLoop(void *pvParameters);
+bool initializeServerResponseQueue();
+void processPendingServerResponse();
 void recordAndSendVoice();
 
 // --- SystemLogic / Hardware ---
@@ -299,6 +301,11 @@ void playSound(int trackNum);
 void bootAnimation();
 void systemHeartbeat();
 void monitorWeight();
+void initializeLoadcells();
+uint8_t tareLoadcells();
+bool isLoadcellMeasurementValid(int channel);
+bool enableNozzleIfSensorValid(int channel);
+void enforceLoadcellSafety();
 void resetWeightFilters();
 void printCalibrationInfo();
 void runAmbientMode();
@@ -310,6 +317,7 @@ int parseAndSetNozzles(String cmdStr);
 void handleInput(String input);
 void checkSerialInput();
 void runManualMode(String input);
+bool isRunningManualCommand(int cmd);
 void enterWeatherMode(bool runNow);
 void runSprayLogic();
 void runAutoDemoLoop();
