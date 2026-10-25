@@ -20,18 +20,43 @@ logger = logging.getLogger()
 
 # 날씨 정보를 바탕으로 향기 분사 로직을 결정함
 def logic_weather_mode(weather, humidity):
+    weather_text = str(weather or "").strip()
 
-    spray_code = 1
-    try:
-        if float(humidity) >= 50.0:
-            weather = "흐림(고습도)"
-    except: pass
-    
-    if any(x in weather for x in ["비", "강수"]): spray_code = 3
-    elif "눈" in weather: spray_code = 4
-    elif "흐림" in weather or "구름" in weather: spray_code = 2
-    else: spray_code = 1
-    return spray_code, weather, "Weather_Mode", 3
+    # 습도는 표시용 보조 정보이며 실제 기상청 날씨 분류를 덮어쓰지 않는다.
+    # 강수·적설을 먼저 판정한 뒤 구름 상태와 맑음을 구분한다.
+    if any(x in weather_text for x in ["비", "강수"]):
+        spray_code = 3
+    elif "눈" in weather_text:
+        spray_code = 4
+    elif any(x in weather_text for x in ["흐림", "구름"]):
+        spray_code = 2
+    else:
+        spray_code = 1
+
+    return spray_code, weather_text, "Weather_Mode", 3
+
+
+def build_weather_context_key(weather, now_kst=None):
+    weather_text = str(weather or "").strip()
+    weather_key = "Sunny"
+    if any(x in weather_text for x in ["비", "강수"]):
+        weather_key = "Rain"
+    elif "눈" in weather_text:
+        weather_key = "Snow"
+    elif any(x in weather_text for x in ["흐림", "구름"]):
+        weather_key = "Cloudy"
+
+    current_time = now_kst or datetime.now(timezone(timedelta(hours=9)))
+    if 0 <= current_time.hour < 6:
+        time_zone = "새벽"
+    elif current_time.hour < 12:
+        time_zone = "오전"
+    elif current_time.hour < 18:
+        time_zone = "오후"
+    else:
+        time_zone = "밤"
+
+    return f"Weather_{weather_key}_{time_zone}"
 
 # logic_emotion_mode 처리를 담당함
 def logic_emotion_mode(user_emotion_input):
@@ -132,7 +157,7 @@ def _build_ambient_response(scent_code, duration, context_key, db_level, result_
     music_code = 0
     if device_id and scent_code > 0:
         music_code = db_utils.get_music_track(device_id, scent_code, is_pump=True)
-        
+
     payload = {
         "cmd": int(scent_code),
         "dur": int(duration),

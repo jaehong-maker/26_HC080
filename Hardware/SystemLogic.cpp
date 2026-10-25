@@ -8,6 +8,7 @@ void processStandardInput();
 static const int NEXTION_DIM_NORMAL = 100;
 static bool isDisplayDimmed = false;
 static bool shouldShowStartupReadyPage = false;
+static int activeSprayCommand = -1;
 
 static bool consumeStartupPageRequest() {
   const String currentBuild = String(__DATE__) + " " + String(__TIME__);
@@ -24,12 +25,6 @@ static bool consumeStartupPageRequest() {
 
   return firstBootAfterUpdate || forceStartupPage;
 }
-
-// --- 로드셀 데이터 준비 완료 인터럽트 (ISR) ---
-void IRAM_ATTR isr_hx0() { hxReady[0] = true; }
-void IRAM_ATTR isr_hx1() { hxReady[1] = true; }
-void IRAM_ATTR isr_hx2() { hxReady[2] = true; }
-void IRAM_ATTR isr_hx3() { hxReady[3] = true; }
 
 // --- 서브 루틴: 시스템 기상 ---
 void wakeUpSystem() {
@@ -116,6 +111,9 @@ void initSystem() {
   esp_task_wdt_add(NULL); 
 
   networkQueue = xQueueCreate(10, sizeof(String*));
+  if (!initializeServerResponseQueue()) {
+    Serial.println("[Network] Response queue unavailable; online commands disabled.");
+  }
 
   pinMode(PIN_SUNNY, OUTPUT); pinMode(PIN_CLOUDY, OUTPUT);
   pinMode(PIN_RAIN, OUTPUT); pinMode(PIN_SNOW, OUTPUT); pinMode(PIN_LED, OUTPUT);
@@ -158,27 +156,8 @@ void initSystem() {
 
   SprayIntensity(prefs.getInt("intensity", currentIntensity));
 
-  for (int i = 0; i < 4; i++) {
-    scales[i].begin(LOADCELL_DT[i], LOADCELL_SCK[i]);
-    scales[i].set_scale(calibration_factor);
-  
-    String key = "off_" + String(i);
-    long savedOffset = prefs.getLong(key.c_str(), 0);
-  
-    if (savedOffset != 0) {
-      scales[i].set_offset(savedOffset);
-      Serial.printf("[LoadCell %d] 오프셋 복구 완료: %ld\r\n", i + 1, savedOffset);
-    } else {
-      scales[i].tare();
-    }
-  
-    lastNozzleSprayTime[i] = millis();
-
-    if (i == 0) attachInterrupt(digitalPinToInterrupt(LOADCELL_DT[0]), isr_hx0, FALLING);
-    if (i == 1) attachInterrupt(digitalPinToInterrupt(LOADCELL_DT[1]), isr_hx1, FALLING);
-    if (i == 2) attachInterrupt(digitalPinToInterrupt(LOADCELL_DT[2]), isr_hx2, FALLING);
-    if (i == 3) attachInterrupt(digitalPinToInterrupt(LOADCELL_DT[3]), isr_hx3, FALLING);
-  }
+  initializeLoadcells();
+  for (int i = 0; i < 4; i++) lastNozzleSprayTime[i] = millis();
 
   checkSensorHealth();
 
@@ -221,6 +200,8 @@ void runSystem() {
   runSprayLogic();
   handleOTA(); 
   checkNextionInput(); 
+  // Only the main loop applies server commands to relays, audio and the display.
+  processPendingServerResponse();
   if (shouldShowStartupReadyPage) {
     shouldShowStartupReadyPage = false;
     clearNextionInputBuffer();
@@ -228,6 +209,8 @@ void runSystem() {
   }
   updateClockDisplay();
 
+  // Reconnection must also run before ambient/sleep branches return.
+  manageWiFi();
   runScheduler();
 
   if (currentMode == MODE_AMBIENT) { 
@@ -246,7 +229,6 @@ void runSystem() {
     return; 
   } 
 
-  manageWiFi(); 
   systemHeartbeat(); 
   handleWebClient(); 
   autoWeatherScheduler(); 
@@ -292,7 +274,7 @@ void processSettingModeInput() {
 
   switch (c) {
     case 'r':
-      Serial.printf("\r\n[DEBUG] Scale 1 Raw: %ld\r\n", scales[0].read());
+      printCalibrationInfo();
       break;
 
     case '+':
@@ -308,17 +290,14 @@ void processSettingModeInput() {
       break;
 
     case 't':
-      for(int i=0; i<4; i++) scales[i].tare(); 
-      resetWeightFilters();
-      Serial.println("\r\n✅ [영점 완료] 필터 잔상이 제거되었습니다."); 
-      Serial.printf("📊 현재 잔량: W1:%.1fg | W2:%.1fg | W3:%.1fg | W4:%.1fg\r\n", 
-                    weights[0], weights[1], weights[2], weights[3]);
+      resetScaleZero();
       showPrompt(); 
       break;
 
     case 's':
       prefs.putFloat("cal_factor", calibration_factor);
       for (int i = 0; i < 4; i++) {
+        if (!isLoadcellMeasurementValid(i)) continue;
         String key = "off_" + String(i);
         long currentOffset = scales[i].get_offset();
         prefs.putLong(key.c_str(), currentOffset);
@@ -534,11 +513,15 @@ void runSprayLogic() {
     }
   } else if (currentMode != MODE_DEMO && millis() - prevMotorMillis >= REST_TIME) {
     forceAllOff();
+    bool enabledAny = false;
     for (int i = 0; i < 4; i++) {
       if (activeNozzles[i]) {
-        int pin = getPinFromCommand(i + 1);
-        if (pin != -1) digitalWrite(pin, LOW);
+        if (enableNozzleIfSensorValid(i)) enabledAny = true;
       }
+    }
+    if (!enabledAny) {
+      stopLowFluidActiveNozzles();
+      return;
     }
     isSpraying = true;
     prevMotorMillis = millis();
@@ -584,7 +567,7 @@ void runAutoDemoLoop() {
   for (int attempt = 0; attempt < 4; attempt++) {
     demoStep++;
     if (demoStep > 4) demoStep = 1;
-    if (calculateScentPercent(weights[demoStep - 1]) < MIN_SPRAY_SCENT_PERCENT) continue;
+    if (!isLoadcellMeasurementValid(demoStep - 1) || calculateScentPercent(weights[demoStep - 1]) < MIN_SPRAY_SCENT_PERCENT) continue;
 
     triggerSpray(demoStep, 4, 0, "Demo Mode", false);
     if (isRunning) {
@@ -649,7 +632,7 @@ void printManualMenu() {
 
 void getCurrentTime(int &hour, int &minute) {
     struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) {
+    if (!getLocalTime(&timeinfo, 0)) {
         hour = -1; minute = -1;
         return;
     }
@@ -672,7 +655,7 @@ void runScheduler() {
         static int lastEventDay = -1;
         struct tm timeinfo;
         
-        if (getLocalTime(&timeinfo)) {
+        if (getLocalTime(&timeinfo, 0)) {
             if (lastEventDay != timeinfo.tm_mday) {
                 lastEventDay = timeinfo.tm_mday;
                 Serial.println(C_MAGENTA "\r\n[Scheduler] Good Morning! 아침 향기를 분사합니다.\r\n" C_RESET);
@@ -683,26 +666,15 @@ void runScheduler() {
 }
 
 void resetScaleZero() {
-  Serial.println(C_YELLOW "\r\n[Calibration] Resetting load cell zero offsets..." C_RESET);
-
-  forceAllOff();
-  isRunning = false;
-  isSpraying = false;
-
-  for (int i = 0; i < 4; i++) {
-    scales[i].tare();
-
-    String key = "off_" + String(i);
-    long currentOffset = scales[i].get_offset();
-    prefs.putLong(key.c_str(), currentOffset);
-
-    Serial.printf(C_GREEN "[Calibration] Load cell %d zeroed (Offset: %ld)\r\n" C_RESET, i + 1, currentOffset);
-    weights[i] = 0.0f;
-  }
-
+  uint8_t success = tareLoadcells();
+  Serial.printf("[Calibration] Successful channels mask: 0x%02x\r\n", success);
   updateScentProgressBars();
-  updateDisplay(0, "Tare Complete!");
-  Serial.println(C_CYAN "[Calibration] Zero reset complete." C_RESET);
+  if (success == 0x0f) {
+    updateDisplay(0, "Tare Complete!");
+  } else {
+    updateDisplay(0, "Sensor Error: Tare Incomplete");
+    showPage(PAGE_DEVICE_STATUS);
+  }
 }
 
 static bool stopLowFluidActiveNozzles() {
@@ -710,6 +682,7 @@ static bool stopLowFluidActiveNozzles() {
     bool blockedAnyNozzle = false;
     static unsigned long lowFluidTime[4] = {0, 0, 0, 0};
     int lastLowFluidCartridge = -1;
+    bool sensorFault = false;
 
     for (int i = 0; i < 4; i++) {
         if (!activeNozzles[i]) {
@@ -717,6 +690,14 @@ static bool stopLowFluidActiveNozzles() {
             continue;
         }
 
+        if (!isLoadcellMeasurementValid(i)) {
+            digitalWrite(Config::SPRAY_PINS[i], HIGH);
+            activeNozzles[i] = false;
+            blockedAnyNozzle = true;
+            sensorFault = true;
+            lowFluidTime[i] = 0;
+            continue;
+        }
         float percent = calculateScentPercent(weights[i]);
         if (percent < MIN_SPRAY_SCENT_PERCENT) {
             if (lowFluidTime[i] == 0) lowFluidTime[i] = millis();
@@ -749,11 +730,13 @@ static bool stopLowFluidActiveNozzles() {
         isSpraying = false;
         blendSelection = "";
         blendSprayActive = false;
-        if (currentMode == MODE_AMBIENT || currentMode == MODE_DEMO) {
-            setSystemMode(MODE_READY, "Low Fluid! Stopped");
+        String stopReason = sensorFault ? "Sensor Error! Stopped" : "Low Fluid! Stopped";
+        if (sensorFault || currentMode == MODE_AMBIENT || currentMode == MODE_DEMO) {
+            setSystemMode(MODE_READY, stopReason);
         }
-        updateDisplay(0, "Low Fluid! Stopped");
-        showLowFluidPage(lastLowFluidCartridge);
+        updateDisplay(0, stopReason);
+        if (sensorFault) showPage(PAGE_DEVICE_STATUS);
+        else showLowFluidPage(lastLowFluidCartridge);
         return true;
     }
 
@@ -777,6 +760,10 @@ int parseAndSetNozzles(String cmdStr) {
     return activeCount;
 }
 
+bool isRunningManualCommand(int cmd) {
+  return currentMode == MODE_MANUAL && isRunning && activeSprayCommand == cmd;
+}
+
 void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
   static int lastActiveCmd = -1;
   bool isAlreadyRunningSameCmd = (isRunning && lastActiveCmd == cmd);
@@ -796,10 +783,14 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
   
   bool hasValidNozzle = false;
   bool blockedLowFluidNozzle = false;
+  bool blockedSensorNozzle = false;
   int lastLowFluidCartridge = -1;
   for (int i = 0; i < 4; i++) {
       if (activeNozzles[i]) {
-          if (calculateScentPercent(weights[i]) < MIN_SPRAY_SCENT_PERCENT) {
+          if (!isLoadcellMeasurementValid(i)) {
+              activeNozzles[i] = false;
+              blockedSensorNozzle = true;
+          } else if (calculateScentPercent(weights[i]) < MIN_SPRAY_SCENT_PERCENT) {
               Serial.printf(C_YELLOW "\r\n[Warning] %d번 향기 잔량이 15%% 미만이어서 작동에서 제외됩니다.\r\n" C_RESET, i + 1);
               activeNozzles[i] = false;
               blockedLowFluidNozzle = true;
@@ -815,6 +806,8 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
       showLowFluidPage(lastLowFluidCartridge);
   }
 
+  if (blockedSensorNozzle) showPage(PAGE_DEVICE_STATUS);
+
   if (!hasValidNozzle) {
       Serial.println(C_YELLOW "⚠️ 작동 가능한 카트리지가 없어 분사가 취소되었습니다." C_RESET);
       return; 
@@ -827,12 +820,21 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
   sprayDuration = dur * 1000;
   prevMotorMillis = millis(); 
   
+  bool enabledAny = false;
   for (int i = 0; i < 4; i++) {
     if (activeNozzles[i]) {
-      int targetPin = getPinFromCommand(i + 1);
-      if (targetPin != -1) digitalWrite(targetPin, LOW);
+      // Recheck after display work, immediately before energizing each relay.
+      if (enableNozzleIfSensorValid(i)) enabledAny = true;
+      else activeNozzles[i] = false;
     }
   }
+  if (!enabledAny) {
+    isRunning = false;
+    isSpraying = false;
+    forceAllOff();
+    return;
+  }
+  activeSprayCommand = cmd;
   
   // 🎵 오직 서버에서 내려준 음악 데이터만 믿고 재생하는 깔끔한 로직
   if (currentMode != MODE_AMBIENT && currentMode != MODE_DEMO && cmd >= 1 && cmd <= 34) {
@@ -917,5 +919,6 @@ void updateMusicMapping(String data) {
 }
 
 void runManualMode(String input) {
+    if (isRunningManualCommand(input.toInt())) return;
     triggerSpray(input.toInt(), 3, 0, "Manual Spray", false);
 }

@@ -1,7 +1,34 @@
 #include "Globals.h"
+#include <new>
 
 static WiFiClientSecure sharedClient;
 static bool isSessionInit = false;
+static bool automaticOfflineMode = false;
+
+struct PendingServerResponse {
+  String body;
+  bool weatherRefresh;
+  bool weatherRetry;
+};
+static QueueHandle_t serverResponseQueue = nullptr;
+
+bool initializeServerResponseQueue() {
+  if (!serverResponseQueue) serverResponseQueue = xQueueCreate(4, sizeof(PendingServerResponse*));
+  return serverResponseQueue != nullptr;
+}
+
+static void queueServerResponse(const String &body, bool weatherRefresh, bool weatherRetry = false) {
+  if (!serverResponseQueue) return;
+  PendingServerResponse *message = new (std::nothrow) PendingServerResponse{body, weatherRefresh, weatherRetry};
+  if (!message || message->body.length() != body.length()) {
+    delete message;
+    Serial.println("[Network] Unable to allocate server response; response discarded.");
+    return;
+  }
+  // Backpressure preserves command order, including explicit app stop commands.
+  // Waiting here never holds a relay/audio lock or blocks the main control loop.
+  if (xQueueSend(serverResponseQueue, &message, portMAX_DELAY) != pdTRUE) delete message;
+}
 
 static unsigned long lastLocalSettingsMillis = 0;
 static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 30000;
@@ -112,6 +139,7 @@ void displayWatcherTask(void *pvParameters) {
 
 void connectWiFi() {
   Serial.printf("\r\n[System] 무선 연결/설정 모드 가동...\r\n"); esp_task_wdt_delete(NULL);
+  automaticOfflineMode = false;
   if (prefs.getBool("force_offline", false)) {
     prefs.putBool("force_offline", false); 
     Serial.println(C_YELLOW "\r\n[Offline] Wi-Fi 설정을 건너뛰고 수동 모드로 진입합니다!" C_RESET);
@@ -119,6 +147,10 @@ void connectWiFi() {
   }
 
   WiFiManager wifiManager;
+  // Bound ordinary boot attempts; explicit Wi-Fi setup keeps its existing portal.
+  wifiManager.setConnectTimeout(10);
+  wifiManager.setSaveConnectTimeout(10);
+  wifiManager.setConnectRetries(1);
   bool forceConfigPortal = prefs.getBool("force_config_portal", false);
   if (forceConfigPortal) {
     prefs.putBool("force_config_portal", false); showPage(PAGE_WIFI_RESET); WiFi.disconnect(true, true); delay(200);
@@ -128,7 +160,9 @@ void connectWiFi() {
   wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   wifiManager.setCaptivePortalEnable(true); WiFi.setHostname("SmartDiffuser"); wifiManager.setDebugOutput(true);
   WiFi.mode(WIFI_STA); 
-  String savedSSID = WiFi.SSID();
+  // WiFi.SSID() is empty while disconnected on ESP32; read saved credentials.
+  String savedSSID = wifiManager.getWiFiSSID();
+  wifiManager.setEnableConfigPortal(forceConfigPortal || savedSSID.length() == 0);
 
   if (savedSSID.length() > 0) Serial.printf("\r\n[WiFi] 저장된 와이파이 발견: %s\r\n", savedSSID.c_str());
   else Serial.println("\r\n[WiFi] 최초 부팅 상태입니다! (와이파이 미설정)");
@@ -142,7 +176,13 @@ void connectWiFi() {
   if (forceConfigPortal) { updateDisplay(0, "Setup WiFi"); wifiConnected = wifiManager.startConfigPortal("SmartDiffuser_Setup"); } 
   else { wifiConnected = wifiManager.autoConnect("SmartDiffuser_Setup"); }
 
-  if (!wifiConnected) Serial.println(C_YELLOW "\r\n[Warning] Wi-Fi 설정 실패." C_RESET);
+  if (!wifiConnected) {
+    Serial.println(C_YELLOW "\r\n[Offline] Wi-Fi unavailable; continuing to local controls.\r\n" C_RESET);
+    automaticOfflineMode = true;
+    setOfflineModeActive(true);
+    wifiRetryInterval = 5000;
+    lastWifiRetryMillis = millis();
+  }
   else {
     Serial.printf("\r\nConnected! IP: %s\r\n", WiFi.localIP().toString().c_str());
     if (prefs.isKey("wifi_return_page")) {
@@ -156,14 +196,28 @@ void connectWiFi() {
 }
 
 void manageWiFi() {
-  static bool wasConnected = true; unsigned long currentTime = millis();
+  static bool wasConnected = false; unsigned long currentTime = millis();
   if (WiFi.status() != WL_CONNECTED) {
     if (wasConnected) { wasConnected = false; Serial.println(C_RED "\r\n🚨 WiFi 끊김! 복구 진입" C_RESET); wifiRetryInterval = 5000; }
     if (currentTime - lastWifiRetryMillis >= wifiRetryInterval) {
       lastWifiRetryMillis = currentTime; WiFi.disconnect(); WiFi.reconnect();
       wifiRetryInterval = min(wifiRetryInterval * 2, 60000UL);
     }
-  } else { if (!wasConnected) { wasConnected = true; wifiRetryInterval = 5000; } }
+  } else {
+    if (!wasConnected) {
+      wasConnected = true;
+      wifiRetryInterval = 5000;
+      // OTA may not have started during an offline boot.
+      initOTA();
+    }
+    if (automaticOfflineMode) {
+      automaticOfflineMode = false;
+      offlineModeActive = false;
+      // Keep a manual/settings page open if the user has already navigated there.
+      if (currentDisplayPage == PAGE_OFFLINE) showWeatherOffPage();
+      Serial.println(C_GREEN "\r\n[WiFi] Reconnected; online controls restored.\r\n" C_RESET);
+    }
+  }
 }
 
 void pollServer() {
@@ -273,6 +327,13 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     return;
   }
 
+  // A status snapshot is not an explicit stop. A late ready/off snapshot must
+  // not cancel a manual cycle started on the display. App stops still pass.
+  if (currentMode == MODE_MANUAL && isRunning && isPassiveReadyOrOffStatus) {
+    Serial.println("[Manual] Ignored passive ready/off status during local spray.");
+    return;
+  }
+
   if (!isActiveWeatherRefreshResponse && isServerStopCommand(cmd, resultText, serverActiveMode)) {
     SystemMode modeBeforeStop = currentMode; markLocalStop(); clearWeatherState(); setSystemMode(MODE_READY, "Stopped by Server");
     if (modeBeforeStop == MODE_WEATHER || currentDisplayPage == PAGE_WEATHER) showWeatherOffPage(); else updateDisplay(0, "Stopped by Server");
@@ -298,7 +359,7 @@ static void processServerResponse(const String& response, bool isPollRequest = t
       if (!suppressManualSingleDuringBlendSelection && ((activeScent >= 1 && activeScent <= 4) || isValidBlendCommand(activeScent))) {
         if (!isAppCmd && lastStoppedManualScent == activeScent && millis() - manualModeOffMillis < 5000) return;
         bool scentChanged = activeScent != lastSyncedManualScent; lastSyncedManualScent = activeScent;
-        if (currentMode != MODE_MANUAL || scentChanged) {
+        if ((currentMode != MODE_MANUAL || scentChanged) && !isRunningManualCommand(activeScent)) {
           stopSystem();
           setSystemMode(MODE_MANUAL, "Manual Mode"); showManualPageForServerScent(activeScent);
         }
@@ -315,12 +376,25 @@ static void processServerResponse(const String& response, bool isPollRequest = t
 
   if (shouldRunSpray) {
     int dur = doc["duration"] | 3; int music = doc["music"] | 0; String txt = resultText.length() > 0 ? resultText : "명령 수신";
-    triggerSpray(cmd, dur, music, txt, (currentMode == MODE_WEATHER));
+    if (serverActiveMode == "manual" && isRunningManualCommand(cmd)) {
+      Serial.println("[Manual] Same command already running; keeping spray/rest phase.");
+    } else {
+      triggerSpray(cmd, dur, music, txt, (currentMode == MODE_WEATHER));
+    }
   } else if (!suppressManualSingleDuringBlendSelection && !doc["music"].isNull() && doc["music"] > 0) {
     int track = doc["music"] | 0; playSound(track); nexSend("t_music.txt=\"" + getTrackName(track) + "\""); updateDisplay(0, "Music Playing");
   }
 
   if (!doc["timer_enabled"].isNull()) { schedulerEnabled = doc["timer_enabled"] | false; activeStartHour = doc["timer_start"] | 9; activeEndHour = doc["timer_end"] | 22; }
+}
+
+void processPendingServerResponse() {
+  if (!serverResponseQueue) return;
+  PendingServerResponse *message = nullptr;
+  if (xQueueReceive(serverResponseQueue, &message, 0) != pdTRUE) return;
+  if (message->weatherRetry) allowWeatherRetry();
+  else processServerResponse(message->body, true, message->weatherRefresh);
+  delete message;
 }
 
 void networkTaskLoop(void *pvParameters) {
@@ -333,10 +407,10 @@ void networkTaskLoop(void *pvParameters) {
       
       if (http.begin(sharedClient, serverName)) {
         http.addHeader("Content-Type", "application/json"); int httpCode = http.POST(payload);
-        if (httpCode == HTTP_CODE_OK) { String response = http.getString(); processServerResponse(response, shouldProcessResponse, isWeatherRefreshResponse); } 
-        else { if (isWeatherRequestPayload(payload)) allowWeatherRetry(); Serial.printf(C_RED "⚠️ [Network] HTTP 에러: %d\r\n" C_RESET, httpCode); }
+        if (httpCode == HTTP_CODE_OK) { String response = http.getString(); if (shouldProcessResponse) queueServerResponse(response, isWeatherRefreshResponse); }
+        else { if (isWeatherRefreshResponse) queueServerResponse("", true, true); Serial.printf(C_RED "⚠️ [Network] HTTP 에러: %d\r\n" C_RESET, httpCode); }
         http.end();
-      } else { if (isWeatherRequestPayload(payload)) allowWeatherRetry(); }
+      } else { if (isWeatherRefreshResponse) queueServerResponse("", true, true); }
       isCommunicate = false;
     }
     vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -385,6 +459,7 @@ void recordAndSendVoice() {
 void autoWeatherScheduler() { if (currentMode != MODE_WEATHER || isRunning) return; if (millis() - lastWeatherCallMillis >= WEATHER_INTERVAL) requestWeatherRefresh(lastWeatherRegion); }
 void handleWebClient() { WiFiClient client = webServer.available(); if (!client) return; client.println("HTTP/1.1 200 OK\r\nConnection: close\r\n"); client.stop(); }
 void initOTA() { 
+  if (WiFi.status() != WL_CONNECTED) return;
   ArduinoOTA.setHostname("SmartDiffuser"); ArduinoOTA.setPassword("1234"); 
   ArduinoOTA.onStart([]() { esp_task_wdt_delete(NULL); forceAllOff(); updateDisplay(0, "OTA Updating..."); });
   ArduinoOTA.onEnd([]() { prefs.putBool("force_startup_page", true); updateDisplay(0, "Update Success!"); esp_task_wdt_add(NULL); });

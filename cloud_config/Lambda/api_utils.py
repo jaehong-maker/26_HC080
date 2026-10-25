@@ -184,13 +184,15 @@ def ask_gemini_ambient_mood(db_avg, db_1hr_avg, is_spike, db_stddev):
 # get_kma_time 처리를 담당함
 def get_kma_time():
     now = datetime.now(timezone(timedelta(hours=9)))
-    if now.minute < 40: now -= timedelta(hours=1)
-    return now.strftime("%Y%m%d"), now.strftime("%H00")
+    if now.minute < 45:
+        now -= timedelta(hours=1)
+    return now.strftime("%Y%m%d"), now.strftime("%H30")
 
 # forecast 처리를 담당함
 def forecast(params):
-    url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtNcst"
+    url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtFcst"
     try:
+        params = dict(params)
         service_key = params.pop('serviceKey')
         query_string = urllib.parse.urlencode(params)
         full_url = f"{url}?serviceKey={service_key}&{query_string}"
@@ -206,14 +208,37 @@ def forecast(params):
                     return "0", "API_키_오류", "0"
 
                 root = ET.fromstring(xml_str)
-                t, p, h = "0", "0", "0"
+                forecasts = {}
                 for item in root.findall(".//item"):
                     cat = item.findtext("category")
-                    val = item.findtext("obsrValue")
-                    if cat == "T1H": t = val
-                    elif cat == "PTY": p = val
-                    elif cat == "REH": h = val
-                w = "강수" if p != "0" else "맑음"
+                    val = item.findtext("fcstValue") or item.findtext("obsrValue")
+                    fcst_date = item.findtext("fcstDate") or params.get("base_date", "")
+                    fcst_time = item.findtext("fcstTime") or params.get("base_time", "")
+                    key = f"{fcst_date}{fcst_time}"
+                    forecasts.setdefault(key, {})[cat] = val
+
+                if not forecasts:
+                    return "0", "통신에러", "0"
+
+                values = forecasts[sorted(forecasts.keys())[0]]
+                t = values.get("T1H", "0")
+                p = str(values.get("PTY", "0"))
+                h = values.get("REH", "0")
+                sky = str(values.get("SKY", "1"))
+
+                if p in {"3", "7"}:
+                    w = "눈"
+                elif p in {"2", "6"}:
+                    w = "비/눈"
+                elif p in {"1", "4", "5"}:
+                    w = "비"
+                elif sky == "4":
+                    w = "흐림"
+                elif sky == "3":
+                    w = "구름많음"
+                else:
+                    w = "맑음"
+
                 return t, w, h
     except Exception as e:
         logger.error(f"Forecast Error: {e}")

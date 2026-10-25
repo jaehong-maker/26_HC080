@@ -9,7 +9,7 @@ import time
 import config
 import db_utils
 import api_utils
-from .common import logic_weather_mode, logic_emotion_mode
+from .common import build_weather_context_key, logic_weather_mode, logic_emotion_mode
 logger = logging.getLogger()
 # 날씨, 감정 등 메인 모드의 로직을 수행함
 def handle_core_modes(action, mode, body, device_id, normalized_weights, region):
@@ -117,7 +117,7 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
                 spray_code, result_text, logic_name, duration = 4, "테스트 눈 실행", "Test_Weather", 3
                 context_key = "Weather_Snow"
             else:
-                if not body.get("region") or body.get("region") == "서울":
+                if not body.get("region"):
                     voice_region = db_utils.get_latest_voice_region(device_id)
                     if voice_region and voice_region in config.REGION_COORDS:
                         region = voice_region
@@ -133,7 +133,7 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
                     bd, bt = api_utils.get_kma_time()
                     params = {
                         "serviceKey": os.environ["SERVICE_KEY"],
-                        "pageNo": "1", "numOfRows": "10", "dataType": "XML",
+                        "pageNo": "1", "numOfRows": "60", "dataType": "XML",
                         "base_date": bd, "base_time": bt, "nx": nx, "ny": ny
                     }
                     temp, w_res, humidity = api_utils.forecast(params)
@@ -143,21 +143,7 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
                         w_res = "맑음(API지연)"
                         temp, humidity = "20", "50"
                     weather_text = w_res
-                    now_kst = datetime.now(timezone(timedelta(hours=9)))
-                    current_hour = now_kst.hour
-                    if 0 <= current_hour < 6:
-                        time_zone = "새벽"
-                    elif 6 <= current_hour < 12:
-                        time_zone = "오전"
-                    elif 12 <= current_hour < 18:
-                        time_zone = "오후"
-                    else:
-                        time_zone = "밤"
-                    w_key = "Sunny"
-                    if w_res and any(x in w_res for x in ["비", "강수"]): w_key = "Rain"
-                    elif w_res and "눈" in w_res: w_key = "Snow"
-                    elif w_res and any(x in w_res for x in ["흐림", "구름"]): w_key = "Cloudy"
-                    context_key = f"Weather_{w_key}_{time_zone}"
+                    context_key = build_weather_context_key(w_res)
                     spray_code, result_text, logic_name, duration = logic_weather_mode(w_res, humidity)
                 else:
                     spray_code, result_text, logic_name, duration = 1, "API키없음", "Error", 3
@@ -287,7 +273,7 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
         led_g = led_dict["led_g"]
         led_b = led_dict["led_b"]
         led_br = led_dict["led_bright"]
-        
+
     if mode == "weather" and action != "START" and "_PREVIEW" not in action:
         try:
             db_utils.state_table.update_item(

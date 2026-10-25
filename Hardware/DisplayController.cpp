@@ -149,9 +149,24 @@ void clearNextionInputBuffer() { while (nexSerial.available()) nexSerial.read();
 void nexSend(const String &cmd) { nexSerial.print(cmd); nexWriteTerminator(); }
 
 static void sendClockDisplayNow() {
-  struct tm timeinfo; if (!getLocalTime(&timeinfo)) { nexSend("t_time.txt=\"--:--\""); return; }
-  char timeText[6]; snprintf(timeText, sizeof(timeText), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
-  nexSend("t_time.txt=\"" + String(timeText) + "\"");
+  static char cachedTimeText[6] = "--:--";
+  static unsigned long lastClockReadMillis = 0;
+  static bool clockCacheInitialized = false;
+  unsigned long now = millis();
+
+  // Page changes reuse the cache instead of repeatedly waiting for time sync.
+  if (!clockCacheInitialized || now - lastClockReadMillis >= 1000UL) {
+    clockCacheInitialized = true;
+    lastClockReadMillis = now;
+    struct tm timeinfo;
+    // Avoid the default 5-second wait. SNTP updates the system clock separately.
+    if (getLocalTime(&timeinfo, 0)) {
+      snprintf(cachedTimeText, sizeof(cachedTimeText), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+    } else {
+      snprintf(cachedTimeText, sizeof(cachedTimeText), "%s", "--:--");
+    }
+  }
+  nexSend("t_time.txt=\"" + String(cachedTimeText) + "\"");
 }
 
 static void scheduleWeatherFieldUpdate(bool loading) { pendingWeatherFieldUpdate = true; pendingWeatherLoadingUpdate = loading; }
