@@ -124,18 +124,6 @@ def handle_voice(event, device_id):
                 }, ensure_ascii=False)
             }
         
-        if led_dict and led_dict.get("led_r", -1) >= 0:
-            try:
-                db_utils.state_table.update_item(
-                    Key={'deviceId': device_id},
-                    UpdateExpression="set led_r = :r, led_g = :g, led_b = :b, led_br = :br",
-                    ExpressionAttributeValues={
-                        ':r': led_dict["led_r"], ':g': led_dict["led_g"], ':b': led_dict["led_b"], ':br': led_dict["led_bright"]
-                    }
-                )
-            except Exception as e:
-                logger.error(f"Voice LED DB 업데이트 실패: {e}")
-
         if kind_code == 0:
             spray_code = 0
         else:
@@ -146,18 +134,33 @@ def handle_voice(event, device_id):
         state = db_utils.get_device_state(device_id) or {}
         last_time_str = state.get('last_spray_time', "2000-01-01T00:00:00")
         now = datetime.now(timezone(timedelta(hours=9)))
-        try:
-            last_time = datetime.fromisoformat(last_time_str)
-            if (now - last_time).total_seconds() < (config.COOLDOWN_MINUTES * 60):
-                return {
-                    "statusCode": 200,
-                    "body": json.dumps({"spray": 0, "message": "쿨타임 중이라 분사할 수 없습니다.", "mode": "CoolDown"}, ensure_ascii=False)
-                }
-        except: pass
+        if spray_code > 0:
+            try:
+                last_time = datetime.fromisoformat(last_time_str)
+                if (now - last_time).total_seconds() < (config.COOLDOWN_MINUTES * 60):
+                    return {
+                        "statusCode": 200,
+                        "body": json.dumps({"spray": 0, "message": "쿨타임 중이라 분사할 수 없습니다.", "mode": "CoolDown"}, ensure_ascii=False)
+                    }
+            except (TypeError, ValueError):
+                pass
 
         if spray_code >= 0:
             target_cmd = spray_code if spray_code > 0 else 0
-            db_utils.manage_mailbox(device_id, target_cmd, save_duration=duration)
+            command_duration = int(duration) if spray_code > 0 else 0
+            active_mode = "voice" if spray_code > 0 else "ready"
+            voice_led = led_dict if led_dict and led_dict.get("led_r", -1) >= 0 else None
+            saved_cmd = db_utils.manage_mailbox(
+                device_id,
+                target_cmd,
+                save_duration=command_duration,
+                save_active_mode=active_mode,
+                save_active_scent=target_cmd,
+                save_led=voice_led,
+            )
+            if saved_cmd != target_cmd:
+                raise RuntimeError("음성 명령을 기기 메일박스에 저장하지 못했습니다.")
+            duration = command_duration
             
             if spray_code > 0:
                 current_cap = float(state.get('current_capacity', config.MAX_CAPACITY))
