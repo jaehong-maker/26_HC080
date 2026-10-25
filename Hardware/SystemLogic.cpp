@@ -228,6 +228,8 @@ void runSystem() {
   }
   updateClockDisplay();
 
+  // Reconnection must also run before ambient/sleep branches return.
+  manageWiFi();
   runScheduler();
 
   if (currentMode == MODE_AMBIENT) { 
@@ -246,7 +248,6 @@ void runSystem() {
     return; 
   } 
 
-  manageWiFi(); 
   systemHeartbeat(); 
   handleWebClient(); 
   autoWeatherScheduler(); 
@@ -649,7 +650,7 @@ void printManualMenu() {
 
 void getCurrentTime(int &hour, int &minute) {
     struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) {
+    if (!getLocalTime(&timeinfo, 0)) {
         hour = -1; minute = -1;
         return;
     }
@@ -672,7 +673,7 @@ void runScheduler() {
         static int lastEventDay = -1;
         struct tm timeinfo;
         
-        if (getLocalTime(&timeinfo)) {
+        if (getLocalTime(&timeinfo, 0)) {
             if (lastEventDay != timeinfo.tm_mday) {
                 lastEventDay = timeinfo.tm_mday;
                 Serial.println(C_MAGENTA "\r\n[Scheduler] Good Morning! 아침 향기를 분사합니다.\r\n" C_RESET);
