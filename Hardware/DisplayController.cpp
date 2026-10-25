@@ -324,19 +324,8 @@ static void enterManualSprayFromDisplay() {
 }
 
 static void openManualModeFromDisplay() {
-  if (currentMode == MODE_WEATHER) {
-    markLocalStop();
-    currentMode = MODE_MANUAL;
-    stopSystem();
-    clearWeatherState();
-    pendingManualScent = "";
-    lastManualPage = PAGE_MANUAL;
-    syncDisplayModeToServer("manual");
-    Serial.println(C_CYAN "\r\n[Display] Weather mode stopped before opening manual mode\r\n" C_RESET);
-  } else if (currentMode != MODE_MANUAL) {
-    setSystemMode(MODE_MANUAL, "Manual Mode");
-  }
   showManualPageByState();
+  if (currentMode != MODE_WEATHER) setSystemMode(MODE_MANUAL, "Manual Mode");
 }
 
 static void openWeatherModeFromDisplay() {
