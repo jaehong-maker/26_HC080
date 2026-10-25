@@ -113,7 +113,6 @@ void initSystem() {
   esp_task_wdt_reconfigure(&wdt_config); 
   esp_task_wdt_add(NULL); 
 
-  networkQueue = xQueueCreate(10, sizeof(String*));
   if (!initializeServerResponseQueue()) {
     Serial.println("[Network] Response queue unavailable; online commands disabled.");
   }
@@ -590,6 +589,8 @@ void checkSafety() {
 }
 
 void setSystemMode(SystemMode mode, String msg) { 
+  bool stoppingActiveSystem = mode == MODE_READY &&
+      (currentMode != MODE_READY || isRunning || isSpraying);
   if (mode != currentMode && (mode == MODE_AMBIENT || mode == MODE_DEMO)) {
     stopSystem();
     automaticSessionStartedMillis = millis();
@@ -604,6 +605,7 @@ void setSystemMode(SystemMode mode, String msg) {
   }
   
   if (mode == MODE_READY) {
+    if (stoppingActiveSystem) invalidatePendingServerStarts();
     stopSystem();
     printMainMenu(); 
   }
