@@ -9,13 +9,28 @@ from datetime import datetime, timedelta, timezone
 import config
 import db_utils
 import api_utils
-from .common import _parse_int, _get_ambient_scent_ids
+from .common import _parse_int, _get_ambient_scent_ids, build_weather_context_key
 
 logger = logging.getLogger()
 
 # handle_feedback 처리를 담당함
 def handle_feedback(action, mode, body, device_id):
-    if action == "FEEDBACK":
+    if action in ["FEEDBACK", "LIKE", "DISLIKE"]:
+        raw_value = body.get("value", 1)
+        try:
+            numeric_value = int(raw_value)
+        except Exception:
+            normalized_value = str(raw_value).strip().lower()
+            numeric_value = 1 if normalized_value in ["1", "good", "like", "true"] else -1
+
+        feedback_action = str(body.get("feedback_action") or action).strip().upper()
+        if feedback_action == "LIKE":
+            is_like = True
+        elif feedback_action == "DISLIKE":
+            is_like = False
+        else:
+            is_like = numeric_value > 0
+
         ambient_context = str(body.get("ambient_context", "") or "").strip()
         feedback_context = str(body.get("context", "") or "").strip()
         feedback_data = str(body.get("data", "") or "").strip()
@@ -44,14 +59,7 @@ def handle_feedback(action, mode, body, device_id):
                 if scent not in ambient_scent_ids:
                     scent = int(config.AMBIENT_DEFAULT_SCENT)
 
-                raw_value = body.get("value", 1)
-                try:
-                    val = int(raw_value)
-                except Exception:
-                    normalized_value = str(raw_value).strip().lower()
-                    val = 1 if normalized_value in ["1", "good", "like", "true"] else -1
-
-                weight_val = 1 if val == 1 else -1
+                weight_val = 1 if is_like else -1
                 db_utils.seed_ambient_defaults()
                 db_utils.save_ambient_feedback(ambient_context, scent, weight_val)
                 return {
@@ -70,9 +78,6 @@ def handle_feedback(action, mode, body, device_id):
                 return {"statusCode": 500, "body": str(e)}
 
         try:
-            val = body.get("value", 1) 
-            is_like = (val == 1)
-
             data_str = body.get("data", "1_Unknown")
             parts = data_str.split("_", 1)
 
@@ -90,17 +95,17 @@ def handle_feedback(action, mode, body, device_id):
                     nx, ny = coord["nx"], coord["ny"]
                     
                     bd, bt = api_utils.get_kma_time()
-                    _, w_res, _ = api_utils.forecast({"serviceKey": os.environ.get("SERVICE_KEY", ""), "base_date": bd, "base_time": bt, "nx": nx, "ny": ny})
-                    
-                    w_key = "Sunny"
-                    if w_res and any(x in w_res for x in ["비", "강수"]): w_key = "Rain"
-                    elif w_res and "눈" in w_res: w_key = "Snow"
-                    elif w_res and any(x in w_res for x in ["흐림", "구름"]): w_key = "Cloudy"
-
-                    now_kst = datetime.now(timezone(timedelta(hours=9)))
-                    h = now_kst.hour
-                    t_zone = "새벽" if 0 <= h < 6 else "오전" if 6 <= h < 12 else "오후" if 12 <= h < 18 else "밤"
-                    ctx = f"Weather_{w_key}_{t_zone}"
+                    _, w_res, _ = api_utils.forecast({
+                        "serviceKey": os.environ.get("SERVICE_KEY", ""),
+                        "pageNo": "1",
+                        "numOfRows": "60",
+                        "dataType": "XML",
+                        "base_date": bd,
+                        "base_time": bt,
+                        "nx": nx,
+                        "ny": ny,
+                    })
+                    ctx = build_weather_context_key(w_res)
                     logger.info(f"[FEEDBACK_CTX] Created context: {ctx} for region: {region}")
                 except Exception as e:
                     logger.error(f"[FEEDBACK_CTX_ERR] {e}")
@@ -122,7 +127,8 @@ def handle_feedback(action, mode, body, device_id):
                 if ctx.startswith("Weather_"):
                     ctx = f"{ctx}_{t_zone}"
 
-            weight_val = 1 if is_like else -1
+            magnitude = abs(numeric_value) or 1
+            weight_val = magnitude if is_like else -magnitude
             u_email = body.get("email")
             db_utils.save_feedback(device_id, ctx, real_kind_code, weight_val, u_email)
 

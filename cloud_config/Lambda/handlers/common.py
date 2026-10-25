@@ -35,6 +35,29 @@ def logic_weather_mode(weather, humidity):
 
     return spray_code, weather_text, "Weather_Mode", 3
 
+
+def build_weather_context_key(weather, now_kst=None):
+    weather_text = str(weather or "").strip()
+    weather_key = "Sunny"
+    if any(x in weather_text for x in ["비", "강수"]):
+        weather_key = "Rain"
+    elif "눈" in weather_text:
+        weather_key = "Snow"
+    elif any(x in weather_text for x in ["흐림", "구름"]):
+        weather_key = "Cloudy"
+
+    current_time = now_kst or datetime.now(timezone(timedelta(hours=9)))
+    if 0 <= current_time.hour < 6:
+        time_zone = "새벽"
+    elif current_time.hour < 12:
+        time_zone = "오전"
+    elif current_time.hour < 18:
+        time_zone = "오후"
+    else:
+        time_zone = "밤"
+
+    return f"Weather_{weather_key}_{time_zone}"
+
 # logic_emotion_mode 처리를 담당함
 def logic_emotion_mode(user_emotion_input):
 

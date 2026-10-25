@@ -262,7 +262,8 @@ export async function apiSendData(options: SendDataOptions): Promise<ApiResponse
     const actType = action === "LIKE" ? "LIKE" : action === "DISLIKE" ? "DISLIKE" : (region === "like" ? "LIKE" : "DISLIKE");
     data.mode = "manual";
     data.event_type = "FEEDBACK";
-    data.action = actType;
+    data.action = "FEEDBACK";
+    data.feedback_action = actType;
     data.value = actType === "LIKE" ? 2 : -5;
     data.current_scent_id = sprayValue || 1;
     data.data = dataPayload || region;
