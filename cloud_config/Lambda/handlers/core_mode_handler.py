@@ -117,7 +117,7 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
                 spray_code, result_text, logic_name, duration = 4, "테스트 눈 실행", "Test_Weather", 3
                 context_key = "Weather_Snow"
             else:
-                if not body.get("region") or body.get("region") == "서울":
+                if not body.get("region"):
                     voice_region = db_utils.get_latest_voice_region(device_id)
                     if voice_region and voice_region in config.REGION_COORDS:
                         region = voice_region
@@ -133,7 +133,7 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
                     bd, bt = api_utils.get_kma_time()
                     params = {
                         "serviceKey": os.environ["SERVICE_KEY"],
-                        "pageNo": "1", "numOfRows": "10", "dataType": "XML",
+                        "pageNo": "1", "numOfRows": "60", "dataType": "XML",
                         "base_date": bd, "base_time": bt, "nx": nx, "ny": ny
                     }
                     temp, w_res, humidity = api_utils.forecast(params)
@@ -287,7 +287,7 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
         led_g = led_dict["led_g"]
         led_b = led_dict["led_b"]
         led_br = led_dict["led_bright"]
-        
+
     if mode == "weather" and action != "START" and "_PREVIEW" not in action:
         try:
             db_utils.state_table.update_item(
