@@ -258,6 +258,7 @@ void changeVolume(int vol);
 
 // --- NetworkUI.cpp ---
 void markLocalStop();
+void invalidatePendingServerStarts();
 void clearLocalStopMark();
 void markLocalWeatherStart();
 void markLocalSettingsChanged();

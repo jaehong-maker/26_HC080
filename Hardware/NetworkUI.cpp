@@ -5,21 +5,44 @@ static WiFiClientSecure sharedClient;
 static bool isSessionInit = false;
 static bool automaticOfflineMode = false;
 
+struct PendingServerRequest {
+  String body;
+  uint32_t stopGeneration;
+};
+
 struct PendingServerResponse {
   String body;
   bool weatherRefresh;
   bool weatherRetry;
+  uint32_t stopGeneration;
 };
 static QueueHandle_t serverResponseQueue = nullptr;
+static portMUX_TYPE commandOrderMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t stopGeneration = 0;
+static int lastSyncedManualScent = 0;
 
-bool initializeServerResponseQueue() {
-  if (!serverResponseQueue) serverResponseQueue = xQueueCreate(4, sizeof(PendingServerResponse*));
-  return serverResponseQueue != nullptr;
+static uint32_t currentStopGeneration() {
+  portENTER_CRITICAL(&commandOrderMux);
+  uint32_t generation = stopGeneration;
+  portEXIT_CRITICAL(&commandOrderMux);
+  return generation;
 }
 
-static void queueServerResponse(const String &body, bool weatherRefresh, bool weatherRetry = false) {
+void invalidatePendingServerStarts() {
+  portENTER_CRITICAL(&commandOrderMux);
+  ++stopGeneration;
+  portEXIT_CRITICAL(&commandOrderMux);
+}
+
+bool initializeServerResponseQueue() {
+  if (!networkQueue) networkQueue = xQueueCreate(10, sizeof(PendingServerRequest*));
+  if (!serverResponseQueue) serverResponseQueue = xQueueCreate(4, sizeof(PendingServerResponse*));
+  return networkQueue != nullptr && serverResponseQueue != nullptr;
+}
+
+static void queueServerResponse(const String &body, bool weatherRefresh, uint32_t requestGeneration, bool weatherRetry = false) {
   if (!serverResponseQueue) return;
-  PendingServerResponse *message = new (std::nothrow) PendingServerResponse{body, weatherRefresh, weatherRetry};
+  PendingServerResponse *message = new (std::nothrow) PendingServerResponse{body, weatherRefresh, weatherRetry, requestGeneration};
   if (!message || message->body.length() != body.length()) {
     delete message;
     Serial.println("[Network] Unable to allocate server response; response discarded.");
@@ -38,7 +61,10 @@ static unsigned long lastLocalWeatherStartMillis = 0;
 static const unsigned long WEATHER_STOP_IGNORE_AFTER_START_MS = 15000;
 
 void markLocalSettingsChanged() { lastLocalSettingsMillis = millis(); }
-void markLocalStop() { lastLocalStopMillis = millis(); }
+void markLocalStop() {
+  lastLocalStopMillis = millis();
+  invalidatePendingServerStarts();
+}
 void clearLocalStopMark() { lastLocalStopMillis = 0; }
 void markLocalWeatherStart() { lastLocalWeatherStartMillis = millis(); }
 
@@ -60,6 +86,36 @@ static bool isServerStopCommand(int cmd, const String &resultText, const String 
   if (resultText.indexOf("중지") >= 0 || resultText.indexOf("정지") >= 0) return true;
   if (resultText.indexOf("꺼짐") >= 0 || resultText.indexOf("대기") >= 0) return true;
   return false; 
+}
+
+static bool isExplicitServerStop(int cmd, const String &text, const String &mode, bool isAppCmd) {
+  return cmd == 0 || cmd == 90 || isServerStopCommand(cmd, text, "") ||
+         (isAppCmd && (mode == "ready" || mode == "off"));
+}
+
+static bool isExplicitServerStopResponse(const String &body) {
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) return false;
+  int cmd = doc["spray"] | -1;
+  String text = doc["result_text"] | "";
+  String mode = doc["active_mode"] | "";
+  mode.trim();
+  bool isAppCmd = (doc["app_command"] == true || doc["pending_cmd"] == true || doc["command_source"] == "app");
+  return isExplicitServerStop(cmd, text, mode, isAppCmd);
+}
+
+static void applyServerStop(bool explicitStop = true) {
+  SystemMode modeBeforeStop = currentMode;
+  if (explicitStop || currentMode != MODE_READY || isRunning || isSpraying) markLocalStop();
+  else lastLocalStopMillis = millis(); // An idle status is not a new stop barrier.
+  clearWeatherState();
+  setSystemMode(MODE_READY, "Stopped by Server");
+  if (modeBeforeStop == MODE_WEATHER || currentDisplayPage == PAGE_WEATHER) showWeatherOffPage();
+  else updateDisplay(0, "Stopped by Server");
+  lastSyncedManualScent = 0;
+  manualModeOffMillis = 0;
+  lastStoppedManualScent = 0;
+  Serial.println("[Server Sync] Stop applied.");
 }
 
 static bool readJsonFloatField(JsonDocument &doc, const char *fieldName, float &value) {
@@ -309,7 +365,6 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   refreshWeatherFieldsIfVisible(); showWeatherPageForRefreshResponse(isWeatherRefreshResponse); 
 
   // 🟢 3. 기타 세팅 및 모드 전환 로직
-  static int lastSyncedManualScent = 0;
   if (shouldApplySettings && !doc["intensity"].isNull()) SprayIntensity(doc["intensity"] | 2);
   if (shouldApplySettings && !doc["volume"].isNull()) applyServerVolumeWithoutPageChange(doc["volume"] | 5);
 
@@ -335,9 +390,8 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   }
 
   if (!isActiveWeatherRefreshResponse && isServerStopCommand(cmd, resultText, serverActiveMode)) {
-    SystemMode modeBeforeStop = currentMode; markLocalStop(); clearWeatherState(); setSystemMode(MODE_READY, "Stopped by Server");
-    if (modeBeforeStop == MODE_WEATHER || currentDisplayPage == PAGE_WEATHER) showWeatherOffPage(); else updateDisplay(0, "Stopped by Server");
-    lastSyncedManualScent = 0; manualModeOffMillis = 0; lastStoppedManualScent = 0; Serial.println(C_YELLOW "\r\n🛑 [Server Sync] 서버 정지 신호 수신\r\n" C_RESET); return;
+    applyServerStop(isExplicitServerStop(cmd, resultText, serverActiveMode, isAppCmd));
+    return;
   }
 
   if (!isAppCmd && wasRecentlyStoppedLocally() && currentMode != MODE_WEATHER && isWeatherLikeResponse(serverActiveMode, weatherText, targetRegion, isWeatherRefreshResponse)) return;
@@ -392,25 +446,34 @@ void processPendingServerResponse() {
   if (!serverResponseQueue) return;
   PendingServerResponse *message = nullptr;
   if (xQueueReceive(serverResponseQueue, &message, 0) != pdTRUE) return;
-  if (message->weatherRetry) allowWeatherRetry();
+  if (message->stopGeneration != currentStopGeneration()) {
+    // Stops win even when their request predates a local stop. Old starts and
+    // settings never reach the actuator/display handlers after the barrier.
+    if (!message->weatherRetry && isExplicitServerStopResponse(message->body)) applyServerStop();
+    else Serial.println("[Network] Ignored response requested before the latest stop.");
+  }
+  else if (message->weatherRetry) allowWeatherRetry();
   else processServerResponse(message->body, true, message->weatherRefresh);
   delete message;
 }
 
 void networkTaskLoop(void *pvParameters) {
+  if (!networkQueue || !serverResponseQueue) { vTaskDelete(NULL); return; }
   for (;;) {
-    String* currentMsgPtr;
+    PendingServerRequest* currentMsgPtr;
     if (xQueueReceive(networkQueue, &currentMsgPtr, portMAX_DELAY) == pdTRUE) {
-      String payload = *currentMsgPtr; delete currentMsgPtr;
+      String payload = currentMsgPtr->body;
+      const uint32_t requestGeneration = currentMsgPtr->stopGeneration;
+      delete currentMsgPtr;
       bool isWeatherRefreshResponse = isWeatherRequestPayload(payload); bool shouldProcessResponse = shouldProcessNetworkResponse(payload);
       isCommunicate = true; initNetworkSession(); HTTPClient http; http.setTimeout(20000);
       
       if (http.begin(sharedClient, serverName)) {
         http.addHeader("Content-Type", "application/json"); int httpCode = http.POST(payload);
-        if (httpCode == HTTP_CODE_OK) { String response = http.getString(); if (shouldProcessResponse) queueServerResponse(response, isWeatherRefreshResponse); }
-        else { if (isWeatherRefreshResponse) queueServerResponse("", true, true); Serial.printf(C_RED "⚠️ [Network] HTTP 에러: %d\r\n" C_RESET, httpCode); }
+        if (httpCode == HTTP_CODE_OK) { String response = http.getString(); if (shouldProcessResponse) queueServerResponse(response, isWeatherRefreshResponse, requestGeneration); }
+        else { if (isWeatherRefreshResponse) queueServerResponse("", true, requestGeneration, true); Serial.printf(C_RED "⚠️ [Network] HTTP 에러: %d\r\n" C_RESET, httpCode); }
         http.end();
-      } else { if (isWeatherRefreshResponse) queueServerResponse("", true, true); }
+      } else { if (isWeatherRefreshResponse) queueServerResponse("", true, requestGeneration, true); }
       isCommunicate = false;
     }
     vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -418,8 +481,15 @@ void networkTaskLoop(void *pvParameters) {
 }
 
 void sendServerRequest(String payload) {
-  if (WiFi.status() != WL_CONNECTED) return;
-  String normalizedPayload = attachDeviceIdIfMissing(payload); String* msg = new String(normalizedPayload);
+  if (WiFi.status() != WL_CONNECTED || !networkQueue || !serverResponseQueue) return;
+  const uint32_t requestGeneration = currentStopGeneration();
+  String normalizedPayload = attachDeviceIdIfMissing(payload);
+  PendingServerRequest* msg = new (std::nothrow) PendingServerRequest{normalizedPayload, requestGeneration};
+  if (!msg || msg->body.length() != normalizedPayload.length()) {
+    delete msg;
+    Serial.println("[Network] Unable to allocate server request.");
+    return;
+  }
   if (xQueueSend(networkQueue, &msg, 0) != pdTRUE) { delete msg; Serial.println(C_RED "⚠️ 통신 대기열 꽉 참" C_RESET); }
 }
 
