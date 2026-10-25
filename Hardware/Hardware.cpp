@@ -396,7 +396,7 @@ void resetSlidingWindow() {
 }
 
 void runAmbientMode() {
-  if (isWaitingForTestDb) return; 
+  if (currentMode != MODE_AMBIENT || isWaitingForTestDb) return;
 
   unsigned long currentTime = millis();
   
@@ -424,6 +424,14 @@ void runAmbientMode() {
     long sumDB = 0;
     
     for (int i = 0; i < sampleCount; i++) {
+      esp_task_wdt_reset();
+      checkNextionInput();
+      checkSerialInput();
+      monitorWeight();
+      runSprayLogic();
+      // A stop, mode change or safety trip cancels this measurement cycle.
+      if (currentMode != MODE_AMBIENT) return;
+
       int32_t samples[64]; 
       size_t bytes_read = 0;
       i2s_read(I2S_PORT, &samples, sizeof(samples), &bytes_read, I2S_READ_TIMEOUT);
@@ -432,10 +440,6 @@ void runAmbientMode() {
       dbSamples[i] = current_db; 
       sumDB += current_db;
 
-      if (isRunning) runSprayLogic();
-      
-      esp_task_wdt_reset();
-      checkNextionInput();
       updateClockDisplay();
       delay(30); // 30ms * 100 = 3초 수음
     }
