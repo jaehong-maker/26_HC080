@@ -2,6 +2,7 @@
 
 static WiFiClientSecure sharedClient;
 static bool isSessionInit = false;
+static bool automaticOfflineMode = false;
 
 static unsigned long lastLocalSettingsMillis = 0;
 static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 30000;
@@ -112,6 +113,7 @@ void displayWatcherTask(void *pvParameters) {
 
 void connectWiFi() {
   Serial.printf("\r\n[System] 무선 연결/설정 모드 가동...\r\n"); esp_task_wdt_delete(NULL);
+  automaticOfflineMode = false;
   if (prefs.getBool("force_offline", false)) {
     prefs.putBool("force_offline", false); 
     Serial.println(C_YELLOW "\r\n[Offline] Wi-Fi 설정을 건너뛰고 수동 모드로 진입합니다!" C_RESET);
@@ -119,6 +121,10 @@ void connectWiFi() {
   }
 
   WiFiManager wifiManager;
+  // Bound ordinary boot attempts; explicit Wi-Fi setup keeps its existing portal.
+  wifiManager.setConnectTimeout(10);
+  wifiManager.setSaveConnectTimeout(10);
+  wifiManager.setConnectRetries(1);
   bool forceConfigPortal = prefs.getBool("force_config_portal", false);
   if (forceConfigPortal) {
     prefs.putBool("force_config_portal", false); showPage(PAGE_WIFI_RESET); WiFi.disconnect(true, true); delay(200);
@@ -128,7 +134,9 @@ void connectWiFi() {
   wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   wifiManager.setCaptivePortalEnable(true); WiFi.setHostname("SmartDiffuser"); wifiManager.setDebugOutput(true);
   WiFi.mode(WIFI_STA); 
-  String savedSSID = WiFi.SSID();
+  // WiFi.SSID() is empty while disconnected on ESP32; read saved credentials.
+  String savedSSID = wifiManager.getWiFiSSID();
+  wifiManager.setEnableConfigPortal(forceConfigPortal || savedSSID.length() == 0);
 
   if (savedSSID.length() > 0) Serial.printf("\r\n[WiFi] 저장된 와이파이 발견: %s\r\n", savedSSID.c_str());
   else Serial.println("\r\n[WiFi] 최초 부팅 상태입니다! (와이파이 미설정)");
@@ -142,7 +150,13 @@ void connectWiFi() {
   if (forceConfigPortal) { updateDisplay(0, "Setup WiFi"); wifiConnected = wifiManager.startConfigPortal("SmartDiffuser_Setup"); } 
   else { wifiConnected = wifiManager.autoConnect("SmartDiffuser_Setup"); }
 
-  if (!wifiConnected) Serial.println(C_YELLOW "\r\n[Warning] Wi-Fi 설정 실패." C_RESET);
+  if (!wifiConnected) {
+    Serial.println(C_YELLOW "\r\n[Offline] Wi-Fi unavailable; continuing to local controls.\r\n" C_RESET);
+    automaticOfflineMode = true;
+    setOfflineModeActive(true);
+    wifiRetryInterval = 5000;
+    lastWifiRetryMillis = millis();
+  }
   else {
     Serial.printf("\r\nConnected! IP: %s\r\n", WiFi.localIP().toString().c_str());
     if (prefs.isKey("wifi_return_page")) {
@@ -156,14 +170,28 @@ void connectWiFi() {
 }
 
 void manageWiFi() {
-  static bool wasConnected = true; unsigned long currentTime = millis();
+  static bool wasConnected = false; unsigned long currentTime = millis();
   if (WiFi.status() != WL_CONNECTED) {
     if (wasConnected) { wasConnected = false; Serial.println(C_RED "\r\n🚨 WiFi 끊김! 복구 진입" C_RESET); wifiRetryInterval = 5000; }
     if (currentTime - lastWifiRetryMillis >= wifiRetryInterval) {
       lastWifiRetryMillis = currentTime; WiFi.disconnect(); WiFi.reconnect();
       wifiRetryInterval = min(wifiRetryInterval * 2, 60000UL);
     }
-  } else { if (!wasConnected) { wasConnected = true; wifiRetryInterval = 5000; } }
+  } else {
+    if (!wasConnected) {
+      wasConnected = true;
+      wifiRetryInterval = 5000;
+      // OTA may not have started during an offline boot.
+      initOTA();
+    }
+    if (automaticOfflineMode) {
+      automaticOfflineMode = false;
+      offlineModeActive = false;
+      // Keep a manual/settings page open if the user has already navigated there.
+      if (currentDisplayPage == PAGE_OFFLINE) showWeatherOffPage();
+      Serial.println(C_GREEN "\r\n[WiFi] Reconnected; online controls restored.\r\n" C_RESET);
+    }
+  }
 }
 
 void pollServer() {
@@ -385,6 +413,7 @@ void recordAndSendVoice() {
 void autoWeatherScheduler() { if (currentMode != MODE_WEATHER || isRunning) return; if (millis() - lastWeatherCallMillis >= WEATHER_INTERVAL) requestWeatherRefresh(lastWeatherRegion); }
 void handleWebClient() { WiFiClient client = webServer.available(); if (!client) return; client.println("HTTP/1.1 200 OK\r\nConnection: close\r\n"); client.stop(); }
 void initOTA() { 
+  if (WiFi.status() != WL_CONNECTED) return;
   ArduinoOTA.setHostname("SmartDiffuser"); ArduinoOTA.setPassword("1234"); 
   ArduinoOTA.onStart([]() { esp_task_wdt_delete(NULL); forceAllOff(); updateDisplay(0, "OTA Updating..."); });
   ArduinoOTA.onEnd([]() { prefs.putBool("force_startup_page", true); updateDisplay(0, "Update Success!"); esp_task_wdt_add(NULL); });
