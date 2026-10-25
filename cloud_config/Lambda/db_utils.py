@@ -595,7 +595,16 @@ def get_user_history_text(device_id, email=None):
 
 
 # 기기가 수행할 다음 명령(메일박스)을 저장하거나 읽어옴
-def manage_mailbox(device_id, save_cmd=None, save_region=None, save_duration=None, is_peek=False):
+def manage_mailbox(
+    device_id,
+    save_cmd=None,
+    save_region=None,
+    save_duration=None,
+    is_peek=False,
+    save_active_mode=None,
+    save_active_scent=None,
+    save_led=None,
+):
     try:
         if save_cmd is not None:
             update_exp = "set pending_cmd = :c, current_spray = :c"
@@ -608,6 +617,21 @@ def manage_mailbox(device_id, save_cmd=None, save_region=None, save_duration=Non
             if save_duration is not None:
                 update_exp += ", pending_duration = :d"
                 exp_vals[":d"] = int(save_duration)
+
+            if save_active_mode is not None:
+                update_exp += ", active_mode = :am"
+                exp_vals[":am"] = str(save_active_mode)
+
+            if save_active_scent is not None:
+                update_exp += ", active_scent = :as"
+                exp_vals[":as"] = int(save_active_scent)
+
+            if save_led is not None:
+                update_exp += ", led_r = :lr, led_g = :lg, led_b = :lb, led_br = :lbr"
+                exp_vals[":lr"] = int(save_led["led_r"])
+                exp_vals[":lg"] = int(save_led["led_g"])
+                exp_vals[":lb"] = int(save_led["led_b"])
+                exp_vals[":lbr"] = int(save_led["led_bright"])
 
             state_table.update_item(
                 Key={"deviceId": device_id},
