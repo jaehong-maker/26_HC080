@@ -323,6 +323,41 @@ static void enterManualSprayFromDisplay() {
   Serial.println(C_CYAN "\r\n[Display] Weather spray stopped before manual spray\r\n" C_RESET);
 }
 
+static void openManualModeFromDisplay() {
+  if (currentMode == MODE_WEATHER) {
+    markLocalStop();
+    currentMode = MODE_MANUAL;
+    stopSystem();
+    clearWeatherState();
+    pendingManualScent = "";
+    lastManualPage = PAGE_MANUAL;
+    syncDisplayModeToServer("manual");
+    Serial.println(C_CYAN "\r\n[Display] Weather mode stopped before opening manual mode\r\n" C_RESET);
+  } else if (currentMode != MODE_MANUAL) {
+    setSystemMode(MODE_MANUAL, "Manual Mode");
+  }
+  showManualPageByState();
+}
+
+static void openWeatherModeFromDisplay() {
+  if (offlineModeActive) { showPage(PAGE_OFFLINE); return; }
+
+  bool startingWeatherMode = currentMode != MODE_WEATHER;
+  clearLocalStopMark();
+  markLocalWeatherStart();
+  if (startingWeatherMode) {
+    stopSystem();
+    pendingManualScent = "";
+    lastManualPage = PAGE_MANUAL;
+  }
+
+  showPage(PAGE_WEATHER);
+  beginWeatherRefresh();
+  if (startingWeatherMode) enterWeatherMode(false);
+  syncDisplayModeToServer("weather");
+  requestWeatherRefresh(lastWeatherRegion);
+}
+
 static void handleScentButton(const String &cmd) {
   int scent = cmd.substring(1).toInt(); if (scent < 1 || scent > 4) return;
   Serial.printf("\r\n[S BUTTON] %s\r\n", cmd.c_str()); String scentStr = String(scent);
@@ -382,8 +417,8 @@ void handleNextionCmd(const String &cmd) {
     else if (currentMode == MODE_WEATHER) showWeatherPageByState();
     else showWeatherOffPage();
   }
-  else if (cmd == "Y3") { if (offlineModeActive) showPage(PAGE_OFFLINE); else if (currentMode == MODE_WEATHER) { clearLocalStopMark(); markLocalWeatherStart(); showPage(PAGE_WEATHER); beginWeatherRefresh(); syncDisplayModeToServer("weather"); requestWeatherRefresh(lastWeatherRegion); } else { clearLocalStopMark(); markLocalWeatherStart(); showPage(PAGE_WEATHER); beginWeatherRefresh(); enterWeatherMode(false); syncDisplayModeToServer("weather"); requestWeatherRefresh(lastWeatherRegion); } }
-  else if (cmd == "M1" || cmd == "Y1") { showManualPageByState(); if (currentMode != MODE_WEATHER) setSystemMode(MODE_MANUAL, "Manual Mode"); } 
+  else if (cmd == "Y3") openWeatherModeFromDisplay();
+  else if (cmd == "M1" || cmd == "Y1") openManualModeFromDisplay();
   else if (cmd == "M3" || cmd == "Y2") { showPage(PAGE_DEVICE_STATUS); updateScentProgressBars(); if (currentMode != MODE_WEATHER) setSystemMode(MODE_SETTING, "Setting Mode"); } 
   else if (cmd == "ST") {
     SystemMode modeBeforeStop = currentMode; lastManualPage = PAGE_MANUAL; markLocalStop(); setSystemMode(MODE_READY, "Stopped"); pendingManualScent = "";

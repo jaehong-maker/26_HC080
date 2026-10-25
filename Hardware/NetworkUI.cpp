@@ -8,7 +8,7 @@ static const unsigned long LOCAL_SETTINGS_PROTECT_MS = 30000;
 static unsigned long lastLocalStopMillis = 0;
 static const unsigned long WEATHER_RESPONSE_IGNORE_AFTER_STOP_MS = 15000;
 static unsigned long lastLocalWeatherStartMillis = 0;
-static const unsigned long WEATHER_STOP_IGNORE_AFTER_START_MS = 3000;
+static const unsigned long WEATHER_STOP_IGNORE_AFTER_START_MS = 15000;
 
 void markLocalSettingsChanged() { lastLocalSettingsMillis = millis(); }
 void markLocalStop() { lastLocalStopMillis = millis(); }
@@ -231,6 +231,11 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   // 🟢 2. 모드 및 서버 상태 파싱
   String serverActiveMode = doc["active_mode"] | ""; serverActiveMode.trim();
   int cmd = doc["spray"] | -1; String resultText = doc["result_text"] | "";
+
+  if (!isAppCmd && currentMode == MODE_WEATHER && wasWeatherStartedLocallyRecently() && serverActiveMode == "manual") {
+    Serial.println(C_YELLOW "\r\n[Weather] Ignored stale manual state after local weather start\r\n" C_RESET);
+    return;
+  }
 
   String weatherText = doc["weather"] | ""; String targetRegion = doc["target_region"] | "";
   if (targetRegion.length() == 0 && doc.containsKey("region")) targetRegion = doc["region"].as<String>();
