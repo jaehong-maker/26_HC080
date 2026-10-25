@@ -78,12 +78,14 @@ def handle_feedback(action, mode, body, device_id):
                 return {"statusCode": 500, "body": str(e)}
 
         try:
-            data_str = body.get("data", "1_Unknown")
+            data_str = str(body.get("data") or "").strip()
             parts = data_str.split("_", 1)
 
-            spray_no = int(parts[0]) if parts[0].isdigit() else 1
+            spray_no = _parse_int(body.get("current_scent_id"), 0)
+            if spray_no <= 0:
+                spray_no = int(parts[0]) if parts and parts[0].isdigit() else 1
             real_kind_code = db_utils.get_kind_from_spray(device_id, spray_no) or spray_no
-            ctx = parts[1] if len(parts) > 1 else "Unknown"
+            ctx = feedback_context or (parts[1] if len(parts) > 1 else "Unknown")
             
             if ctx == "AI_WEATHER":
                 try:
@@ -143,14 +145,11 @@ def handle_feedback(action, mode, body, device_id):
                 valid_kinds = set(db_utils._kind_ids())
                 active_sprays = [spray for spray, kind in mapping.items() if int(kind) in valid_kinds]
                 
-                candidates = [s for s in active_sprays if s != spray_no]
+                candidates = [s for s in active_sprays if int(s) != spray_no]
                 if not candidates:
-                    candidates = active_sprays if active_sprays else [1, 2, 3, 4]
+                    candidates = [s for s in [1, 2, 3, 4] if s != spray_no]
                     
                 new_spray = random.choice(candidates)
-                new_kind = db_utils.get_kind_from_spray(device_id, new_spray) or new_spray
-                
-                db_utils.save_feedback(device_id, ctx, new_kind, 1, u_email)
                 db_utils.manage_mailbox(device_id, new_spray)
                 
                 return {
