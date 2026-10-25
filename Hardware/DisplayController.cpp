@@ -311,16 +311,52 @@ static void toggleBlendMode() {
   if (blendModeEnabled || (currentDisplayPage >= PAGE_BLEND_HOME && currentDisplayPage <= 19)) { exitBlendModeToManual(true); Serial.println("\r\n[BLEND] OFF"); return; }
   blendModeEnabled = true; blendSelection = ""; blendSprayActive = false; pendingManualScent = ""; nexSend("b_blend.txt=\"blendOFF\""); lastManualPage = PAGE_BLEND_HOME; showPage(PAGE_BLEND_HOME); Serial.println("\r\n[BLEND] ON");
 }
+
+static void enterManualSprayFromDisplay() {
+  bool leavingWeatherMode = currentMode == MODE_WEATHER;
+  currentMode = MODE_MANUAL;
+  if (!leavingWeatherMode) return;
+
+  markLocalStop();
+  stopSystem();
+  clearWeatherState();
+  Serial.println(C_CYAN "\r\n[Display] Weather spray stopped before manual spray\r\n" C_RESET);
+}
+
+static void openManualModeFromDisplay() {
+  showManualPageByState();
+  if (currentMode != MODE_WEATHER) setSystemMode(MODE_MANUAL, "Manual Mode");
+}
+
+static void openWeatherModeFromDisplay() {
+  if (offlineModeActive) { showPage(PAGE_OFFLINE); return; }
+
+  bool startingWeatherMode = currentMode != MODE_WEATHER;
+  clearLocalStopMark();
+  markLocalWeatherStart();
+  if (startingWeatherMode) {
+    stopSystem();
+    pendingManualScent = "";
+    lastManualPage = PAGE_MANUAL;
+  }
+
+  showPage(PAGE_WEATHER);
+  beginWeatherRefresh();
+  if (startingWeatherMode) enterWeatherMode(false);
+  syncDisplayModeToServer("weather");
+  requestWeatherRefresh(lastWeatherRegion);
+}
+
 static void handleScentButton(const String &cmd) {
   int scent = cmd.substring(1).toInt(); if (scent < 1 || scent > 4) return;
   Serial.printf("\r\n[S BUTTON] %s\r\n", cmd.c_str()); String scentStr = String(scent);
-  if (!isBlendUiActive()) { currentMode = MODE_MANUAL; clearBlendSelectionOnly(); blendSprayActive = false; lastManualPage = PAGE_MANUAL_SCENT_BASE + scent; showPage(lastManualPage); syncDisplayModeToServer("manual", scent); pendingManualScent = String(scent); lastScentTouchTime = millis(); return; }
+  if (!isBlendUiActive()) { enterManualSprayFromDisplay(); clearBlendSelectionOnly(); blendSprayActive = false; lastManualPage = PAGE_MANUAL_SCENT_BASE + scent; showPage(lastManualPage); syncDisplayModeToServer("manual", scent); pendingManualScent = String(scent); lastScentTouchTime = millis(); return; }
   blendModeEnabled = true;
   if (blendSprayActive) { if (isRunning) stopSystem(); blendModeEnabled = true; blendSprayActive = false; pendingManualScent = ""; nexSend("b_blend.txt=\"blendOFF\""); blendSelection = scentStr; lastManualPage = blendSinglePage(scent); showPage(lastManualPage); return; }
   if (blendSelection.length() == 0 || blendSelection == scentStr) { blendSelection = scentStr; lastManualPage = blendSinglePage(scent); showPage(lastManualPage); return; }
   String pair = makeBlendPair(blendSelection, scentStr);
   if (!isValidBlendSelection(pair)) { blendSelection = scentStr; lastManualPage = blendSinglePage(scent); showPage(lastManualPage); return; }
-  lastManualPage = blendPairPage(pair); showPage(lastManualPage); currentMode = MODE_MANUAL; syncDisplayModeToServer("manual", pair.toInt()); pendingManualScent = pair; lastScentTouchTime = millis(); blendSelection = ""; blendSprayActive = true;
+  enterManualSprayFromDisplay(); blendModeEnabled = true; lastManualPage = blendPairPage(pair); showPage(lastManualPage); syncDisplayModeToServer("manual", pair.toInt()); pendingManualScent = pair; lastScentTouchTime = millis(); blendSelection = ""; blendSprayActive = true;
 }
 
 static int currentIntensityPage() { if (currentIntensity == 1) return PAGE_INTENSITY_LOW; if (currentIntensity == 2) return PAGE_INTENSITY_MEDIUM; if (currentIntensity == 3) return PAGE_INTENSITY_HIGH; return PAGE_INTENSITY_HOME; }
@@ -370,8 +406,8 @@ void handleNextionCmd(const String &cmd) {
     else if (currentMode == MODE_WEATHER) showWeatherPageByState();
     else showWeatherOffPage();
   }
-  else if (cmd == "Y3") { if (offlineModeActive) showPage(PAGE_OFFLINE); else if (currentMode == MODE_WEATHER) { clearLocalStopMark(); markLocalWeatherStart(); showPage(PAGE_WEATHER); beginWeatherRefresh(); syncDisplayModeToServer("weather"); requestWeatherRefresh(lastWeatherRegion); } else { clearLocalStopMark(); markLocalWeatherStart(); showPage(PAGE_WEATHER); beginWeatherRefresh(); enterWeatherMode(false); syncDisplayModeToServer("weather"); requestWeatherRefresh(lastWeatherRegion); } }
-  else if (cmd == "M1" || cmd == "Y1") { showManualPageByState(); if (currentMode != MODE_WEATHER) setSystemMode(MODE_MANUAL, "Manual Mode"); } 
+  else if (cmd == "Y3") openWeatherModeFromDisplay();
+  else if (cmd == "M1" || cmd == "Y1") openManualModeFromDisplay();
   else if (cmd == "M3" || cmd == "Y2") { showPage(PAGE_DEVICE_STATUS); updateScentProgressBars(); if (currentMode != MODE_WEATHER) setSystemMode(MODE_SETTING, "Setting Mode"); } 
   else if (cmd == "ST") {
     SystemMode modeBeforeStop = currentMode; lastManualPage = PAGE_MANUAL; markLocalStop(); setSystemMode(MODE_READY, "Stopped"); pendingManualScent = "";
