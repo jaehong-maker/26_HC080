@@ -431,7 +431,13 @@ bool recordAudio(uint8_t** audioBuffer, uint32_t* totalSize) {
   WavHeader header; memcpy(header.riff, "RIFF", 4); header.overall_size = *totalSize - 8; memcpy(header.wave, "WAVE", 4); memcpy(header.fmt_chunk_marker, "fmt ", 4); 
   header.length_of_fmt = 16; header.format_type = 1; header.channels = 1; header.sample_rate = SAMPLE_RATE; header.byterate = SAMPLE_RATE * 2; 
   header.block_align = 2; header.bits_per_sample = 16; memcpy(header.data_chunk_header, "data", 4); header.data_size = dataSize; memcpy(*audioBuffer, &header, sizeof(WavHeader));
-  size_t bytesRead = 0; i2s_read(I2S_PORT, (void*)(*audioBuffer + sizeof(WavHeader)), dataSize, &bytesRead, portMAX_DELAY);
+  int16_t *pcm = reinterpret_cast<int16_t*>(*audioBuffer + sizeof(WavHeader));
+  if (!recordMicrophonePcm(pcm, dataSize / sizeof(int16_t), RECORD_TIME * 1000UL + 1000UL)) {
+    free(*audioBuffer);
+    *audioBuffer = nullptr;
+    *totalSize = 0;
+    return false;
+  }
   return true;
 }
 
@@ -453,7 +459,10 @@ void recordAndSendVoice() {
   if (WiFi.status() != WL_CONNECTED) return;
   SystemMode prevMode = currentMode; currentMode = MODE_VOICE; uint8_t* audioBuffer = NULL; uint32_t totalSize = 0;
   if (recordAudio(&audioBuffer, &totalSize)) { String response = ""; if (sendAudioToServer(audioBuffer, totalSize, response)) executeVoiceCommand(response); }
-  if (audioBuffer != NULL) free(audioBuffer); currentMode = (prevMode == MODE_VOICE) ? MODE_READY : prevMode; showPrompt();
+  if (audioBuffer != NULL) free(audioBuffer);
+  // A stop or mode selection during recording must not be overwritten here.
+  if (currentMode == MODE_VOICE) currentMode = (prevMode == MODE_VOICE) ? MODE_READY : prevMode;
+  showPrompt();
 }
 
 void autoWeatherScheduler() { if (currentMode != MODE_WEATHER || isRunning) return; if (millis() - lastWeatherCallMillis >= WEATHER_INTERVAL) requestWeatherRefresh(lastWeatherRegion); }

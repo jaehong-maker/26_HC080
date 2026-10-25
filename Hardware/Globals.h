@@ -290,6 +290,14 @@ void SprayIntensity(int intensityVal);
 String getTrackName(int trackNum);
 void updateMusicMapping(String data);
 void initMicrophone();
+struct MicrophoneLevel {
+    int level;
+    int peak;
+    uint32_t sequence;
+    unsigned long capturedAtMillis;
+};
+bool getMicrophoneLevel(MicrophoneLevel &snapshot);
+bool recordMicrophonePcm(int16_t *destination, size_t sampleCount, unsigned long timeoutMs);
 void runSoundVisualizer();
 void runSoundReaction();
 void checkBackgroundNoise();
