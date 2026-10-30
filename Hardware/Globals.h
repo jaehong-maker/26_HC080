@@ -266,7 +266,7 @@ void connectWiFi();
 void manageWiFi();
 void pollServer();
 void sendServerRequest(String payload);
-void requestWeatherRefresh(const String &region);
+void requestWeatherRefresh(const String &region, bool preferProfileRegion = false);
 void rememberWeatherRegion(const String &region);
 void handleWebClient();
 void autoWeatherScheduler();

@@ -141,10 +141,11 @@ void rememberWeatherRegion(const String &region) {
   Serial.printf(C_CYAN "\r\n[Weather] Saved region updated: %s\r\n" C_RESET, lastWeatherRegion.c_str());
 }
 
-String buildWeatherRequestPayload(const String &region) {
+String buildWeatherRequestPayload(const String &region, bool preferProfileRegion) {
   JsonDocument reqDoc; reqDoc["mode"] = "weather";
   String safeRegion = region; safeRegion.trim();
   if (safeRegion.length() > 0) reqDoc["region"] = safeRegion;
+  if (preferProfileRegion) reqDoc["prefer_profile_region"] = true;
   JsonArray wArray = reqDoc["weights"].to<JsonArray>();
   for (int i = 0; i < 4; i++) {
     float percent = calculateScentPercent(weights[i]); 
@@ -153,9 +154,9 @@ String buildWeatherRequestPayload(const String &region) {
   String payload; payload.reserve(128); serializeJson(reqDoc, payload); return payload;
 }
 
-void requestWeatherRefresh(const String &region) {
+void requestWeatherRefresh(const String &region, bool preferProfileRegion) {
   lastWeatherCallMillis = millis();
-  sendServerRequest(buildWeatherRequestPayload(region));
+  sendServerRequest(buildWeatherRequestPayload(region, preferProfileRegion));
 }
 
 static bool isWeatherRequestPayload(const String &payload) { return payload.indexOf("\"mode\":\"weather\"") >= 0; }
