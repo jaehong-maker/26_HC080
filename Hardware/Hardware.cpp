@@ -171,7 +171,9 @@ void stopSystem() {
   isRunning = false; isSpraying = false;
   for (int i = 0; i < 4; i++) activeNozzles[i] = false;
   
+  recordControlDiagnostic("stop", "outputs-off");
   myDFPlayer.stop();
+  currentAmbientTrack = 0;
 }
 
 void resetManualState() {
@@ -569,6 +571,7 @@ bool recordMicrophonePcm(int16_t *destination, size_t sampleCount, unsigned long
     runSprayLogic();
     checkNextionInput();
     processPendingServerResponse();
+    handleWebClient();
     delay(5);
   }
   // Detach under the same lock used by the capture task before the caller can
@@ -642,119 +645,8 @@ void resetSlidingWindow() {
 }
 
 void runAmbientMode() {
-  if (currentMode != MODE_AMBIENT || isWaitingForTestDb) return;
-
-  unsigned long currentTime = millis();
-  
-  bool isSongFinished = (digitalRead(PIN_BUSY) == HIGH && (currentTime - lastAmbientTime > 3000)); // Config:: 삭제
-  bool isOneHourPassed = (last1HourCheckTime > 0 && (currentTime - last1HourCheckTime >= Config::ONE_HOUR_MS));
-
-  // -----------------------------------------------------------------------------------
-  // [트리거 조건]: 1) 최초 실행  2) 1시간 경과  3) 노래 종료  4) 강제 스킵(n)
-  // -----------------------------------------------------------------------------------
-  if (isFirstAmbientRun || isOneHourPassed || isSongFinished || forceAmbientSkip) {
-    forceAmbientSkip = false;
-    
-    if (isFirstAmbientRun || isOneHourPassed) {
-      last1HourCheckTime = currentTime;
-    }
-
-    // [단계 1] 무음 구간(Silence Gap) 수음: BGM을 잠시 끄고 3초간 순수 앰비언트 소음 측정
-    myDFPlayer.stop(); 
-    delay(100);
-
-    Serial.printf(C_CYAN "\r\n[Silence Gap] 🤫 BGM 무음 구간: 3초간 앰비언트 소음 측정 중...\r\n" C_RESET);
-
-    const int maxSamples = 100;
-    int dbSamples[maxSamples];
-    int sampleCount = 0;
-    long sumDB = 0;
-    unsigned long measurementStarted = millis();
-    MicrophoneLevel previousSnapshot = {};
-    getMicrophoneLevel(previousSnapshot);
-    uint32_t lastSequence = previousSnapshot.sequence;
-    
-    while (sampleCount < maxSamples && millis() - measurementStarted < 3000UL) {
-      esp_task_wdt_reset();
-      checkNextionInput();
-      checkSerialInput();
-      processPendingServerResponse();
-      monitorWeight();
-      runSprayLogic();
-      // A stop, mode change or safety trip cancels this measurement cycle.
-      if (currentMode != MODE_AMBIENT) return;
-
-      MicrophoneLevel snapshot;
-      if (digitalRead(PIN_BUSY) == HIGH && getMicrophoneLevel(snapshot) && snapshot.sequence != lastSequence) {
-        lastSequence = snapshot.sequence;
-        dbSamples[sampleCount++] = snapshot.level;
-        sumDB += snapshot.level;
-      }
-
-      updateClockDisplay();
-      delay(30);
-    }
-
-    if (sampleCount == 0) {
-      setSystemMode(MODE_READY, "Microphone unavailable or speaker not stopped");
-      showPage(PAGE_DEVICE_STATUS);
-      return;
-    }
-
-    float avgDB = (float)sumDB / sampleCount;
-    float stdDev = calculateStdDev(dbSamples, sampleCount, avgDB);
-
-    float previous1HourAvg = get1HourDbAverage();
-    bool isSpike = false;
-
-    if (dbHistoryCount > 0) {
-      if (abs(avgDB - previous1HourAvg) >= 15.0f || avgDB >= 75.0f) {
-        isSpike = true;
-        Serial.printf(C_RED "🚨 [Fast-Track] 소음 스파이크 감지! (현재: %.1fdB, 1시간평균: %.1fdB)\r\n" C_RESET, avgDB, previous1HourAvg);
-        resetSlidingWindow();
-        last1HourCheckTime = currentTime;
-      }
-    }
-
-    addDbToSlidingWindow(avgDB);
-    float current1HourAvg = get1HourDbAverage();
-
-    Serial.printf(C_GREEN "📊 [소음 분석] 현재: %.1f dB | 1시간 average: %.1f dB | Spike: %s\r\n" C_RESET, 
-                  avgDB, current1HourAvg, isSpike ? "YES" : "NO");
-
-    String payload = "{\"mode\": \"ambient\","
-                     "\"db_avg\": " + String(avgDB, 1) + ","
-                     "\"db_1hr_avg\": " + String(current1HourAvg, 1) + ","
-                     "\"is_spike\": " + String(isSpike ? "true" : "false") + ","
-                     "\"db_stddev\": " + String(stdDev, 1) + ","
-                     "\"weights\": [" + String(weights[0], 1) + ", " + String(weights[1], 1) + 
-                     ", " + String(weights[2], 1) + ", " + String(weights[3], 1) + "]}";
-    
-    sendServerRequest(payload);
-    isFirstAmbientRun = false;
-
-    // [단계 3] 다음 BGM 트랙 연속 재생
-    currentAmbientTrack++;
-    if (currentAmbientTrack > 20) currentAmbientTrack = 1;
-    playSound(currentAmbientTrack);
-    
-    lastAmbientTime = millis();
-  }
-
-  // Do not classify our own BGM as an environmental spike. Ambient decisions
-  // use the speaker-stopped measurement above; no acoustic echo cancellation
-  // is available to separate background sound while the speaker is playing.
-  currentTime = millis();
-  if (digitalRead(PIN_BUSY) == LOW || currentTime - lastAmbientTime < 1000UL) return;
-  static unsigned long lastSpikeCheck = 0;
-  if (currentTime - lastSpikeCheck > 1000) {
-    lastSpikeCheck = currentTime;
-    float currentAvg = get1HourDbAverage();
-    MicrophoneLevel snapshot;
-    if (getMicrophoneLevel(snapshot) && currentAvg > 0 &&
-        (abs(snapshot.level - currentAvg) >= 15.0f || snapshot.level >= 75.0f)) {
-      Serial.printf(C_RED "[Ambient] Speaker stopped; sound spike detected (%d).\r\n" C_RESET, snapshot.level);
-      forceAmbientSkip = true;
-    }
-  }
+  if (currentMode != MODE_AMBIENT) return;
+  // The capture task is the only microphone reader. POLL reports its current
+  // snapshot; the server owns scent selection and music changes.
+  checkBackgroundNoise();
 }
