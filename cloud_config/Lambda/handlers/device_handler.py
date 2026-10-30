@@ -287,6 +287,9 @@ def handle_device(action, mode, body, device_id, normalized_weights):
             "music_tracks": state.get('music_tracks', '1_6_11_16'),
             "result_text": "" if spray_code in [0, -1] else f"명령:{spray_code}"
         }
+        profile_region = db_utils.normalize_weather_region(state.get('last_region', ''))
+        if profile_region in config.REGION_COORDS:
+            response_body["profile_region"] = profile_region
         if implicit_like_result:
             response_body["implicit_like_applied"] = True
             response_body["implicit_like_context"] = implicit_like_result["context"]

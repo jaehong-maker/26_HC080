@@ -12,58 +12,6 @@ import api_utils
 from .common import build_weather_context_key, logic_weather_mode, logic_emotion_mode
 logger = logging.getLogger()
 
-APP_REGION_MAP = {
-    "seoul": "서울",
-    "gapyeong": "가평",
-    "goyang": "고양",
-    "gwacheon": "과천",
-    "gwangmyeong": "광명",
-    "gwangju": "광주",
-    "gwangju_gyeonggi": "경기광주",
-    "gwangju_jeolla": "광주광역시",
-    "guri": "구리",
-    "gunpo": "군포",
-    "gimpo": "김포",
-    "namyangju": "남양주",
-    "dongducheon": "동두천",
-    "bucheon": "부천",
-    "seongnam": "성남",
-    "suwon": "수원",
-    "siheung": "시흥",
-    "ansan": "안산",
-    "anyang": "안양",
-    "yangju": "양주",
-    "yangpyeong": "양평",
-    "yongin": "용인",
-    "uijeongbu": "의정부",
-    "icheon": "이천",
-    "paju": "파주",
-    "pyeongtaek": "평택",
-    "pocheon": "포천",
-    "hwaseong": "화성",
-    "gangwon": "강원",
-    "gyeongnam": "경남",
-    "gyeongbuk": "경북",
-    "daegu": "대구",
-    "daejeon": "대전",
-    "busan": "부산",
-    "sejong": "세종",
-    "ulleungdo": "울릉도",
-    "ulsan": "울산",
-    "incheon": "인천",
-    "jeonnam": "전남",
-    "jeonbuk": "전북",
-    "jeju": "제주",
-    "chungnam": "충남",
-    "chungbuk": "충북",
-}
-
-
-def normalize_weather_region(region):
-    normalized = str(region or "").strip()
-    return APP_REGION_MAP.get(normalized.lower(), normalized)
-
-
 # 날씨, 감정 등 메인 모드의 로직을 수행함
 def handle_core_modes(action, mode, body, device_id, normalized_weights, region):
     weight_g = normalized_weights[0]
@@ -173,9 +121,9 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
                 spray_code, result_text, logic_name, duration = 4, "테스트 눈 실행", "Test_Weather", 3
                 context_key = build_weather_context_key("눈")
             else:
-                region = normalize_weather_region(region)
+                region = db_utils.normalize_weather_region(region)
                 if body.get("prefer_profile_region"):
-                    saved_region = normalize_weather_region(db_utils.get_saved_region(device_id))
+                    saved_region = db_utils.normalize_weather_region(db_utils.get_saved_region(device_id))
                     if saved_region in config.REGION_COORDS:
                         region = saved_region
                 elif not body.get("region"):
@@ -183,7 +131,7 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
                     if voice_region and voice_region in config.REGION_COORDS:
                         region = voice_region
                     else:
-                        saved_region = normalize_weather_region(db_utils.get_saved_region(device_id))
+                        saved_region = db_utils.normalize_weather_region(db_utils.get_saved_region(device_id))
                         if saved_region and saved_region in config.REGION_COORDS:
                             region = saved_region
                 if not region: region = "서울"
