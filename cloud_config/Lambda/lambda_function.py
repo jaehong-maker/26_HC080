@@ -32,7 +32,15 @@ def lambda_handler(event, context):
         parsed_preview = json.loads(raw_body) if isinstance(raw_body, str) and raw_body else raw_body
         if isinstance(parsed_preview, dict):
             action = parsed_preview.get("action", "")
-            if action != "POLL" and response and "body" in response:
+            if action == "POLL" and response and "body" in response:
+                resp_body = json.loads(response["body"])
+                is_hardware_poll = not bool(parsed_preview.get("email"))
+                if is_hardware_poll and resp_body.get("app_command"):
+                    logger.info(
+                        f"📤 [POLL_RESPONSE] deviceId={parsed_preview.get('deviceId', '')}\n"
+                        f"{json.dumps(resp_body, indent=2, ensure_ascii=False)}"
+                    )
+            elif response and "body" in response:
                 resp_body = json.loads(response["body"])
                 logger.info(f"📤 [명령 처리 완료] 클라이언트로 반환하는 데이터:\n{json.dumps(resp_body, indent=2, ensure_ascii=False)}")
     except Exception as e:

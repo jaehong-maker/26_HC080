@@ -4,13 +4,16 @@
 // [1] 유틸리티 (수학 계산 및 정렬 알고리즘)
 // ===================================================================================
 
-static int calculateDecibels(int32_t* samples, int numSamples) {
+static int calculateDecibels(const int16_t* samples, int numSamples) {
   if (numSamples <= 0) return 0;
-  
+  // Relative PCM level, not calibrated dB SPL. Remove DC before computing RMS.
+  float mean = 0.0f;
+  for (int i = 0; i < numSamples; i++) mean += samples[i];
+  mean /= numSamples;
   float sumSquares = 0.0f;
   for (int i = 0; i < numSamples; i++) {
-    int16_t wave = (samples[i] >> 14);
-    sumSquares += (float)wave * wave;
+    float wave = samples[i] - mean;
+    sumSquares += wave * wave;
   }
   
   float rms = sqrt(sumSquares / numSamples);
@@ -463,13 +466,62 @@ void playSound(int trackNum) {
   myDFPlayer.playMp3Folder(safeTrack);
 }
 
+namespace {
+portMUX_TYPE microphoneMux = portMUX_INITIALIZER_UNLOCKED;
+bool microphoneReady = false;
+MicrophoneLevel microphoneLevel = {};
+int16_t *recordingDestination = nullptr;
+size_t recordingCapacity = 0;
+size_t recordingCount = 0;
+
+static int16_t microphoneWordToPcm(int32_t word) {
+  // INMP441: signed 24-bit data in the upper bits of a 32-bit I2S slot.
+  return static_cast<int16_t>(word >> 16);
+}
+
+void captureMicrophoneFrame() {
+  if (!microphoneReady) return;
+  int32_t raw[128];
+  size_t bytesRead = 0;
+  // Sole DMA reader. Never wait here: the same task enforces nozzle safety.
+  if (i2s_read(I2S_PORT, raw, sizeof(raw), &bytesRead, 0) != ESP_OK || bytesRead == 0) {
+    portENTER_CRITICAL(&microphoneMux);
+    if (millis() - microphoneLevel.capturedAtMillis > 250UL) currentDbLevel = 0;
+    portEXIT_CRITICAL(&microphoneMux);
+    return;
+  }
+  size_t count = bytesRead / sizeof(raw[0]);
+  int16_t pcm[128];
+  int peak = 0;
+  for (size_t i = 0; i < count; ++i) {
+    pcm[i] = microphoneWordToPcm(raw[i]);
+    int magnitude = abs(static_cast<int>(pcm[i]));
+    if (magnitude > peak) peak = magnitude;
+  }
+  int level = calculateDecibels(pcm, count);
+  portENTER_CRITICAL(&microphoneMux);
+  microphoneLevel.level = level;
+  microphoneLevel.peak = peak;
+  microphoneLevel.capturedAtMillis = millis();
+  ++microphoneLevel.sequence;
+  currentDbLevel = level;
+  if (recordingDestination && recordingCount < recordingCapacity) {
+    size_t remaining = recordingCapacity - recordingCount;
+    size_t copyCount = count < remaining ? count : remaining;
+    memcpy(recordingDestination + recordingCount, pcm, copyCount * sizeof(int16_t));
+    recordingCount += copyCount;
+  }
+  portEXIT_CRITICAL(&microphoneMux);
+}
+} // namespace
+
 void initMicrophone() {
   const i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
     .dma_buf_len = 64,
@@ -480,68 +532,93 @@ void initMicrophone() {
   const i2s_pin_config_t pin_config = {
     .bck_io_num = I2S_SCK, .ws_io_num = I2S_WS, .data_out_num = I2S_PIN_NO_CHANGE, .data_in_num = I2S_SD
   };
-  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_PORT, &pin_config);
+  esp_err_t error = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  if (error == ESP_OK) {
+    error = i2s_set_pin(I2S_PORT, &pin_config);
+    if (error != ESP_OK) i2s_driver_uninstall(I2S_PORT);
+  }
+  microphoneReady = error == ESP_OK;
+  if (!microphoneReady) Serial.printf("[Microphone] Initialization failed: %d\r\n", error);
+}
+
+bool getMicrophoneLevel(MicrophoneLevel &snapshot) {
+  portENTER_CRITICAL(&microphoneMux);
+  snapshot = microphoneLevel;
+  bool valid = microphoneReady && snapshot.sequence != 0 && millis() - snapshot.capturedAtMillis <= 250UL;
+  portEXIT_CRITICAL(&microphoneMux);
+  return valid;
+}
+
+bool recordMicrophonePcm(int16_t *destination, size_t sampleCount, unsigned long timeoutMs) {
+  if (!destination || sampleCount == 0 || !microphoneReady || !SensorTaskHandle) return false;
+  portENTER_CRITICAL(&microphoneMux);
+  if (recordingDestination) { portEXIT_CRITICAL(&microphoneMux); return false; }
+  recordingDestination = destination;
+  recordingCapacity = sampleCount;
+  recordingCount = 0;
+  portEXIT_CRITICAL(&microphoneMux);
+  unsigned long started = millis();
+  bool complete = false;
+  while (millis() - started < timeoutMs && currentMode == MODE_VOICE) {
+    portENTER_CRITICAL(&microphoneMux);
+    complete = recordingCount == sampleCount;
+    portEXIT_CRITICAL(&microphoneMux);
+    if (complete) break;
+    esp_task_wdt_reset();
+    monitorWeight();
+    runSprayLogic();
+    checkNextionInput();
+    processPendingServerResponse();
+    delay(5);
+  }
+  // Detach under the same lock used by the capture task before the caller can
+  // upload/free this buffer. No capture callback may retain its old address.
+  portENTER_CRITICAL(&microphoneMux);
+  complete = recordingCount == sampleCount && currentMode == MODE_VOICE;
+  recordingDestination = nullptr;
+  recordingCapacity = 0;
+  recordingCount = 0;
+  portEXIT_CRITICAL(&microphoneMux);
+  if (!complete) Serial.println("[Microphone] Recording cancelled or timed out; partial WAV discarded.");
+  return complete;
 }
 
 void runSoundVisualizer() {
-  if (currentMode != MODE_AMBIENT) return;
-  int32_t sample = 0; size_t bytes_read = 0;
-  i2s_read(I2S_PORT, &sample, sizeof(sample), &bytes_read, 0);
-  if (bytes_read == 0) return;
-  
-  unsigned long currentTime = millis();
+  if (currentMode != MODE_VISUAL) return;
+  MicrophoneLevel snapshot;
+  if (!getMicrophoneLevel(snapshot)) return;
   static unsigned long lastVisUpdate = 0;
-  if (currentTime - lastVisUpdate > 100) { 
-    lastVisUpdate = currentTime;
-    int vol = abs(sample >> 14); 
-    if (vol < 100) vol = 0;
-    int bars = constrain(map(vol, 0, 5000, 0, 30), 0, 30); 
-    Serial.print("\r\033[K"); Serial.print(C_CYAN "🎤 Sound: " C_RESET C_GREEN);
-    for(int i = 0; i < bars; i++) Serial.print("█");
-    Serial.printf(C_RESET " [%d]", vol);
-  }
+  if (millis() - lastVisUpdate <= 100) return;
+  lastVisUpdate = millis();
+  int bars = constrain(map(snapshot.peak, 0, 5000, 0, 30), 0, 30);
+  Serial.print("\r\033[K"); Serial.print(C_CYAN "Microphone: " C_RESET C_GREEN);
+  for (int i = 0; i < bars; ++i) Serial.print("#");
+  Serial.printf(C_RESET " [%d]", snapshot.peak);
 }
 
 void runSoundReaction() {
-  if (currentMode != MODE_AMBIENT) return;
-  int32_t samples[64]; size_t bytes_read = 0;
-  i2s_read(I2S_PORT, &samples, sizeof(samples), &bytes_read, 0);
-  if (bytes_read == 0) return;
-
-  int db = calculateDecibels(samples, bytes_read / sizeof(int32_t));
-  unsigned long currentTime = millis();
-  
-  if (db >= soundThreshold && (currentTime - lastReactionTime > 5000)) { 
-    lastReactionTime = currentTime;
+  if (currentMode != MODE_REACTIVE) return;
+  MicrophoneLevel snapshot;
+  if (!getMicrophoneLevel(snapshot)) return;
+  if (digitalRead(PIN_BUSY) == LOW) return; // Own BGM cannot request a spray.
+  if (snapshot.level >= soundThreshold && millis() - lastReactionTime > 5000) {
+    lastReactionTime = millis();
     triggerSpray(random(1, 5), 3, 0, "LOUD NOISE TRIGGER", false);
   }
 }
 
 void checkBackgroundNoise() {
-  if (currentMode != MODE_AMBIENT) return;
-  int32_t samples[32]; size_t bytes_read = 0;
-  i2s_read(I2S_PORT, &samples, sizeof(samples), &bytes_read, 0);
-  if (bytes_read == 0) return;
-  
-  int current_db = calculateDecibels(samples, bytes_read / sizeof(int32_t));
-  currentDbLevel = current_db; 
-  
-  static float smoothed_db = 0;
-  smoothed_db = (0.3 * current_db) + (0.7 * smoothed_db);
-  
+  MicrophoneLevel snapshot;
+  if (getMicrophoneLevel(snapshot)) currentDbLevel = snapshot.level;
 }
 
 void sensorTaskLoop(void *parameter) {
   for (;;) {
     enforceLoadcellSafety();
-    if (currentMode != MODE_REACTIVE && currentMode != MODE_DASHBOARD && currentMode != MODE_VISUAL) {
-        checkBackgroundNoise();
-    }
-    vTaskDelay(2 / portTICK_PERIOD_MS); 
+    captureMicrophoneFrame();
+    vTaskDelay(pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1);
   }
 }
-
 // --- [1시간 슬라이딩 윈도우 헬퍼 함수] ---
 void addDbToSlidingWindow(float db) {
   dbHistory[dbHistoryIndex] = db;
@@ -588,29 +665,40 @@ void runAmbientMode() {
 
     Serial.printf(C_CYAN "\r\n[Silence Gap] 🤫 BGM 무음 구간: 3초간 앰비언트 소음 측정 중...\r\n" C_RESET);
 
-    const int sampleCount = 100;
-    int dbSamples[sampleCount];
+    const int maxSamples = 100;
+    int dbSamples[maxSamples];
+    int sampleCount = 0;
     long sumDB = 0;
+    unsigned long measurementStarted = millis();
+    MicrophoneLevel previousSnapshot = {};
+    getMicrophoneLevel(previousSnapshot);
+    uint32_t lastSequence = previousSnapshot.sequence;
     
-    for (int i = 0; i < sampleCount; i++) {
+    while (sampleCount < maxSamples && millis() - measurementStarted < 3000UL) {
       esp_task_wdt_reset();
       checkNextionInput();
       checkSerialInput();
+      processPendingServerResponse();
       monitorWeight();
       runSprayLogic();
       // A stop, mode change or safety trip cancels this measurement cycle.
       if (currentMode != MODE_AMBIENT) return;
 
-      int32_t samples[64]; 
-      size_t bytes_read = 0;
-      i2s_read(I2S_PORT, &samples, sizeof(samples), &bytes_read, I2S_READ_TIMEOUT);
-      
-      int current_db = (bytes_read > 0) ? calculateDecibels(samples, bytes_read / sizeof(int32_t)) : 0;
-      dbSamples[i] = current_db; 
-      sumDB += current_db;
+      MicrophoneLevel snapshot;
+      if (digitalRead(PIN_BUSY) == HIGH && getMicrophoneLevel(snapshot) && snapshot.sequence != lastSequence) {
+        lastSequence = snapshot.sequence;
+        dbSamples[sampleCount++] = snapshot.level;
+        sumDB += snapshot.level;
+      }
 
       updateClockDisplay();
-      delay(30); // 30ms * 100 = 3초 수음
+      delay(30);
+    }
+
+    if (sampleCount == 0) {
+      setSystemMode(MODE_READY, "Microphone unavailable or speaker not stopped");
+      showPage(PAGE_DEVICE_STATUS);
+      return;
     }
 
     float avgDB = (float)sumDB / sampleCount;
@@ -653,13 +741,19 @@ void runAmbientMode() {
     lastAmbientTime = millis();
   }
 
-  // 실시간 백그라운드 스파이크 감시
+  // Do not classify our own BGM as an environmental spike. Ambient decisions
+  // use the speaker-stopped measurement above; no acoustic echo cancellation
+  // is available to separate background sound while the speaker is playing.
+  currentTime = millis();
+  if (digitalRead(PIN_BUSY) == LOW || currentTime - lastAmbientTime < 1000UL) return;
   static unsigned long lastSpikeCheck = 0;
   if (currentTime - lastSpikeCheck > 1000) {
     lastSpikeCheck = currentTime;
     float currentAvg = get1HourDbAverage();
-    if (currentAvg > 0 && (abs(currentDbLevel - currentAvg) >= 15.0f || currentDbLevel >= 75.0f)) {
-      Serial.printf(C_RED "⚡ [Instant Spike] BGM 재생 중 돌발 소음 감지(%d dB)! 즉시 재수음 진입.\r\n" C_RESET, currentDbLevel);
+    MicrophoneLevel snapshot;
+    if (getMicrophoneLevel(snapshot) && currentAvg > 0 &&
+        (abs(snapshot.level - currentAvg) >= 15.0f || snapshot.level >= 75.0f)) {
+      Serial.printf(C_RED "[Ambient] Speaker stopped; sound spike detected (%d).\r\n" C_RESET, snapshot.level);
       forceAmbientSkip = true;
     }
   }

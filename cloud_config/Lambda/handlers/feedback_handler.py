@@ -35,8 +35,17 @@ def handle_feedback(action, mode, body, device_id):
         feedback_context = str(body.get("context", "") or "").strip()
         feedback_data = str(body.get("data", "") or "").strip()
 
+        # 명시적인 새 피드백은 이전 대체 향의 자동 +1 예약을 항상 취소함
+        db_utils.cancel_implicit_like(device_id)
+
         if not ambient_context and feedback_context.startswith("Ambient_"):
             ambient_context = feedback_context[len("Ambient_"):]
+
+        if not ambient_context and feedback_data:
+            feedback_parts = feedback_data.split("_", 1)
+            data_context = feedback_parts[1] if len(feedback_parts) > 1 else ""
+            if data_context.startswith("Ambient_"):
+                ambient_context = data_context[len("Ambient_"):]
 
         if not ambient_context and mode == "ambient":
             if feedback_context:
@@ -51,27 +60,61 @@ def handle_feedback(action, mode, body, device_id):
         if ambient_context:
             try:
                 ambient_scent_ids = _get_ambient_scent_ids()
-                scent = _parse_int(body.get("scent"), 0)
-                if scent not in ambient_scent_ids and feedback_data:
+                spray_no = _parse_int(body.get("current_scent_id"), 0)
+                if spray_no <= 0:
+                    spray_no = _parse_int(body.get("scent"), 0)
+                if spray_no <= 0 and feedback_data:
                     feedback_parts = feedback_data.split("_", 1)
                     if feedback_parts and feedback_parts[0].isdigit():
-                        scent = int(feedback_parts[0])
-                if scent not in ambient_scent_ids:
-                    scent = int(config.AMBIENT_DEFAULT_SCENT)
+                        spray_no = int(feedback_parts[0])
 
-                weight_val = 1 if is_like else -1
+                scent_kind = db_utils.get_kind_from_spray(device_id, spray_no) or spray_no
+                if scent_kind not in ambient_scent_ids:
+                    scent_kind = int(config.AMBIENT_DEFAULT_SCENT)
+
+                magnitude = abs(numeric_value) or 1
+                weight_val = magnitude if is_like else -magnitude
                 db_utils.seed_ambient_defaults()
-                db_utils.save_ambient_feedback(ambient_context, scent, weight_val)
+                db_utils.save_ambient_feedback(ambient_context, scent_kind, weight_val)
+
+                response_spray = spray_no
+                implicit_like_scheduled = False
+                if not is_like:
+                    replacement_kind = db_utils.get_ambient_alternative(
+                        ambient_context,
+                        device_id,
+                        scent_kind,
+                    )
+                    response_spray = db_utils.get_spray_from_kind(device_id, replacement_kind) or 1
+                    db_utils.manage_mailbox(
+                        device_id,
+                        response_spray,
+                        ambient_context,
+                        3,
+                        save_active_mode="ambient",
+                        save_active_scent=response_spray,
+                    )
+                    implicit_like_scheduled = db_utils.schedule_implicit_like(
+                        device_id,
+                        ambient_context,
+                        replacement_kind,
+                        body.get("email"),
+                        delay_seconds=600,
+                        feedback_store="ambient",
+                    )
+
                 return {
                     "statusCode": 200,
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({
                         "message": "Ambient feedback saved",
-                        "spray": 0,
-                        "cmd": 0,
+                        "spray": response_spray,
+                        "cmd": response_spray if not is_like else 0,
                         "context": f"Ambient_{ambient_context}",
                         "ambient_context": ambient_context,
-                        "value": weight_val
+                        "value": weight_val,
+                        "implicit_like_scheduled": implicit_like_scheduled,
+                        "implicit_like_after_seconds": 600 if implicit_like_scheduled else 0
                     }, ensure_ascii=False)
                 }
             except Exception as e:
@@ -141,24 +184,34 @@ def handle_feedback(action, mode, body, device_id):
                     ExpressionAttributeValues={':t': "2000-01-01T00:00:00"}
                 )
                 
-                mapping = db_utils.get_spray_mapping(device_id)
-                valid_kinds = set(db_utils._kind_ids())
-                active_sprays = [spray for spray, kind in mapping.items() if int(kind) in valid_kinds]
-                
-                candidates = [s for s in active_sprays if int(s) != spray_no]
-                if not candidates:
-                    candidates = [s for s in [1, 2, 3, 4] if s != spray_no]
-                    
-                new_spray = random.choice(candidates)
+                new_kind = db_utils.get_preferred_alternative(
+                    device_id,
+                    ctx,
+                    real_kind_code,
+                    u_email,
+                )
+                if new_kind is None:
+                    candidates = [kind for kind in db_utils._kind_ids() if kind != real_kind_code]
+                    new_kind = random.choice(candidates)
+                new_spray = db_utils.get_spray_from_kind(device_id, new_kind) or 1
                 db_utils.manage_mailbox(device_id, new_spray)
+                implicit_like_scheduled = db_utils.schedule_implicit_like(
+                    device_id,
+                    ctx,
+                    new_kind,
+                    u_email,
+                    delay_seconds=600,
+                )
                 
                 return {
                     "statusCode": 200,
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({
-                        "message": f"싫어요 반영! {new_spray}번 칸 향기로 우회 학습",
+                        "message": f"싫어요 반영! {new_spray}번 칸 향기로 대체 분사",
                         "spray": new_spray,
-                        "context": ctx
+                        "context": ctx,
+                        "implicit_like_scheduled": implicit_like_scheduled,
+                        "implicit_like_after_seconds": 600
                     }, ensure_ascii=False)
                 }
 
@@ -242,6 +295,12 @@ def handle_feedback(action, mode, body, device_id):
                     }, ensure_ascii=False)
                 }
 
+            exact_context_map = {
+                "AI_DIARY": "AI 감정 일기에서",
+                "AI_EMOTION": "AI 감정 모드에서",
+                "AI_VOICE": "AI 음성 모드에서",
+                "NOISE_ANALYSIS": "소음 분석 모드에서",
+            }
             context_map = {
                 "Rain": "비오는 날",
                 "Sunny": "맑은 날",
@@ -257,7 +316,7 @@ def handle_feedback(action, mode, body, device_id):
                 "Emotion_Angry": "화날 때"
             }
             
-            translated_ctx = best_context
+            translated_ctx = exact_context_map.get(best_context, best_context)
             for key, val in context_map.items():
                 if key in translated_ctx:
                     translated_ctx = translated_ctx.replace(f"Weather_{key}", val)

@@ -27,9 +27,13 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
     if mode == "emotion":
         user_emo_tag = body.get("user_emotion", "평범")
         diary_full_text = body.get("diary_text", user_emo_tag) 
-        context_key = f"Emotion_{user_emo_tag}"
+        context_key = "AI_DIARY" if body.get("diary_text") else "AI_EMOTION"
         u_email = body.get("email")
-        user_history_str = db_utils.get_user_history_text(device_id, u_email)
+        user_history_str = db_utils.get_user_history_text(
+            device_id,
+            u_email,
+            contexts=[context_key],
+        )
         active_kinds = db_utils._active_kinds(device_id)
         kind_descriptions = {
             1: "1번(시트러스: 상쾌/에너지/우울감 극복)",
@@ -51,7 +55,6 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
         )
         if emotion_tag and emotion_tag != "에러":
             user_emo_tag = emotion_tag
-            context_key = f"Emotion_{emotion_tag}"
         if led_dict and led_dict.get("led_r", -1) >= 0:
             try:
                 db_utils.state_table.update_item(
@@ -86,7 +89,7 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
         result_text = "이전 AI 추천 기록이 없어 기본 향기로 분사합니다."
         logic_name = "AI_Replay"
         duration = 3
-        context_key = "AI_Replay"
+        context_key = "AI_EMOTION"
         try:
             from boto3.dynamodb.conditions import Key
             log_resp = db_utils.log_table.query(
@@ -96,9 +99,9 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
             )
             for item in log_resp.get("Items", []):
                 if item.get("mode") == "AI_Gemini_Emotion":
-                    spray_code = int(item.get("spray_code", 1))
+                    replayed_pump = int(item.get("spray_code", 1))
+                    spray_code = db_utils.get_kind_from_spray(device_id, replayed_pump) or replayed_pump
                     result_text = "가장 최근의 AI 추천 설정(향기, 조명, 음악)으로 즉시 분사를 시작합니다."
-                    context_key = "AI_Replay_Matched"
                     break
         except Exception as e:
             logger.error(f"[AI_REPLAY_ERROR] {e}")
@@ -106,16 +109,16 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
         try: 
             if region == "테스트맑음":
                 spray_code, result_text, logic_name, duration = 1, "테스트 맑음 실행", "Test_Weather", 3
-                context_key = "Weather_Sunny"
+                context_key = build_weather_context_key("맑음")
             elif region == "테스트흐림":
                 spray_code, result_text, logic_name, duration = 2, "테스트 흐림 실행", "Test_Weather", 3
-                context_key = "Weather_Cloudy"
+                context_key = build_weather_context_key("흐림")
             elif region == "테스트비":
                 spray_code, result_text, logic_name, duration = 3, "테스트 비 실행", "Test_Weather", 3
-                context_key = "Weather_Rain"
+                context_key = build_weather_context_key("비")
             elif region == "테스트눈":
                 spray_code, result_text, logic_name, duration = 4, "테스트 눈 실행", "Test_Weather", 3
-                context_key = "Weather_Snow"
+                context_key = build_weather_context_key("눈")
             else:
                 if not body.get("region"):
                     voice_region = db_utils.get_latest_voice_region(device_id)
@@ -154,16 +157,13 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
             weather_text = "날씨 통신 실패"
             temp, humidity = "0", "0"
             context_key = "Weather_Unknown"   
-    if spray_code > 0 and logic_name != "AI_Replay":
+    if spray_code > 0:
         u_email = body.get("email")
-        if logic_name == "AI_Gemini_Emotion":
-            final_scent = spray_code
-        else:
-            final_scent, ai_msg = db_utils.get_personalized_scent(device_id, context_key, spray_code, u_email)
-            if final_scent != spray_code:
-                logger.info(f"[AI Change] {spray_code} -> {final_scent} ({ai_msg})")
-                result_text += f" -> [취향 맞춤: {final_scent}번]" 
-                spray_code = final_scent
+        final_scent, ai_msg = db_utils.get_personalized_scent(device_id, context_key, spray_code, u_email)
+        if final_scent != spray_code:
+            logger.info(f"[AI Change] {spray_code} -> {final_scent} ({ai_msg})")
+            result_text += f" -> [취향 맞춤: {final_scent}번]"
+            spray_code = final_scent
         mapped_pump, fb_msg = db_utils.get_smart_spray_mapping(device_id, spray_code)
         result_text += fb_msg
         spray_code = mapped_pump

@@ -237,6 +237,30 @@ def get_ambient_recommendation(context_key, device_id):
         }
 
 
+def get_ambient_alternative(context_key, device_id, excluded_kind):
+    try:
+        ensure_ambient_context(context_key)
+        resp = ambient_table.get_item(Key={"context_key": str(context_key)})
+        item = resp.get("Item") or {}
+        scores = _read_ambient_scores(item)
+        installed_kinds = set(_active_kinds(device_id))
+        candidates = [
+            kind for kind in installed_kinds
+            if kind in _ambient_scent_ids() and int(kind) != int(excluded_kind)
+        ]
+        if not candidates:
+            candidates = [
+                kind for kind in _ambient_scent_ids()
+                if int(kind) != int(excluded_kind)
+            ]
+        weights = [max(1, scores.get(kind, 50)) for kind in candidates]
+        return random.choices(candidates, weights=weights, k=1)[0]
+    except Exception as e:
+        logger.error(f"Ambient Alternative Error: {e}")
+        fallback = [kind for kind in _ambient_scent_ids() if int(kind) != int(excluded_kind)]
+        return fallback[0] if fallback else int(getattr(config, "AMBIENT_DEFAULT_SCENT", 1))
+
+
 # 앰비언트 모드 피드백을 가중치에 반영함
 def save_ambient_feedback(context_key, scent_code, weight_change):
     """
@@ -527,6 +551,126 @@ def save_feedback(device_id, context, kind_code, weight_change, email=None):
         return False
 
 
+_IMPLICIT_LIKE_FIELDS = (
+    "pending_implicit_context",
+    "pending_implicit_kind",
+    "pending_implicit_email",
+    "pending_implicit_due",
+    "pending_implicit_token",
+    "pending_implicit_store",
+)
+
+
+def cancel_implicit_like(device_id):
+    try:
+        state_table.update_item(
+            Key={"deviceId": device_id},
+            UpdateExpression="REMOVE " + ", ".join(_IMPLICIT_LIKE_FIELDS),
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Implicit Like Cancel Error: {e}")
+        return False
+
+
+def schedule_implicit_like(
+    device_id,
+    context,
+    kind_code,
+    email=None,
+    delay_seconds=600,
+    feedback_store="preference",
+):
+    try:
+        kind_no = int(kind_code)
+        if kind_no not in _kind_ids() or not str(context or "").strip():
+            return False
+
+        normalized_store = str(feedback_store or "preference").strip().lower()
+        if normalized_store not in ("preference", "ambient"):
+            return False
+
+        target_email = email or _get_email_by_device_id(device_id) or ""
+        due_epoch = int(_get_kst_now().timestamp()) + max(0, int(delay_seconds))
+        token = uuid.uuid4().hex
+        state_table.update_item(
+            Key={"deviceId": device_id},
+            UpdateExpression=(
+                "SET pending_implicit_context = :ctx, pending_implicit_kind = :kind, "
+                "pending_implicit_email = :email, pending_implicit_due = :due, "
+                "pending_implicit_token = :token, pending_implicit_store = :store"
+            ),
+            ExpressionAttributeValues={
+                ":ctx": str(context),
+                ":kind": kind_no,
+                ":email": str(target_email),
+                ":due": due_epoch,
+                ":token": token,
+                ":store": normalized_store,
+            },
+        )
+        logger.info(
+            f"[IMPLICIT_LIKE_SCHEDULED] ID:{device_id} Context:{context} "
+            f"Kind:{kind_no} Due:{due_epoch}"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Implicit Like Schedule Error: {e}")
+        return False
+
+
+def apply_due_implicit_like(device_id, now_epoch=None):
+    try:
+        response = state_table.get_item(Key={"deviceId": device_id}, ConsistentRead=True)
+        item = response.get("Item") or {}
+        due_epoch = _parse_int(item.get("pending_implicit_due"), 0)
+        current_epoch = int(now_epoch) if now_epoch is not None else int(_get_kst_now().timestamp())
+        if due_epoch <= 0 or current_epoch < due_epoch:
+            return None
+
+        context = str(item.get("pending_implicit_context") or "").strip()
+        kind_no = _parse_int(item.get("pending_implicit_kind"), 0)
+        email = str(item.get("pending_implicit_email") or "").strip() or None
+        token = str(item.get("pending_implicit_token") or "").strip()
+        feedback_store = str(item.get("pending_implicit_store") or "preference").strip().lower()
+        if not context or kind_no not in _kind_ids() or not token:
+            cancel_implicit_like(device_id)
+            return None
+
+        try:
+            state_table.update_item(
+                Key={"deviceId": device_id},
+                UpdateExpression="REMOVE " + ", ".join(_IMPLICIT_LIKE_FIELDS),
+                ConditionExpression=(
+                    "pending_implicit_token = :token AND pending_implicit_due = :due"
+                ),
+                ExpressionAttributeValues={":token": token, ":due": due_epoch},
+            )
+        except Exception as e:
+            error_code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+            if error_code == "ConditionalCheckFailedException":
+                return None
+            raise
+
+        if feedback_store == "ambient":
+            saved = save_ambient_feedback(context, kind_no, 1)
+        else:
+            saved = save_feedback(device_id, context, kind_no, 1, email)
+
+        if not saved:
+            logger.error(
+                f"[IMPLICIT_LIKE_SAVE_FAILED] ID:{device_id} Context:{context} Kind:{kind_no}"
+            )
+            return None
+
+        result = {"context": context, "kind": kind_no, "value": 1, "store": feedback_store}
+        logger.info(f"[IMPLICIT_LIKE_APPLIED] ID:{device_id} {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Implicit Like Apply Error: {e}")
+        return None
+
+
 # get_personalized_scent 처리를 담당함
 def get_personalized_scent(device_id, context, default_kind, email=None):
     try:
@@ -546,25 +690,60 @@ def get_personalized_scent(device_id, context, default_kind, email=None):
         if not candidate_scores:
             return default_kind, "기본 추천"
 
-        max_score = max(candidate_scores.values())
-        if max_score > 0:
-            best_kinds = [kind for kind, score in candidate_scores.items() if score == max_score]
-            if int(default_kind) in best_kinds:
-                return default_kind, "가중치 확인(유지)"
-            return random.choice(best_kinds), "사용자 선호 가중치 적용"
+        if not any(score != 0 for score in candidate_scores.values()):
+            return default_kind, "기본 추천"
 
-        return default_kind, "기본 추천"
+        max_score = max(candidate_scores.values())
+        best_kinds = [kind for kind, score in candidate_scores.items() if score == max_score]
+        if int(default_kind) in best_kinds:
+            return default_kind, "가중치 확인(유지)"
+        return random.choice(best_kinds), "사용자 선호 가중치 적용"
+
     except Exception as e:
         logger.error(f"Personalization Error: {e}")
         return default_kind, "에러(기본값)"
 
 
+def get_preferred_alternative(device_id, context, excluded_kind, email=None):
+    """현재 향을 제외하고 해당 context에서 점수가 가장 높은 장착 향을 고름."""
+    try:
+        excluded_no = int(excluded_kind)
+        candidates = [kind for kind in _active_kinds(device_id) if int(kind) != excluded_no]
+        if not candidates:
+            candidates = [kind for kind in _kind_ids() if int(kind) != excluded_no]
+        if not candidates:
+            return None
+
+        target_email = email or _get_email_by_device_id(device_id)
+        if not target_email:
+            return random.choice(candidates)
+
+        response = pref_table.get_item(
+            Key={"email": str(target_email), "context": str(context)}
+        )
+        item = response.get("Item") or {}
+        scores = {
+            kind: int(item.get(f"scent_{kind}_score", 0))
+            for kind in candidates
+        }
+        max_score = max(scores.values())
+        best_kinds = [kind for kind, score in scores.items() if score == max_score]
+        return random.choice(best_kinds)
+    except Exception as e:
+        logger.error(f"Preferred Alternative Error: {e}")
+        return None
+
+
 # get_user_history_text 처리를 담당함
-def get_user_history_text(device_id, email=None):
+def get_user_history_text(device_id, email=None, contexts=None):
     try:
         target_email = email or _get_email_by_device_id(device_id)
         if not target_email:
             return "사용자 취향 데이터 없음"
+
+        allowed_contexts = None
+        if contexts:
+            allowed_contexts = {str(context) for context in contexts}
             
         resp = pref_table.query(
             KeyConditionExpression=Key('email').eq(str(target_email))
@@ -576,13 +755,15 @@ def get_user_history_text(device_id, email=None):
         history_lines = []
         for item in items:
             context = item.get("context", "")
+            if allowed_contexts is not None and context not in allowed_contexts:
+                continue
             scores = []
             for kind in _kind_ids():
                 score = int(item.get(f"scent_{kind}_score", 0))
                 if score > 0:
-                    scores.append(f"{kind}번 향기 선호")
+                    scores.append(f"{kind}번 향기 +{score}")
                 elif score < 0:
-                    scores.append(f"{kind}번 향기 비선호")
+                    scores.append(f"{kind}번 향기 {score}")
             if scores:
                 history_lines.append(f"[{context} 상황]: " + ", ".join(scores))
                 
@@ -604,6 +785,7 @@ def manage_mailbox(
     save_active_mode=None,
     save_active_scent=None,
     save_led=None,
+    save_music=None,
 ):
     try:
         if save_cmd is not None:
@@ -632,6 +814,10 @@ def manage_mailbox(
                 exp_vals[":lg"] = int(save_led["led_g"])
                 exp_vals[":lb"] = int(save_led["led_b"])
                 exp_vals[":lbr"] = int(save_led["led_bright"])
+
+            if save_music is not None:
+                update_exp += ", current_music = :music"
+                exp_vals[":music"] = int(save_music)
 
             state_table.update_item(
                 Key={"deviceId": device_id},

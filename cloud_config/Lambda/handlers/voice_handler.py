@@ -5,6 +5,7 @@ import json
 import base64
 import uuid
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import config
@@ -12,6 +13,25 @@ import db_utils
 import api_utils
 
 logger = logging.getLogger()
+
+_DIRECT_SCENT_TERMS = (
+    "시트러스",
+    "샌달우드",
+    "센달우드",
+    "패츌리",
+    "패츄리",
+    "페퍼민트",
+    "라벤더",
+    "바닐라",
+    "무향",
+)
+
+
+def _has_explicit_scent_request(transcript):
+    normalized = str(transcript or "").strip().lower()
+    if any(term in normalized for term in _DIRECT_SCENT_TERMS):
+        return True
+    return bool(re.search(r"(?:향기\s*)?[1-7]\s*번(?:\s*향기)?", normalized))
 
 # 음성 데이터를 처리하고 기기 명령을 반환함
 def handle_voice(event, device_id):
@@ -89,7 +109,10 @@ def handle_voice(event, device_id):
             logger.error(f"RateLimit DB Update error: {e}")
         # -------------------------------------------
 
-        user_history_str = db_utils.get_user_history_text(device_id)
+        user_history_str = db_utils.get_user_history_text(
+            device_id,
+            contexts=["AI_VOICE"],
+        )
         active_kinds = db_utils._active_kinds(device_id)
         kind_descriptions = {
             1: "1번(시트러스: 상쾌/에너지/우울감 극복)",
@@ -127,6 +150,18 @@ def handle_voice(event, device_id):
         if kind_code == 0:
             spray_code = 0
         else:
+            if not _has_explicit_scent_request(normalized_transcript):
+                personalized_kind, preference_message = db_utils.get_personalized_scent(
+                    device_id,
+                    "AI_VOICE",
+                    kind_code,
+                )
+                if personalized_kind != kind_code:
+                    logger.info(
+                        f"[VOICE_PREFERENCE] {kind_code} -> {personalized_kind} "
+                        f"({preference_message})"
+                    )
+                    kind_code = personalized_kind
             spray_code = db_utils.get_spray_from_kind(device_id, kind_code)
             if not spray_code:
                 spray_code = 1
@@ -174,7 +209,9 @@ def handle_voice(event, device_id):
                 "spray": int(spray_code),
                 "message": f"음성 인식 성공: {result_text}",
                 "transcript": normalized_transcript,
-                "duration": duration
+                "duration": duration,
+                "context": "AI_VOICE",
+                "active_mode": "voice" if spray_code > 0 else "ready"
             }, ensure_ascii=False)
         }
 

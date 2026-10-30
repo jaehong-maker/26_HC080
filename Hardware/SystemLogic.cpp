@@ -9,6 +9,9 @@ static const int NEXTION_DIM_NORMAL = 100;
 static bool isDisplayDimmed = false;
 static bool shouldShowStartupReadyPage = false;
 static int activeSprayCommand = -1;
+static unsigned long automaticSessionStartedMillis = 0;
+static unsigned long playlistStartedMillis = 0;
+static unsigned long lastPlaylistChangeMillis = 0;
 
 static bool consumeStartupPageRequest() {
   const String currentBuild = String(__DATE__) + " " + String(__TIME__);
@@ -110,7 +113,6 @@ void initSystem() {
   esp_task_wdt_reconfigure(&wdt_config); 
   esp_task_wdt_add(NULL); 
 
-  networkQueue = xQueueCreate(10, sizeof(String*));
   if (!initializeServerResponseQueue()) {
     Serial.println("[Network] Response queue unavailable; online commands disabled.");
   }
@@ -527,14 +529,12 @@ void runSprayLogic() {
     prevMotorMillis = millis();
   }
 
-  // ★ 1. 동료분의 쿨다운 아이디어 추가
-  static unsigned long lastTrackChangeTime = 0;
-
   // 🎵 일반/수동 모드 플레이리스트 연속 재생 검사
-  if (currentMode != MODE_AMBIENT && currentMode != MODE_DEMO && millis() - startTimeMillis > 3000) {
+  if (currentMode != MODE_AMBIENT && currentMode != MODE_DEMO &&
+      currentSlotTracksCount > 0 && millis() - playlistStartedMillis > 3000) {
     
     // ★ 2. 트랙 변경 후 최소 0.5초(500ms)가 지나야만 BUSY 핀 검사
-    if (millis() - lastTrackChangeTime > 500) {
+    if (millis() - lastPlaylistChangeMillis > 500) {
       
       // ★ 3. Config:: 삭제 완료 (컴파일 에러 해결)
       if (digitalRead(PIN_BUSY) == HIGH) { 
@@ -544,11 +544,10 @@ void runSprayLogic() {
         }
 
         int nextTrack = currentSlotTracks[currentPlaylistIdx];
-        lastTrackChangeTime = millis(); // 타이머 리셋
-
         myDFPlayer.stop();
         delay(100);
         myDFPlayer.playMp3Folder(nextTrack);
+        lastPlaylistChangeMillis = millis();
         
         Serial.printf(C_GREEN "\r\n🎵 [Playlist] 다음 곡 연속 재생 (%d/%d번째 곡): %d번 트랙 (%s)\r\n" C_RESET, 
                       currentPlaylistIdx + 1, currentSlotTracksCount, nextTrack, getTrackName(nextTrack).c_str());
@@ -583,15 +582,18 @@ void runAutoDemoLoop() {
 void checkSafety() {
   bool automaticMode = currentMode == MODE_AMBIENT || currentMode == MODE_DEMO;
   if (!isRunning && !automaticMode) return;
-  if (millis() - startTimeMillis >= (unsigned long)MAX_RUN_TIME) {
+  unsigned long safetyStart = automaticMode ? automaticSessionStartedMillis : startTimeMillis;
+  if (millis() - safetyStart >= (unsigned long)MAX_RUN_TIME) {
     setSystemMode(MODE_READY, "Safety Timeout");
   }
 }
 
 void setSystemMode(SystemMode mode, String msg) { 
+  bool stoppingActiveSystem = mode == MODE_READY &&
+      (currentMode != MODE_READY || isRunning || isSpraying);
   if (mode != currentMode && (mode == MODE_AMBIENT || mode == MODE_DEMO)) {
     stopSystem();
-    startTimeMillis = millis();
+    automaticSessionStartedMillis = millis();
     if (mode == MODE_DEMO) {
       demoStep = 0;
       prevDemoMillis = millis() - 4000UL;
@@ -603,6 +605,7 @@ void setSystemMode(SystemMode mode, String msg) {
   }
   
   if (mode == MODE_READY) {
+    if (stoppingActiveSystem) invalidatePendingServerStarts();
     stopSystem();
     printMainMenu(); 
   }
@@ -813,12 +816,8 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
       return; 
   }
 
-  isRunning = true; 
-  isSpraying = true; 
-  // Automatic modes retain their session deadline across nozzle changes.
-  if (currentMode != MODE_AMBIENT && currentMode != MODE_DEMO) startTimeMillis = millis();
   sprayDuration = dur * 1000;
-  prevMotorMillis = millis(); 
+  const unsigned long sprayStartedMillis = millis();
   
   bool enabledAny = false;
   for (int i = 0; i < 4; i++) {
@@ -834,6 +833,12 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
     forceAllOff();
     return;
   }
+  // Commit a new run only after a relay was successfully enabled. This applies
+  // to every nozzle combination, regardless of whether audio is restarted.
+  startTimeMillis = sprayStartedMillis;
+  prevMotorMillis = sprayStartedMillis;
+  isRunning = true;
+  isSpraying = true;
   activeSprayCommand = cmd;
   
   // 🎵 오직 서버에서 내려준 음악 데이터만 믿고 재생하는 깔끔한 로직
@@ -877,6 +882,8 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
       
       // 서버가 결정한 최종 트랙 번호를 군말 없이 스피커 모듈로 넘깁니다.
       playSound(currentSlotTracks[0]);
+      playlistStartedMillis = millis();
+      lastPlaylistChangeMillis = playlistStartedMillis;
       Serial.printf(C_GREEN "[Audio] 서버 데이터 기준 재생 시작 (총 %d곡 대기): %d번 트랙 (%s)\r\n" C_RESET, 
                     currentSlotTracksCount, currentSlotTracks[0], getTrackName(currentSlotTracks[0]).c_str());
     }
