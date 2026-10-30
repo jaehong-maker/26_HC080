@@ -172,13 +172,13 @@ void stopSystem() {
   for (int i = 0; i < 4; i++) activeNozzles[i] = false;
   
   recordControlDiagnostic("stop", "outputs-off");
-  myDFPlayer.stop();
+  stopAudioPlayback();
   currentAmbientTrack = 0;
 }
 
 void resetManualState() {
   forceAllOff();
-  myDFPlayer.stop();
+  stopAudioPlayback();
   isRunning = false; isSpraying = false; sprayDuration = 0;
   prevMotorMillis = 0; startTimeMillis = 0;
   for (int i = 0; i < 4; i++) activeNozzles[i] = false;
@@ -439,33 +439,45 @@ void printCalibrationInfo() {
 // [5] 오디오 (마이크 수음, 스피커 및 앰비언트 분석)
 // ===================================================================================
 
-// 📄 [Hardware.cpp] playSound 함수 전체 교체
+namespace {
+int lastRequestedTrack = -1;
+unsigned long lastAudioPlayMillis = 0;
+constexpr unsigned long AUDIO_DUPLICATE_WINDOW_MS = 3500;
+constexpr unsigned long AUDIO_START_GRACE_MS = 500;
+}
+
+void stopAudioPlayback() {
+  // Invalidate first: BUSY may still read LOW briefly after an explicit stop.
+  lastRequestedTrack = -1;
+  lastAudioPlayMillis = 0;
+  myDFPlayer.stop();
+}
+
 void playSound(int trackNum) {
   // 곡 번호가 0 이하일 때만 1번으로 보정하고 상한선 제한은 제거
   int safeTrack = (trackNum > 0) ? trackNum : 1;
   int safeVolume = constrain(currentVolume, 0, 30);
 
-  // --- [오버랩 방지 로직] ---
-  static int lastPlayedTrack = -1;
-  static unsigned long lastPlayTime = 0;
-  if (safeTrack == lastPlayedTrack && millis() - lastPlayTime < 3500) {
+  const unsigned long sincePlay = millis() - lastAudioPlayMillis;
+  const bool playingOrStarting = digitalRead(PIN_BUSY) == LOW || sincePlay < AUDIO_START_GRACE_MS;
+  if (safeTrack == lastRequestedTrack && sincePlay < AUDIO_DUPLICATE_WINDOW_MS && playingOrStarting) {
       Serial.printf(C_YELLOW "[Audio] 중복 재생 방지: 이미 %d번 트랙이 재생/로딩 중입니다.\r\n" C_RESET, safeTrack);
       return; 
   }
-  lastPlayedTrack = safeTrack;
-  lastPlayTime = millis();
-  // --------------------------
 
   Serial.printf(C_GREEN "[Audio] play request: track=%d volume=%d busy=%d\r\n" C_RESET,
                 safeTrack, safeVolume, digitalRead(PIN_BUSY));
 
-  myDFPlayer.stop();
+  stopAudioPlayback();
   delay(120);
   myDFPlayer.volume(safeVolume);
   delay(30);
   
   // ★ MP3 폴더 지정 재생(playMp3Folder)으로 변경하여 26번(0026.MP3)을 정확히 재생
   myDFPlayer.playMp3Folder(safeTrack);
+  // Count the loading grace from the actual play command, not the stop delay.
+  lastRequestedTrack = safeTrack;
+  lastAudioPlayMillis = millis();
 }
 
 namespace {
