@@ -307,12 +307,6 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   if (!isPollRequest) return;
   JsonDocument doc; if (deserializeJson(doc, response)) return;
 
-  String profileRegion = doc["profile_region"] | ""; profileRegion.trim();
-  if (profileRegion.length() > 0 && profileRegion != lastWeatherRegion) {
-    rememberWeatherRegion(profileRegion);
-    Serial.printf("\r\n[Sync] Profile region updated to '%s'.\r\n", profileRegion.c_str());
-  }
-
   if (isWeatherRefreshResponse && currentMode != MODE_WEATHER) {
     Serial.println(C_YELLOW "\r\n[Weather] Ignored stale response after leaving weather mode\r\n" C_RESET);
     return;

@@ -139,10 +139,6 @@ def handle_auth(action, body, device_id):
                 ExpressionAttributeNames=expr_attr_names
             )
 
-            if u_region:
-                profile_device_id = u_device_id or user_info.get('deviceId') or device_id
-                db_utils.sync_profile_region(profile_device_id, u_region)
-
             return {
                 "statusCode": 200, 
                 "headers": {"Content-Type": "application/json"}, 
