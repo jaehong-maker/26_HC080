@@ -269,6 +269,7 @@ void sendServerRequest(String payload);
 void requestWeatherRefresh(const String &region);
 void rememberWeatherRegion(const String &region);
 void handleWebClient();
+void recordControlDiagnostic(const char *event, const String &detail);
 void autoWeatherScheduler();
 void initOTA();
 void handleOTA();
@@ -329,6 +330,7 @@ void runManualMode(String input);
 bool isRunningManualCommand(int cmd);
 void enterWeatherMode(bool runNow);
 void runSprayLogic();
+void stopAmbientSpray();
 void runAutoDemoLoop();
 void checkSafety();
 
