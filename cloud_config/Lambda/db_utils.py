@@ -876,22 +876,34 @@ def remember_last_region(device_id, region):
         logger.error(f"Remember Region Error: {e}")
 
 
-# get_saved_region 처리를 담당함
 def get_saved_region(device_id):
+    did = str(device_id or "").strip()
+    region_coords = getattr(config, "REGION_COORDS", {})
+
+    # 1) 앱이 마지막으로 변경한 지역
+    try:
+        res = state_table.get_item(Key={"deviceId": device_id})
+        item = res.get("Item") or {}
+        app_region = str(item.get("app_region", "") or "").strip()
+        if app_region and app_region in region_coords:
+            return app_region
+    except Exception as e:
+        logger.error(f"App Region Load Error: {e}")
+
+    # 2) 사용자 레코드 — 첫 항목만 보지 않고 전부 검사
     try:
         resp = user_table.scan(
-            FilterExpression=Attr("deviceId").eq(str(device_id)),
-            ProjectionExpression="#r",
-            ExpressionAttributeNames={"#r": "region"},
+            FilterExpression=Attr("deviceId").eq(did),
         )
         items = resp.get("Items") or []
-        if items:
-            region = str(items[0].get("region", "") or "").strip()
-            if region:
+        regions = [str(i.get("region", "") or "").strip() for i in items]
+        for region in regions:
+            if region and region in region_coords:
                 return region
     except Exception as e:
         logger.error(f"User Region Load Error: {e}")
 
+    # 3) 기기 상태
     try:
         res = state_table.get_item(Key={"deviceId": device_id})
         item = res.get("Item") or {}
@@ -901,16 +913,17 @@ def get_saved_region(device_id):
     except Exception as e:
         logger.error(f"State Region Load Error: {e}")
 
+    # 4) 최근 로그의 날씨 지역 (기존 로직 유지)
     try:
         resp = log_table.query(
-            KeyConditionExpression=Key("deviceId").eq(str(device_id)),
+            KeyConditionExpression=Key("deviceId").eq(did),
             ScanIndexForward=False,
             Limit=20,
         )
         for item in resp.get("Items") or []:
             region = str(item.get("region", "") or "").strip()
             mode = str(item.get("mode", "") or "").lower()
-            if region and region != "Emotion" and ("weather" in mode or region in getattr(config, "REGION_COORDS", {})):
+            if region and region != "Emotion" and ("weather" in mode or region in region_coords):
                 return region
     except Exception as e:
         logger.error(f"Recent Weather Region Load Error: {e}")
