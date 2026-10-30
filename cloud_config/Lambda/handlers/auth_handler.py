@@ -139,6 +139,22 @@ def handle_auth(action, body, device_id):
                 ExpressionAttributeNames=expr_attr_names
             )
 
+            if u_region:
+                target_device = u_device_id or user_info.get('deviceId')
+                if target_device:
+                    try:
+                        db_utils.state_table.update_item(
+                            Key={'deviceId': str(target_device)},
+                            UpdateExpression="set app_region = :r, app_region_updated = :t",
+                            ExpressionAttributeValues={
+                                ':r': u_region,
+                                ':t': datetime.now(timezone(timedelta(hours=9))).isoformat(),
+                            }
+                        )
+                    except Exception as e:
+                        pass
+
+
             return {
                 "statusCode": 200, 
                 "headers": {"Content-Type": "application/json"}, 
