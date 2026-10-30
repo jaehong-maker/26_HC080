@@ -37,14 +37,11 @@ static const uint8_t REGION_SEOUL[]    = {0xBC, 0xAD, 0xBF, 0xEF, 0x3A};
 static const uint8_t REGION_SUWON[]    = {0xBC, 0xF6, 0xBF, 0xF8, 0x3A};
 static const uint8_t REGION_SEONGNAM[] = {0xBC, 0xBA, 0xB3, 0xB2, 0x3A};
 static const uint8_t REGION_ANYANG[]   = {0xBE, 0xC8, 0xBE, 0xE7, 0x3A};
-static const uint8_t REGION_GWACHEON[] = {0xB0, 0xFA, 0xC3, 0xB5, 0x3A};
-static const uint8_t REGION_GUNPO[]    = {0xB1, 0xBA, 0xC6, 0xF7, 0x3A};
 static const uint8_t REGION_GOYANG[]   = {0xB0, 0xED, 0xBE, 0xE7, 0x3A};
 static const uint8_t REGION_YONGIN[]   = {0xBF, 0xEB, 0xC0, 0xCE, 0x3A};
 static const uint8_t REGION_BUCHEON[]  = {0xBA, 0xCE, 0xC3, 0xB5, 0x3A};
 static const uint8_t REGION_ANSAN[]    = {0xBE, 0xC8, 0xBB, 0xEA, 0x3A};
 static const uint8_t REGION_NAMYANGJU[] = {0xB3, 0xB2, 0xBE, 0xE7, 0xC1, 0xD6, 0x3A};
-static const uint8_t REGION_DONGDUCHEON[] = {0xB5, 0xBF, 0xB5, 0xCE, 0xC3, 0xB5, 0x3A};
 static const uint8_t REGION_HWASEONG[] = {0xC8, 0xAD, 0xBC, 0xBA, 0x3A};
 static const uint8_t REGION_PYEONGTAEK[] = {0xC6, 0xF2, 0xC5, 0xC3, 0x3A};
 static const uint8_t REGION_UIJEONGBU[] = {0xC0, 0xC7, 0xC1, 0xA4, 0xBA, 0xCE, 0x3A};
@@ -52,8 +49,6 @@ static const uint8_t REGION_PAJU[]     = {0xC6, 0xC4, 0xC1, 0xD6, 0x3A};
 static const uint8_t REGION_GIMPO[]    = {0xB1, 0xE8, 0xC6, 0xF7, 0x3A};
 static const uint8_t REGION_GWANGMYEONG[] = {0xB1, 0xA4, 0xB8, 0xED, 0x3A};
 static const uint8_t REGION_GWANGJU[]  = {0xB1, 0xA4, 0xC1, 0xD6, 0x3A};
-static const uint8_t REGION_GYEONGGI_GWANGJU[] = {0xB0, 0xE6, 0xB1, 0xE2, 0xB1, 0xA4, 0xC1, 0xD6, 0x3A};
-static const uint8_t REGION_GWANGJU_METRO[] = {0xB1, 0xA4, 0xC1, 0xD6, 0xB1, 0xA4, 0xBF, 0xAA, 0xBD, 0xC3, 0x3A};
 static const uint8_t REGION_ICHEON[]   = {0xC0, 0xCC, 0xC3, 0xB5, 0x3A};
 static const uint8_t REGION_YANGJU[]   = {0xBE, 0xE7, 0xC1, 0xD6, 0x3A};
 static const uint8_t REGION_GURI[]     = {0xB1, 0xB8, 0xB8, 0xAE, 0x3A};
@@ -90,16 +85,12 @@ static const uint8_t WEATHER_ENV_ERR[] = {0xC8, 0xAF, 0xB0, 0xE6, 0x20, 0xBA, 0x
 static const EncodedRegionText ENCODED_REGIONS[] = {
   {"\xEC\x84\x9C\xEC\x9A\xB8", REGION_SEOUL, sizeof(REGION_SEOUL)}, {"\xEC\x88\x98\xEC\x9B\x90", REGION_SUWON, sizeof(REGION_SUWON)},
   {"\xEC\x84\xB1\xEB\x82\xA8", REGION_SEONGNAM, sizeof(REGION_SEONGNAM)}, {"\xEC\x95\x88\xEC\x96\x91", REGION_ANYANG, sizeof(REGION_ANYANG)},
-  {"\xEA\xB3\xBC\xEC\xB2\x9C", REGION_GWACHEON, sizeof(REGION_GWACHEON)}, {"\xEA\xB5\xB0\xED\x8F\xAC", REGION_GUNPO, sizeof(REGION_GUNPO)},
   {"\xEA\xB3\xA0\xEC\x96\x91", REGION_GOYANG, sizeof(REGION_GOYANG)}, {"\xEC\x9A\xA9\xEC\x9D\xB8", REGION_YONGIN, sizeof(REGION_YONGIN)},
   {"\xEB\xB6\x80\xEC\xB2\x9C", REGION_BUCHEON, sizeof(REGION_BUCHEON)}, {"\xEC\x95\x88\xEC\x82\xB0", REGION_ANSAN, sizeof(REGION_ANSAN)},
   {"\xEB\x82\xA8\xEC\x96\x91\xEC\xA3\xBC", REGION_NAMYANGJU, sizeof(REGION_NAMYANGJU)}, {"\xED\x99\x94\xEC\x84\xB1", REGION_HWASEONG, sizeof(REGION_HWASEONG)},
-  {"\xEB\x8F\x99\xEB\x91\x90\xEC\xB2\x9C", REGION_DONGDUCHEON, sizeof(REGION_DONGDUCHEON)},
   {"\xED\x8F\x89\xED\x83\x9D", REGION_PYEONGTAEK, sizeof(REGION_PYEONGTAEK)}, {"\xEC\x9D\x98\xEC\xA0\x95\xEB\xB6\x80", REGION_UIJEONGBU, sizeof(REGION_UIJEONGBU)},
   {"\xED\x8C\x8C\xEC\xA3\xBC", REGION_PAJU, sizeof(REGION_PAJU)}, {"\xEA\xB9\x80\xED\x8F\xAC", REGION_GIMPO, sizeof(REGION_GIMPO)},
   {"\xEA\xB4\x91\xEB\xAA\x85", REGION_GWANGMYEONG, sizeof(REGION_GWANGMYEONG)}, {"\xEA\xB4\x91\xEC\xA3\xBC", REGION_GWANGJU, sizeof(REGION_GWANGJU)},
-  {"\xEA\xB2\xBD\xEA\xB8\xB0\xEA\xB4\x91\xEC\xA3\xBC", REGION_GYEONGGI_GWANGJU, sizeof(REGION_GYEONGGI_GWANGJU)},
-  {"\xEA\xB4\x91\xEC\xA3\xBC\xEA\xB4\x91\xEC\x97\xAD\xEC\x8B\x9C", REGION_GWANGJU_METRO, sizeof(REGION_GWANGJU_METRO)},
   {"\xEC\x9D\xB4\xEC\xB2\x9C", REGION_ICHEON, sizeof(REGION_ICHEON)}, {"\xEC\x96\x91\xEC\xA3\xBC", REGION_YANGJU, sizeof(REGION_YANGJU)},
   {"\xEA\xB5\xAC\xEB\xA6\xAC", REGION_GURI, sizeof(REGION_GURI)}, {"\xED\x8F\xAC\xEC\xB2\x9C", REGION_POCHEON, sizeof(REGION_POCHEON)},
   {"\xEC\x96\x91\xED\x8F\x89", REGION_YANGPYEONG, sizeof(REGION_YANGPYEONG)}, {"\xEA\xB0\x80\xED\x8F\x89", REGION_GAPYEONG, sizeof(REGION_GAPYEONG)},
