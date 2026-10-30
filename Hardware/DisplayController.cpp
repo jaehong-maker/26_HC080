@@ -24,6 +24,9 @@ static unsigned long pageTransitionTime = 0;
 static int transitioningPageId = 0;
 static bool pendingWeatherFieldUpdate = false;
 static bool pendingWeatherLoadingUpdate = false;
+static bool lowFluidReturnPending = false;
+static unsigned long lowFluidShownAt = 0;
+static int lowFluidReturnPage = PAGE_WEATHER_OFF;
 
 static unsigned long lastScentTouchTime = 0;
 static bool volumeNeedsSave = false;
@@ -171,6 +174,9 @@ static void sendClockDisplayNow() {
 
 static void scheduleWeatherFieldUpdate(bool loading) { pendingWeatherFieldUpdate = true; pendingWeatherLoadingUpdate = loading; }
 void showPage(int pageId) {
+  // Explicit navigation takes ownership of the screen; an old warning must
+  // never return over a newer page (including a local/server stop page).
+  lowFluidReturnPending = false;
   currentDisplayPage = pageId; nexSend("page page" + String(pageId));
   pendingPageUpdate = true; pageTransitionTime = millis(); transitioningPageId = pageId;
 }
@@ -233,13 +239,32 @@ void clearWeatherState() { hasWeatherSnapshot = false; hasTempHumiSnapshot = fal
 static void showHomePageByWeatherState() { if (currentMode == MODE_WEATHER) showWeatherPageByState(); else showWeatherOffPage(); }
 void showStartupReadyPage() { nexSend("sleep=0"); nexSend("dim=100"); clearWeatherState(); setSystemMode(MODE_READY, "Startup Ready"); showInitialHomePage(); }
 void setOfflineModeActive(bool active) { offlineModeActive = active; if (offlineModeActive) { if (currentMode == MODE_WEATHER) { clearWeatherState(); setSystemMode(MODE_READY, "Offline Mode"); } showPage(PAGE_OFFLINE); } else { showWeatherOffPage(); } }
+static void processLowFluidPageTimeout() {
+  if (!lowFluidReturnPending) return;
+  if (currentDisplayPage != PAGE_LOW_FLUID) {
+    lowFluidReturnPending = false;
+    return;
+  }
+  if (millis() - lowFluidShownAt < 3000UL) return;
+  lowFluidReturnPending = false;
+  if (lowFluidReturnPage == PAGE_LOW_FLUID) showHomePageByWeatherState();
+  else showPage(lowFluidReturnPage);
+}
+
 void showLowFluidPage(int cartNum) {
-  int returnPage = currentDisplayPage; showPage(PAGE_LOW_FLUID);
+  // Repeated warnings extend the notice, retaining the original return page.
+  int returnPage = lowFluidReturnPending && currentDisplayPage == PAGE_LOW_FLUID
+      ? lowFluidReturnPage : currentDisplayPage;
+  showPage(PAGE_LOW_FLUID);
   if (cartNum >= 1 && cartNum <= 4) {
     uint8_t encoded[8] = { (uint8_t)('0' + cartNum), 0xB9, 0xF8, 0x20, 0xBA, 0xCE, 0xC1, 0xB7 };
     nexSerial.print("t_capnum.txt=\""); nexSerial.write(encoded, 8); nexSerial.print("\""); nexWriteTerminator();
   }
-  delay(3000); if (returnPage == PAGE_LOW_FLUID) showHomePageByWeatherState(); else showPage(returnPage);
+  // Only schedule the return. The main loop keeps sampling the shared SCK
+  // loadcells and servicing spray safety, ST, OTA and server responses.
+  lowFluidReturnPage = returnPage;
+  lowFluidShownAt = millis();
+  lowFluidReturnPending = true;
 }
 
 // =================================================================
@@ -316,6 +341,7 @@ void checkNextionInput() {
     if (cmd == "WK") { wakeUpSystem(); if (millis() - startMillis > 50) break; continue; }
     handleNextionCmd(cmd); wakeUpSystem(); if (millis() - startMillis > 50) break;
   }
+  processLowFluidPageTimeout();
   if (pendingManualScent.length() > 0 && millis() - lastScentTouchTime > 300) {
     if (isBlendSelectionInProgress() && pendingManualScent.length() < 2) { pendingManualScent = ""; return; }
     String scentToRun = pendingManualScent; runManualMode(scentToRun); if (blendModeEnabled) blendSprayActive = scentToRun.length() >= 2; pendingManualScent = "";
@@ -400,6 +426,7 @@ void showManualPageByState() { if (blendModeEnabled) showPage((currentDisplayPag
 
 void handleNextionCmd(const String &cmd) {
   if (cmd.startsWith("p0") || cmd.startsWith("t_weather") || cmd.startsWith("j0")) return;
+  recordControlDiagnostic("nextion-rx", cmd);
   static unsigned long lastValidCmdMillis = 0; static String lastScentCmd = ""; static unsigned long lastScentCmdMillis = 0;
   bool isVolumeCmd = cmd.startsWith("V"); bool isScentCmd = cmd.startsWith("S"); bool isBlendScentCmd = isScentCmd && isBlendUiActive();
   unsigned long cooldown = isVolumeCmd ? 50 : 1000;

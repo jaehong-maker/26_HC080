@@ -210,6 +210,7 @@ void runSystem() {
     showStartupReadyPage();
   }
   updateClockDisplay();
+  handleWebClient();
 
   // Reconnection must also run before ambient/sleep branches return.
   manageWiFi();
@@ -232,7 +233,6 @@ void runSystem() {
   } 
 
   systemHeartbeat(); 
-  handleWebClient(); 
   autoWeatherScheduler(); 
   pollServer(); 
   
@@ -351,26 +351,7 @@ void processStandardInput() {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       if (inputBuffer.length() > 0) {
-        if (currentMode == MODE_AMBIENT && isWaitingForTestDb) {
-          int testDb = inputBuffer.toInt();
-          Serial.printf("\r\n[Test] 강제 데시벨 %d dB 서버로 즉시 전송!\r\n", testDb);
-          
-          String payload = "{\"mode\": \"ambient\", \"db_level\": " + String(testDb) + ", \"weights\": [" +
-                           String(weights[0], 1) + ", " + String(weights[1], 1) + ", " +
-                           String(weights[2], 1) + ", " + String(weights[3], 1) + "]}";
-          sendServerRequest(payload);
-          
-          isWaitingForTestDb = false;
-          ambientCycleCount = 0;
-          isFirstAmbientRun = false; 
-          
-          currentAmbientTrack++;
-          if (currentAmbientTrack > 20) currentAmbientTrack = 1;
-          playSound(currentAmbientTrack);
-          Serial.printf(C_BLUE "🎵 노래 시작: %d번 트랙\r\n" C_RESET, currentAmbientTrack);
-          lastAmbientTime = millis();
-        
-        } else if (inputBuffer == "0") {
+        if (inputBuffer == "0") {
           setSystemMode(MODE_READY, "Stopped");
         } else {
           handleInput(inputBuffer);
@@ -384,19 +365,8 @@ void processStandardInput() {
     } else if (c == '\b' || c == 0x7F) {
       if (inputBuffer.length() > 0) { inputBuffer.remove(inputBuffer.length() - 1); redrawInputLine(inputBuffer); }
     } else { 
-      if (currentMode == MODE_AMBIENT && c == 'n') {
-          Serial.println("\r\n[Skip] n키 감지: 현재 노래를 중단하고 수음을 시작합니다.");
-          myDFPlayer.stop();
-          forceAmbientSkip = true;
-      } else if (currentMode == MODE_AMBIENT && c == 't') {
-          Serial.println("\r\n[Test Mode] 수음을 건너뛰고 데시벨을 수동으로 입력합니다.");
-          Serial.print("전송할 데시벨 값을 입력하고 엔터를 치세요 (예: 65) >> ");
-          myDFPlayer.stop();
-          isWaitingForTestDb = true; 
-      } else {
-          inputBuffer += c; 
-          redrawInputLine(inputBuffer); 
-      }
+      inputBuffer += c;
+      redrawInputLine(inputBuffer);
     }
   }
 }
@@ -501,6 +471,16 @@ void enterWeatherMode(bool runNow) {
 static const float MIN_SPRAY_SCENT_PERCENT = 15.0f;
 static bool stopLowFluidActiveNozzles();
 
+void stopAmbientSpray() {
+  // Pump-only completion: retain mode, music and LED while awaiting POLL.
+  forceAllOff();
+  isRunning = false;
+  isSpraying = false;
+  activeSprayCommand = -1;
+  for (int i = 0; i < 4; ++i) activeNozzles[i] = false;
+  recordControlDiagnostic("ambient-pump-off", "await-command");
+}
+
 void runSprayLogic() { 
   checkSafety();
   if (!isRunning) return;
@@ -509,11 +489,16 @@ void runSprayLogic() {
 
   if (isSpraying) {
     if (millis() - prevMotorMillis >= sprayDuration) {
+      if (currentMode == MODE_AMBIENT) {
+        stopAmbientSpray();
+        return;
+      }
       forceAllOff();
       isSpraying = false;
       prevMotorMillis = millis();
+      recordControlDiagnostic("pulse-off", "rest");
     }
-  } else if (currentMode != MODE_DEMO && millis() - prevMotorMillis >= REST_TIME) {
+  } else if (currentMode != MODE_DEMO && currentMode != MODE_AMBIENT && millis() - prevMotorMillis >= REST_TIME) {
     forceAllOff();
     bool enabledAny = false;
     for (int i = 0; i < 4; i++) {
@@ -527,6 +512,7 @@ void runSprayLogic() {
     }
     isSpraying = true;
     prevMotorMillis = millis();
+    recordControlDiagnostic("pulse-on", "resume");
   }
 
   // 🎵 일반/수동 모드 플레이리스트 연속 재생 검사
@@ -580,7 +566,17 @@ void runAutoDemoLoop() {
 }
 
 void checkSafety() {
-  bool automaticMode = currentMode == MODE_AMBIENT || currentMode == MODE_DEMO;
+  if (currentMode == MODE_AMBIENT) {
+    // Waiting and BGM are not pump runtime. Each server-authorized spray has
+    // its own start time; timeout preserves the ambient session and settings.
+    if (isRunning && millis() - startTimeMillis >= (unsigned long)MAX_RUN_TIME) {
+      invalidatePendingServerStarts();
+      stopAmbientSpray();
+      recordControlDiagnostic("ambient-pump-timeout", "270s-limit");
+    }
+    return;
+  }
+  bool automaticMode = currentMode == MODE_DEMO;
   if (!isRunning && !automaticMode) return;
   unsigned long safetyStart = automaticMode ? automaticSessionStartedMillis : startTimeMillis;
   if (millis() - safetyStart >= (unsigned long)MAX_RUN_TIME) {
@@ -644,7 +640,7 @@ void getCurrentTime(int &hour, int &minute) {
 }
 
 void runScheduler() {
-    if (!schedulerEnabled || WiFi.status() != WL_CONNECTED) return;
+    if (currentMode == MODE_AMBIENT || !schedulerEnabled || WiFi.status() != WL_CONNECTED) return;
 
     static unsigned long lastTimeCheck = 0;
     if (millis() - lastTimeCheck < 60000) return;
@@ -816,7 +812,7 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
       return; 
   }
 
-  sprayDuration = dur * 1000;
+  sprayDuration = static_cast<unsigned long>(dur) * 1000UL;
   const unsigned long sprayStartedMillis = millis();
   
   bool enabledAny = false;
@@ -840,6 +836,7 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
   isRunning = true;
   isSpraying = true;
   activeSprayCommand = cmd;
+  recordControlDiagnostic("spray-start", String(cmd) + ":" + String(dur) + "s");
   
   // 🎵 오직 서버에서 내려준 음악 데이터만 믿고 재생하는 깔끔한 로직
   if (currentMode != MODE_AMBIENT && currentMode != MODE_DEMO && cmd >= 1 && cmd <= 34) {

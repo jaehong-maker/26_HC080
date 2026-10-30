@@ -1,5 +1,8 @@
 #include "Globals.h"
 #include <new>
+#include <lwip/sockets.h>
+#include <errno.h>
+#include <freertos/semphr.h>
 
 static WiFiClientSecure sharedClient;
 static bool isSessionInit = false;
@@ -20,6 +23,89 @@ static QueueHandle_t serverResponseQueue = nullptr;
 static portMUX_TYPE commandOrderMux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t stopGeneration = 0;
 static int lastSyncedManualScent = 0;
+// A matching request/response pair, captured at HTTP transmission rather than
+// enqueue time. Never hold this mutex during HTTP or actuator work.
+struct PollDiagnostic {
+  String request;
+  String response;
+  unsigned long requestAt = 0;
+  unsigned long responseAt = 0;
+  uint32_t sequence = 0;
+  int httpCode = 0;
+  bool inFlight = false;
+};
+static PollDiagnostic pollDiagnostic;
+static SemaphoreHandle_t pollDiagnosticMutex = nullptr;
+
+static void beginPollDiagnostic(const String &payload) {
+  if (!pollDiagnosticMutex) return;
+  if (xSemaphoreTake(pollDiagnosticMutex, portMAX_DELAY) != pdTRUE) return;
+  pollDiagnostic.request = payload;
+  pollDiagnostic.response = "";
+  pollDiagnostic.requestAt = millis();
+  pollDiagnostic.responseAt = 0;
+  ++pollDiagnostic.sequence;
+  pollDiagnostic.httpCode = 0;
+  pollDiagnostic.inFlight = true;
+  xSemaphoreGive(pollDiagnosticMutex);
+}
+
+static void finishPollDiagnostic(const String &response, int httpCode) {
+  if (!pollDiagnosticMutex) return;
+  if (xSemaphoreTake(pollDiagnosticMutex, portMAX_DELAY) != pdTRUE) return;
+  pollDiagnostic.response = response;
+  pollDiagnostic.responseAt = millis();
+  pollDiagnostic.httpCode = httpCode;
+  pollDiagnostic.inFlight = false;
+  xSemaphoreGive(pollDiagnosticMutex);
+}
+
+namespace {
+constexpr size_t DIAGNOSTIC_EVENT_COUNT = 12;
+struct ControlDiagnosticEvent {
+  uint32_t atMillis;
+  char event[24];
+  char detail[64];
+  uint8_t gpioMask;
+  uint8_t activeMask;
+  bool running;
+  bool spraying;
+  int mode;
+};
+ControlDiagnosticEvent diagnosticEvents[DIAGNOSTIC_EVENT_COUNT] = {};
+portMUX_TYPE diagnosticMux = portMUX_INITIALIZER_UNLOCKED;
+size_t diagnosticWriteIndex = 0;
+size_t diagnosticCount = 0;
+uint32_t nextionStopCount = 0;
+char lastNextionCommand[64] = {};
+
+uint8_t currentSprayGpioMask() {
+  uint8_t mask = 0;
+  for (int i = 0; i < 4; ++i) if (digitalRead(Config::SPRAY_PINS[i]) == HIGH) mask |= (1U << i);
+  return mask;
+}
+} // namespace
+
+void recordControlDiagnostic(const char *event, const String &detail) {
+  ControlDiagnosticEvent entry = {};
+  entry.atMillis = millis();
+  snprintf(entry.event, sizeof(entry.event), "%s", event);
+  snprintf(entry.detail, sizeof(entry.detail), "%s", detail.c_str());
+  entry.gpioMask = currentSprayGpioMask();
+  for (int i = 0; i < 4; ++i) if (activeNozzles[i]) entry.activeMask |= (1U << i);
+  entry.running = isRunning;
+  entry.spraying = isSpraying;
+  entry.mode = currentMode;
+  portENTER_CRITICAL(&diagnosticMux);
+  diagnosticEvents[diagnosticWriteIndex] = entry;
+  diagnosticWriteIndex = (diagnosticWriteIndex + 1) % DIAGNOSTIC_EVENT_COUNT;
+  if (diagnosticCount < DIAGNOSTIC_EVENT_COUNT) ++diagnosticCount;
+  if (strcmp(event, "nextion-rx") == 0) {
+    memcpy(lastNextionCommand, entry.detail, sizeof(lastNextionCommand));
+    if (detail == "ST") ++nextionStopCount;
+  }
+  portEXIT_CRITICAL(&diagnosticMux);
+}
 
 static uint32_t currentStopGeneration() {
   portENTER_CRITICAL(&commandOrderMux);
@@ -35,6 +121,7 @@ void invalidatePendingServerStarts() {
 }
 
 bool initializeServerResponseQueue() {
+  if (!pollDiagnosticMutex) pollDiagnosticMutex = xSemaphoreCreateMutex();
   if (!networkQueue) networkQueue = xQueueCreate(10, sizeof(PendingServerRequest*));
   if (!serverResponseQueue) serverResponseQueue = xQueueCreate(4, sizeof(PendingServerResponse*));
   return networkQueue != nullptr && serverResponseQueue != nullptr;
@@ -110,6 +197,7 @@ static void applyServerStop(bool explicitStop = true) {
   else lastLocalStopMillis = millis(); // An idle status is not a new stop barrier.
   clearWeatherState();
   setSystemMode(MODE_READY, "Stopped by Server");
+  // LED power/color follows its own settings, including while ready/off.
   if (modeBeforeStop == MODE_WEATHER || currentDisplayPage == PAGE_WEATHER) showWeatherOffPage();
   else updateDisplay(0, "Stopped by Server");
   lastSyncedManualScent = 0;
@@ -128,7 +216,8 @@ static bool readJsonFloatField(JsonDocument &doc, const char *fieldName, float &
 static String attachDeviceIdIfMissing(const String &payload) {
   JsonDocument doc;
   if (deserializeJson(doc, payload) || !doc.is<JsonObject>()) return payload;
-  if (doc["deviceId"].isNull()) doc["deviceId"] = deviceId;
+  if (doc["action"] == "POLL") doc["deviceId"] = "SS";
+  else if (doc["deviceId"].isNull()) doc["deviceId"] = deviceId;
   String normalized; normalized.reserve(payload.length() + 32);
   serializeJson(doc, normalized); return normalized;
 }
@@ -279,17 +368,12 @@ void manageWiFi() {
 void pollServer() {
   if (currentMode == MODE_DEMO || isCommunicate) return; 
   unsigned long now = millis();
-  static unsigned long lastSampleTime = 0; static int dbSamples[5] = {0, 0, 0, 0, 0}; static int sampleIdx = 0;
-
-  if (now - lastSampleTime >= 3000) { lastSampleTime = now; dbSamples[sampleIdx] = currentDbLevel; sampleIdx = (sampleIdx + 1) % 5; }
-
   if (now - lastPollTime >= POLL_INTERVAL) {
-    lastPollTime = now; int dbSum = 0; for(int i = 0; i < 5; i++) dbSum += dbSamples[i];
-    int avgDb = dbSum / 5;
-    
+    lastPollTime = now;
     if (WiFi.status() == WL_CONNECTED) {
-      JsonDocument doc; doc["action"] = "POLL"; doc["deviceId"] = deviceId; doc["status"] = lastWebMessage; 
-      doc["db_level"] = avgDb; doc["volume"] = currentVolume / 3; doc["led_br"] = ledEnabled ? ledBrightness : 0;
+      JsonDocument doc; doc["action"] = "POLL"; doc["deviceId"] = "SS"; doc["status"] = lastWebMessage;
+      MicrophoneLevel snapshot;
+      doc["db_level"] = getMicrophoneLevel(snapshot) ? snapshot.level : 0; doc["volume"] = currentVolume / 3; doc["led_br"] = ledEnabled ? ledBrightness : 0;
       int currentPlayingTrack = 0;
       if (currentMode == MODE_AMBIENT) currentPlayingTrack = currentAmbientTrack; 
       else if (isRunning && currentSlotTracksCount > 0) currentPlayingTrack = currentSlotTracks[currentPlaylistIdx];
@@ -313,7 +397,9 @@ static void processServerResponse(const String& response, bool isPollRequest = t
 
   // 🟢 1. 앱 명령(마패) 확인 및 LED "최우선" 동기화 (함수 맨 위로 끌어올림!)
   bool isAppCmd = (doc["app_command"] == true || doc["pending_cmd"] == true || doc["command_source"] == "app");
-  bool shouldApplySettings = canApplyServerSettings() || isAppCmd;
+  String serverActiveMode = doc["active_mode"] | ""; serverActiveMode.trim();
+  const bool ambientResponse = serverActiveMode == "ambient";
+  bool shouldApplySettings = ambientResponse || canApplyServerSettings() || isAppCmd;
 
   bool hasLedData = !doc["led_r"].isNull() || !doc["ledR"].isNull() || 
                     !doc["led_g"].isNull() || !doc["ledG"].isNull() || 
@@ -339,7 +425,6 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   }
 
   // 🟢 2. 모드 및 서버 상태 파싱
-  String serverActiveMode = doc["active_mode"] | ""; serverActiveMode.trim();
   int cmd = doc["spray"] | -1; String resultText = doc["result_text"] | "";
 
   if (!isAppCmd && currentMode == MODE_WEATHER && wasWeatherStartedLocallyRecently() && serverActiveMode == "manual") {
@@ -367,6 +452,43 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   // 🟢 3. 기타 세팅 및 모드 전환 로직
   if (shouldApplySettings && !doc["intensity"].isNull()) SprayIntensity(doc["intensity"] | 2);
   if (shouldApplySettings && !doc["volume"].isNull()) applyServerVolumeWithoutPageChange(doc["volume"] | 5);
+
+  // Ambient has a strict command contract, independent of manual/weather
+  // text heuristics and of whether this response contains a spray command.
+  if (ambientResponse || currentMode == MODE_AMBIENT) {
+    if (serverActiveMode == "ready" || serverActiveMode == "off") {
+      applyServerStop();
+      return;
+    }
+    if (ambientResponse) {
+      if (currentMode != MODE_AMBIENT) setSystemMode(MODE_AMBIENT, "Ambient Mode");
+      int track = doc["music"] | 0;
+      if (track > 0 && track != currentAmbientTrack) {
+        playSound(track);
+        currentAmbientTrack = track;
+        nexSend("t_music.txt=\"" + getTrackName(track) + "\"");
+      }
+      if (cmd == 0) {
+        markLocalStop();
+        stopAmbientSpray();
+      } else if (doc["app_command"] == true && cmd > 0) {
+        int duration = doc["duration"] | 0;
+        if (duration > 0 && duration <= MAX_RUN_TIME / 1000) {
+          triggerSpray(cmd, duration, 0, resultText, false);
+        } else {
+          recordControlDiagnostic("ambient-rejected", "invalid-duration");
+        }
+      }
+      if (!doc["timer_enabled"].isNull()) { schedulerEnabled = doc["timer_enabled"] | false; activeStartHour = doc["timer_start"] | 9; activeEndHour = doc["timer_end"] | 22; }
+      return;
+    }
+    if (cmd == 0) {
+      markLocalStop();
+      stopAmbientSpray();
+      return;
+    }
+    if (serverActiveMode != "manual" && serverActiveMode != "weather") return;
+  }
 
   bool suppressManualSingleDuringBlendSelection = isBlendSelectionInProgress() && cmd >= 1 && cmd <= 4 && serverActiveMode != "weather";
   bool isActiveWeatherRefreshResponse = isWeatherRefreshResponse && currentMode == MODE_WEATHER && isWeatherLikeResponse(serverActiveMode, weatherText, targetRegion, isWeatherRefreshResponse);
@@ -446,11 +568,24 @@ void processPendingServerResponse() {
   if (!serverResponseQueue) return;
   PendingServerResponse *message = nullptr;
   if (xQueueReceive(serverResponseQueue, &message, 0) != pdTRUE) return;
+  if (!message->weatherRefresh && !message->weatherRetry) {
+    Serial.println("[POLL raw] " + message->body);
+  }
   if (message->stopGeneration != currentStopGeneration()) {
     // Stops win even when their request predates a local stop. Old starts and
     // settings never reach the actuator/display handlers after the barrier.
-    if (!message->weatherRetry && isExplicitServerStopResponse(message->body)) applyServerStop();
-    else Serial.println("[Network] Ignored response requested before the latest stop.");
+    if (!message->weatherRetry && isExplicitServerStopResponse(message->body)) {
+      JsonDocument stale;
+      deserializeJson(stale, message->body);
+      if (currentMode == MODE_AMBIENT && stale["active_mode"] == "ambient" && stale["spray"] == 0) {
+        markLocalStop();
+        stopAmbientSpray();
+      } else applyServerStop();
+    }
+    else {
+      recordControlDiagnostic("old-response", "discarded");
+      Serial.println("[Network] Ignored response requested before the latest stop.");
+    }
   }
   else if (message->weatherRetry) allowWeatherRetry();
   else processServerResponse(message->body, true, message->weatherRefresh);
@@ -468,9 +603,15 @@ void networkTaskLoop(void *pvParameters) {
       bool isWeatherRefreshResponse = isWeatherRequestPayload(payload); bool shouldProcessResponse = shouldProcessNetworkResponse(payload);
       isCommunicate = true; initNetworkSession(); HTTPClient http; http.setTimeout(20000);
       
+      const bool isPoll = payload.indexOf("\"POLL\"") >= 0;
       if (http.begin(sharedClient, serverName)) {
-        http.addHeader("Content-Type", "application/json"); int httpCode = http.POST(payload);
-        if (httpCode == HTTP_CODE_OK) { String response = http.getString(); if (shouldProcessResponse) queueServerResponse(response, isWeatherRefreshResponse, requestGeneration); }
+        http.addHeader("Content-Type", "application/json");
+        if (isPoll) beginPollDiagnostic(payload);
+        int httpCode = http.POST(payload);
+        String response;
+        if (httpCode == HTTP_CODE_OK || (isPoll && httpCode > 0)) response = http.getString();
+        if (isPoll) finishPollDiagnostic(response, httpCode);
+        if (httpCode == HTTP_CODE_OK) { if (shouldProcessResponse) queueServerResponse(response, isWeatherRefreshResponse, requestGeneration); }
         else { if (isWeatherRefreshResponse) queueServerResponse("", true, requestGeneration, true); Serial.printf(C_RED "⚠️ [Network] HTTP 에러: %d\r\n" C_RESET, httpCode); }
         http.end();
       } else { if (isWeatherRefreshResponse) queueServerResponse("", true, requestGeneration, true); }
@@ -536,7 +677,152 @@ void recordAndSendVoice() {
 }
 
 void autoWeatherScheduler() { if (currentMode != MODE_WEATHER || isRunning) return; if (millis() - lastWeatherCallMillis >= WEATHER_INTERVAL) requestWeatherRefresh(lastWeatherRegion); }
-void handleWebClient() { WiFiClient client = webServer.available(); if (!client) return; client.println("HTTP/1.1 200 OK\r\nConnection: close\r\n"); client.stop(); }
+static String buildControlDiagnosticJson() {
+  ControlDiagnosticEvent events[DIAGNOSTIC_EVENT_COUNT];
+  char lastCommand[sizeof(lastNextionCommand)];
+  size_t count;
+  uint32_t stopCount;
+  portENTER_CRITICAL(&diagnosticMux);
+  count = diagnosticCount;
+  stopCount = nextionStopCount;
+  memcpy(lastCommand, lastNextionCommand, sizeof(lastCommand));
+  size_t oldest = (diagnosticWriteIndex + DIAGNOSTIC_EVENT_COUNT - count) % DIAGNOSTIC_EVENT_COUNT;
+  for (size_t i = 0; i < count; ++i) events[i] = diagnosticEvents[(oldest + i) % DIAGNOSTIC_EVENT_COUNT];
+  portEXIT_CRITICAL(&diagnosticMux);
+
+  JsonDocument doc;
+  doc["diagnostic_version"] = 3;
+  doc["poll_device_id"] = "SS";
+  PollDiagnostic pollSnapshot;
+  const bool pollSnapshotAvailable = pollDiagnosticMutex && xSemaphoreTake(pollDiagnosticMutex, 0) == pdTRUE;
+  if (pollSnapshotAvailable) {
+    pollSnapshot = pollDiagnostic;
+    xSemaphoreGive(pollDiagnosticMutex);
+    doc["last_poll_request"] = pollSnapshot.request;
+    doc["last_poll_request_at_ms"] = pollSnapshot.requestAt;
+    doc["last_poll_response"] = pollSnapshot.response;
+    doc["last_poll_response_at_ms"] = pollSnapshot.responseAt;
+    doc["poll_sequence"] = pollSnapshot.sequence;
+    doc["poll_http_code"] = pollSnapshot.httpCode;
+    doc["poll_in_flight"] = pollSnapshot.inFlight;
+  }
+  doc["poll_snapshot_available"] = pollSnapshotAvailable;
+  doc["noise_level_unit"] = "relative_pcm_rms";
+  doc["noise_level_note"] = "상대 소음 레벨 (보정된 dB SPL 아님)";
+  doc["own_bgm_may_affect_noise"] = true;
+  doc["measurement_muting_enabled"] = false;
+  doc["measurement_note"] = "반복 음소거 없음. 자체 BGM이 마이크 측정값에 포함될 수 있음.";
+  MicrophoneLevel microphoneSnapshot;
+  doc["microphone_valid"] = getMicrophoneLevel(microphoneSnapshot);
+  doc["ambient_pump_safety_limit_ms"] = MAX_RUN_TIME;
+  doc["ambient_pump_safety_scope"] = "per_server_spray_excludes_waiting";
+  doc["db_level"] = currentDbLevel;
+  doc["ambient_track"] = currentAmbientTrack;
+  doc["spray_duration_ms"] = sprayDuration;
+  doc["build"] = String(__DATE__) + " " + String(__TIME__);
+  doc["deviceId"] = deviceId;
+  doc["uptime_ms"] = millis();
+  doc["mode"] = static_cast<int>(currentMode);
+  doc["running"] = isRunning;
+  doc["spraying"] = isSpraying;
+  doc["last_nextion_command"] = lastCommand;
+  doc["nextion_stop_count"] = stopCount;
+  doc["stop_generation"] = currentStopGeneration();
+  JsonArray gpio = doc["gpio_high"].to<JsonArray>();
+  JsonArray selected = doc["active_nozzles"].to<JsonArray>();
+  JsonArray sensors = doc["sensor_valid"].to<JsonArray>();
+  uint8_t gpioMask = currentSprayGpioMask();
+  for (int i = 0; i < 4; ++i) {
+    gpio.add((gpioMask & (1U << i)) != 0);
+    selected.add(activeNozzles[i]);
+    sensors.add(isLoadcellMeasurementValid(i));
+  }
+  JsonArray history = doc["events"].to<JsonArray>();
+  for (size_t i = 0; i < count; ++i) {
+    JsonObject entry = history.add<JsonObject>();
+    entry["at_ms"] = events[i].atMillis;
+    entry["event"] = events[i].event;
+    entry["detail"] = events[i].detail;
+    entry["mode"] = events[i].mode;
+    entry["running"] = events[i].running;
+    entry["spraying"] = events[i].spraying;
+    JsonArray levels = entry["gpio_high"].to<JsonArray>();
+    JsonArray active = entry["active_nozzles"].to<JsonArray>();
+    for (int channel = 0; channel < 4; ++channel) {
+      levels.add((events[i].gpioMask & (1U << channel)) != 0);
+      active.add((events[i].activeMask & (1U << channel)) != 0);
+    }
+  }
+  String body;
+  serializeJson(doc, body);
+  return body;
+}
+
+void handleWebClient() {
+  static WiFiClient client;
+  static String transmitBuffer;
+  static size_t transmitted = 0;
+  static unsigned long acceptedAt = 0;
+  static uint32_t headerTail = 0;
+  static size_t headerBytes = 0;
+  static char requestLine[128] = {};
+  static size_t requestLength = 0;
+  static bool requestLineComplete = false;
+  static bool headersComplete = false;
+  auto closeClient = [&]() {
+    client.stop();
+    transmitBuffer = "";
+    transmitted = 0;
+  };
+  if (!client) {
+    client = webServer.available();
+    if (!client) return;
+    acceptedAt = millis();
+    headerTail = 0;
+    headerBytes = 0;
+    requestLength = 0;
+    requestLine[0] = '\0';
+    requestLineComplete = false;
+    headersComplete = false;
+    transmitBuffer = "";
+    transmitted = 0;
+  }
+  if (millis() - acceptedAt > 1000UL) { closeClient(); return; }
+  if (!headersComplete) {
+    // Bounded parsing: diagnostics must never wait for a browser or delay ST.
+    int budget = 128;
+    while (budget-- > 0 && client.available()) {
+      int next = client.read();
+      if (next < 0) break;
+      if (++headerBytes > 2048) { closeClient(); return; }
+      if (!requestLineComplete) {
+        if (next == '\n') requestLineComplete = true;
+        else if (next != '\r') {
+          if (requestLength + 1 >= sizeof(requestLine)) { closeClient(); return; }
+          requestLine[requestLength++] = static_cast<char>(next);
+          requestLine[requestLength] = '\0';
+        }
+      }
+      headerTail = (headerTail << 8) | static_cast<uint8_t>(next);
+      if (headerTail == 0x0d0a0d0aUL) { headersComplete = true; break; }
+    }
+    if (!headersComplete) return;
+    bool readOnlyGet = strncmp(requestLine, "GET ", 4) == 0;
+    bool supportedPath = strncmp(requestLine, "GET / ", 6) == 0 || strncmp(requestLine, "GET /diagnostics ", 17) == 0;
+    String body = readOnlyGet && supportedPath ? buildControlDiagnosticJson() : "{\"error\":\"Read-only GET /diagnostics\"}";
+    transmitBuffer = readOnlyGet && supportedPath ? "HTTP/1.1 200 OK\r\n" : "HTTP/1.1 404 Not Found\r\n";
+    transmitBuffer += "Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: ";
+    transmitBuffer += String(body.length()) + "\r\n\r\n" + body;
+  }
+  size_t remaining = transmitBuffer.length() - transmitted;
+  size_t chunk = remaining < 512 ? remaining : 512;
+  // NetworkClient::write can retry for seconds. A single nonblocking socket
+  // send per loop keeps display input and spray safety running normally.
+  int written = send(client.fd(), transmitBuffer.c_str() + transmitted, chunk, MSG_DONTWAIT);
+  if (written > 0) transmitted += static_cast<size_t>(written);
+  else if (written == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) { closeClient(); return; }
+  if (transmitted == transmitBuffer.length()) closeClient();
+}
 void initOTA() { 
   if (WiFi.status() != WL_CONNECTED) return;
   ArduinoOTA.setHostname("SmartDiffuser"); ArduinoOTA.setPassword("1234"); 
