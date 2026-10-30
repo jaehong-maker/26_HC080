@@ -121,11 +121,11 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
                 context_key = build_weather_context_key("눈")
             else:
                 if not body.get("region"):
-                    saved_region = db_utils.get_latest_saved_region(device_id)
+                    saved_region = db_utils.get_saved_region(device_id)
                     if saved_region and saved_region in config.REGION_COORDS:
                         region = saved_region
                     else:
-                        voice_region = db_utils.get_voice_region(device_id)
+                        voice_region = db_utils.get_latest_voice_region(device_id)
                         if voice_region and voice_region in config.REGION_COORDS:
                             region = voice_region
                 if not region: region = "서울"
