@@ -34,6 +34,11 @@ float calculateStdDev(int* samples, int count, float average) {
 // [2] LED 애니메이션 및 시각적 피드백
 // ===================================================================================
 
+namespace {
+const char *ledOutputStage = "startup";
+}
+static void recordLedOutput(uint8_t r, uint8_t g, uint8_t b, const char *source);
+
 void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
   strip.setBrightness(ledBrightness); 
   
@@ -49,53 +54,136 @@ void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
   }
   
   strip.show();
+  recordLedOutput(r, g, b, ledOutputStage);
 }
 
 void bootAnimation() {
+  ledOutputStage = "boot-animation";
   for (int i = 0; i < 3; i++) {
     setLedColor(ledR, ledG, ledB); 
     delay(100);
     setLedColor(0, 0, 0); 
     delay(100);
   }
+  ledOutputStage = "runtime";
+}
+
+namespace {
+enum class LedWarning { None, Sensor, Wifi, LowFluid };
+const char *ledStatus = "startup";
+constexpr unsigned long SENSOR_LED_DELAY_MS = 1000;
+constexpr unsigned long WIFI_LED_DELAY_MS = 3000;
+struct LedFaultDebounce {
+  bool active = false;
+  bool ready = false;
+  unsigned long since = 0;
+  unsigned long clearedAt = 0;
+  uint32_t occurrences = 0;
+  constexpr bool update(bool fault, unsigned long now, unsigned long delayMs) {
+    if (!fault) {
+      if (active) clearedAt = now;
+      active = false;
+      ready = false;
+      return false;
+    }
+    if (!active) {
+      active = true;
+      since = now;
+      ++occurrences;
+    }
+    ready = now - since >= delayMs;
+    return ready;
+  }
+};
+LedFaultDebounce sensorLedFault;
+LedFaultDebounce wifiLedFault;
+uint8_t ledSensorInvalidMask = 0;
+bool ledAudioFault = false;
+constexpr size_t LED_OUTPUT_HISTORY_SIZE = 16;
+struct LedOutputEvent {
+  unsigned long atMillis;
+  uint8_t r, g, b;
+  int brightness;
+  int mode;
+  const char *status;
+  const char *source;
+};
+LedOutputEvent ledOutputHistory[LED_OUTPUT_HISTORY_SIZE] = {};
+size_t ledOutputWriteIndex = 0;
+size_t ledOutputHistoryCount = 0;
+uint32_t ledOutputChangeCount = 0;
+uint32_t ledOutputShowCount = 0;
+}
+const char *getLedStatus() { return ledStatus; }
+
+static void recordLedOutput(uint8_t r, uint8_t g, uint8_t b, const char *source) {
+  // Main-loop/boot owned. Record commands sent to the strip, not optical
+  // feedback; unchanged redraws are counted without flooding the history.
+  ++ledOutputShowCount;
+  if (ledOutputHistoryCount) {
+    const LedOutputEvent &last = ledOutputHistory[(ledOutputWriteIndex + LED_OUTPUT_HISTORY_SIZE - 1) % LED_OUTPUT_HISTORY_SIZE];
+    if (last.r == r && last.g == g && last.b == b && last.brightness == ledBrightness &&
+        strcmp(last.status, ledStatus) == 0 && strcmp(last.source, source) == 0) return;
+  }
+  ledOutputHistory[ledOutputWriteIndex] = {millis(), r, g, b, ledBrightness,
+      static_cast<int>(currentMode), ledStatus, source};
+  ledOutputWriteIndex = (ledOutputWriteIndex + 1) % LED_OUTPUT_HISTORY_SIZE;
+  if (ledOutputHistoryCount < LED_OUTPUT_HISTORY_SIZE) ++ledOutputHistoryCount;
+  ++ledOutputChangeCount;
 }
 
 void systemHeartbeat() {
+  const unsigned long currentTime = millis();
+  static unsigned long lastUpdate = 0;
+  static uint16_t hue = 0;
+
+  bool isAnySensorBroken = !isAudioOk;
+  bool isFluidLow = false;
+  ledAudioFault = !isAudioOk;
+  ledSensorInvalidMask = 0;
+  for (int i = 0; i < 4; i++) {
+    const bool valid = isLoadcellMeasurementValid(i);
+    if (!valid) {
+      isAnySensorBroken = true;
+      ledSensorInvalidMask |= (1U << i);
+    }
+    // Match the existing pump cutoff, including a valid zero/empty reading.
+    else if (calculateScentPercent(weights[i]) < Config::MIN_SCENT_PERCENT) isFluidLow = true;
+  }
+  // Presentation debounce only. Sensor validity and immediate relay cutoff
+  // remain in the independent loadcell safety path, without this delay.
+  const bool sensorWarningReady = sensorLedFault.update(isAnySensorBroken, currentTime, SENSOR_LED_DELAY_MS);
+  const bool wifiWarningReady = wifiLedFault.update(WiFi.status() != WL_CONNECTED, currentTime, WIFI_LED_DELAY_MS);
   if (!ledEnabled) {
+    ledStatus = "disabled";
     setLedColor(0, 0, 0);
     return;
   }
 
-  unsigned long currentTime = millis();
-  static unsigned long lastUpdate = 0;
-  static int effectStep = 0;
-  static uint16_t hue = 0;
-
-  // 1. 상태 체크: 센서 고장 및 잔량 부족 확인
-  bool isAnySensorBroken = !isAudioOk; 
-  bool isFluidLow = false;
-
-  for (int i = 0; i < 4; i++) {
-    if (!isSensorOk[i]) isAnySensorBroken = true;
-    if (weights[i] > 0.5f && weights[i] < (Config::EMPTY_WEIGHT + 2.0f)) isFluidLow = true;
+  // All runtime LED writes use this priority, including server/local updates.
+  // Keep sensor and Wi-Fi warnings ahead of the refill indication.
+  LedWarning warning = sensorWarningReady ? LedWarning::Sensor :
+      wifiWarningReady ? LedWarning::Wifi :
+      isFluidLow ? LedWarning::LowFluid : LedWarning::None;
+  static LedWarning previousWarning = LedWarning::None;
+  static unsigned long warningStartedAt = 0;
+  if (warning != previousWarning) {
+    previousWarning = warning;
+    warningStartedAt = currentTime;
+    // A recovered warning must also repaint immediately in rainbow mode.
+    if (warning == LedWarning::None) lastUpdate = currentTime - 20UL;
   }
-
-  // 2. 현재 시스템 상태에 따라 LED 상태 결정 (특수 상태 우선)
-  if (isAnySensorBroken) {
-    if (currentTime - lastUpdate >= 300) { 
-      lastUpdate = currentTime; effectStep = !effectStep;
-      setLedColor(effectStep ? 255 : 0, 0, 0); 
-    }
+  if (warning != LedWarning::None) {
+    const unsigned long interval = warning == LedWarning::Sensor ? 300UL :
+        warning == LedWarning::Wifi ? 600UL : 500UL;
+    const bool on = ((currentTime - warningStartedAt) / interval) % 2 == 0;
+    const bool blue = warning == LedWarning::Wifi;
+    ledStatus = warning == LedWarning::Sensor ? "sensor-or-audio-fault" :
+        blue ? "wifi-disconnected" : "low-fluid";
+    setLedColor(on && !blue ? 255 : 0, 0, on && blue ? 255 : 0);
     return;
   }
-  
-  if (WiFi.status() != WL_CONNECTED) {
-    if (currentTime - lastUpdate >= 600) {
-      lastUpdate = currentTime; effectStep = !effectStep;
-      setLedColor(0, 0, effectStep ? 255 : 0); 
-    }
-    return;
-  }
+  ledStatus = "normal";
 
   // 3. 앱에서 설정한 LED 효과 모드 실행
   switch (ledEffect) {
@@ -120,6 +208,8 @@ void systemHeartbeat() {
           }
           strip.setBrightness(ledBrightness);
           strip.show();
+          uint32_t color = strip.getPixelColor(4);
+          recordLedOutput((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff, "rainbow");
         }
       }
       break;
@@ -143,6 +233,43 @@ void systemHeartbeat() {
   if (isSpraying || isRunning) {
     // 분사 중에는 색상을 조금 더 밝게 하거나 살짝 떨리는 효과를 줄 수 있음
   }
+}
+
+void appendLedDiagnostics(JsonDocument &doc) {
+  const unsigned long now = millis();
+  doc["led_effect"] = static_cast<int>(ledEffect);
+  doc["led_output_trace_kind"] = "commanded-rgb-not-optical-feedback";
+  doc["led_output_show_count"] = ledOutputShowCount;
+  doc["led_output_change_count"] = ledOutputChangeCount;
+  JsonArray output = doc["led_output_events"].to<JsonArray>();
+  const size_t oldest = (ledOutputWriteIndex + LED_OUTPUT_HISTORY_SIZE - ledOutputHistoryCount) % LED_OUTPUT_HISTORY_SIZE;
+  for (size_t i = 0; i < ledOutputHistoryCount; ++i) {
+    const LedOutputEvent &event = ledOutputHistory[(oldest + i) % LED_OUTPUT_HISTORY_SIZE];
+    JsonObject entry = output.add<JsonObject>();
+    entry["at_ms"] = event.atMillis;
+    JsonArray color = entry["rgb"].to<JsonArray>();
+    color.add(event.r); color.add(event.g); color.add(event.b);
+    entry["brightness"] = event.brightness;
+    entry["mode"] = event.mode;
+    entry["status"] = event.status;
+    entry["source"] = event.source;
+  }
+  JsonObject debounce = doc["led_warning_debounce"].to<JsonObject>();
+  debounce["sensor_invalid_mask"] = ledSensorInvalidMask;
+  debounce["audio_fault"] = ledAudioFault;
+  auto addState = [&](const char *name, const LedFaultDebounce &state, unsigned long delayMs) {
+    JsonObject entry = debounce[name].to<JsonObject>();
+    entry["delay_ms"] = delayMs;
+    entry["fault_active"] = state.active;
+    entry["fault_elapsed_ms"] = state.active ? now - state.since : 0;
+    entry["warning_pending"] = state.active && !state.ready;
+    entry["warning_ready"] = state.ready;
+    entry["occurrences"] = state.occurrences;
+    entry["last_started_at_ms"] = state.since;
+    entry["last_cleared_at_ms"] = state.clearedAt;
+  };
+  addState("sensor_or_audio", sensorLedFault, SENSOR_LED_DELAY_MS);
+  addState("wifi", wifiLedFault, WIFI_LED_DELAY_MS);
 }
 
 // ===================================================================================
@@ -215,10 +342,24 @@ constexpr unsigned long READY_WAIT_MS = 250;
 constexpr unsigned long SAMPLE_MAX_AGE_MS = 1500;
 constexpr unsigned long TARE_TIMEOUT_MS = 4000;
 constexpr int TARE_SAMPLES = 10;
+// HX711 settling after reset is typically 400 ms at 10 SPS. No clocks are
+// issued during this guard; the shared 25-pulse reader remains unchanged.
+constexpr unsigned long RESET_SETTLE_MS = 500;
+constexpr unsigned long BOOT_ATTEMPT_MS = 1500;
+constexpr int BOOT_MAX_ATTEMPTS = 3;
+constexpr int BOOT_VALID_FRAMES = 2;
 portMUX_TYPE loadcellStateMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE loadcellClockMux = portMUX_INITIALIZER_UNLOCKED;
 bool loadcellsInitialized = false;
 bool loadcellCalibrating = false;
+bool loadcellPriming = false;
+unsigned long busResetAt = 0;
+uint8_t bootAttempts = 0;
+uint8_t bootFaultMask = 0;
+const char *sensorFaultReason[4] = {"none", "none", "none", "none"};
+unsigned long sensorFaultAt[4] = {};
+int32_t lastRawFrame[4] = {};
+uint32_t loadcellFrameSequence = 0;
 bool offsetKnown[4] = {};
 bool sampleSeen[4] = {};
 bool sensorFaultLatched[4] = {};
@@ -228,14 +369,17 @@ bool waitingForReady = false;
 unsigned long readyWaitStart = 0;
 
 bool measurementValidLocked(int i, unsigned long now) {
-  return loadcellsInitialized && !loadcellCalibrating && offsetKnown[i] &&
+  return loadcellsInitialized && !loadcellCalibrating && !loadcellPriming && offsetKnown[i] &&
          !sensorFaultLatched[i] && sampleSeen[i] && isSensorOk[i] &&
          now - lastSampleMillis[i] <= SAMPLE_MAX_AGE_MS;
 }
 
-void latchSensorFault(int i) {
+void latchSensorFault(int i, const char *reason) {
   portENTER_CRITICAL(&loadcellStateMux);
   sensorFaultLatched[i] = true;
+  sensorFaultReason[i] = reason;
+  sensorFaultAt[i] = millis();
+  if (loadcellPriming) bootFaultMask |= (1U << i);
   isSensorOk[i] = false;
   digitalWrite(Config::SPRAY_PINS[i], HIGH);
   portEXIT_CRITICAL(&loadcellStateMux);
@@ -249,9 +393,12 @@ void resetLoadcellBus() {
   delayMicroseconds(80);
   digitalWrite(LOADCELL_SCK[0], LOW);
   waitingForReady = false;
+  busResetAt = millis();
 }
 
 uint8_t readLoadcellFrame(int32_t raw[4]) {
+  for (int i = 0; i < 4; ++i) raw[i] = 0;
+  if (millis() - busResetAt < RESET_SETTLE_MS) return 0;
   uint8_t ready = 0;
   for (int i = 0; i < 4; ++i) {
     raw[i] = 0;
@@ -287,8 +434,10 @@ uint8_t readLoadcellFrame(int32_t raw[4]) {
     if (raw[i] & 0x800000) raw[i] -= 0x1000000;
     if (raw[i] == -8388608 || raw[i] == 8388607) valid &= ~(1U << i);
     // A channel that missed shared clocks must be reset/tared before reuse.
-    if (!(valid & (1U << i))) latchSensorFault(i);
+    if (!(valid & (1U << i))) latchSensorFault(i, "frame-desync");
+    lastRawFrame[i] = raw[i];
   }
+  ++loadcellFrameSequence;
   return valid;
 }
 
@@ -326,6 +475,7 @@ uint8_t calibrateLoadcells(uint8_t requested, bool persist) {
     portENTER_CRITICAL(&loadcellStateMux);
     offsetKnown[i] = ok;
     sensorFaultLatched[i] = !ok;
+    sensorFaultReason[i] = ok ? "none" : "tare-failed";
     portEXIT_CRITICAL(&loadcellStateMux);
     Serial.printf("[LoadCell %d] tare %s\r\n", i + 1, ok ? "OK" : "TIMEOUT / INVALID");
   }
@@ -335,22 +485,88 @@ uint8_t calibrateLoadcells(uint8_t requested, bool persist) {
   portEXIT_CRITICAL(&loadcellStateMux);
   return success;
 }
+// Boot-only recovery, with outputs already forced off. It validates ADC
+// frames against the saved offsets; it never tares a loaded cartridge.
+void primeLoadcellsAtBoot(uint8_t required) {
+  loadcellPriming = true;
+  uint8_t stable = 0;
+  float values[4] = {};
+  unsigned long sampledAt[4] = {};
+  for (int attempt = 0; attempt < BOOT_MAX_ATTEMPTS; ++attempt) {
+    ++bootAttempts;
+    uint8_t consecutive[4] = {};
+    stable = 0;
+    resetLoadcellBus();
+    const unsigned long started = millis();
+    while (millis() - started < BOOT_ATTEMPT_MS) {
+      int32_t raw[4];
+      const uint32_t previousFrame = loadcellFrameSequence;
+      const uint8_t valid = readLoadcellFrame(raw);
+      if (loadcellFrameSequence != previousFrame) {
+        for (int i = 0; i < 4; ++i) {
+          const float scale = scales[i].get_scale();
+          const float value = ((double)raw[i] - scales[i].get_offset()) / scale;
+          const bool acceptable = (valid & required & (1U << i)) &&
+              isfinite(scale) && scale != 0 && isfinite(value) && value <= 5000 && value >= -500;
+          if (acceptable) {
+            if (consecutive[i] < BOOT_VALID_FRAMES) ++consecutive[i];
+            values[i] = value;
+            sampledAt[i] = millis();
+          } else {
+            consecutive[i] = 0;
+            if ((valid & required & (1U << i)) && (!isfinite(value) || value > 5000 || value < -500))
+              latchSensorFault(i, "out-of-range");
+          }
+        }
+        stable = 0;
+        for (int i = 0; i < 4; ++i) if (consecutive[i] >= BOOT_VALID_FRAMES) stable |= (1U << i);
+        if ((stable & required) == required) break;
+      }
+      esp_task_wdt_reset();
+      delay(2);
+    }
+    if ((stable & required) == required) break;
+  }
+  portENTER_CRITICAL(&loadcellStateMux);
+  for (int i = 0; i < 4; ++i) {
+    const bool ok = (stable & required & (1U << i)) != 0;
+    sensorFaultLatched[i] = !ok;
+    sensorFaultReason[i] = ok ? "none" : !offsetKnown[i] ? "missing-offset" :
+        strcmp(sensorFaultReason[i], "none") == 0 ? "startup-not-stable" : sensorFaultReason[i];
+    sampleSeen[i] = ok;
+    isSensorOk[i] = ok;
+    lastSampleMillis[i] = sampledAt[i];
+  }
+  loadcellPriming = false;
+  portEXIT_CRITICAL(&loadcellStateMux);
+  for (int i = 0; i < 4; ++i) {
+    const bool ok = (stable & required & (1U << i)) != 0;
+    weights[i] = ok ? values[i] : 0.0f;
+    firstWeight[i] = !ok;
+  }
+}
 } // namespace
 
 void initializeLoadcells() {
-  uint8_t missing = 0;
+  uint8_t known = 0;
   for (int i = 0; i < 4; ++i) {
     scales[i].begin(LOADCELL_DT[i], LOADCELL_SCK[i]);
     scales[i].set_scale(calibration_factor);
     String key = "off_" + String(i);
     offsetKnown[i] = prefs.isKey(key.c_str()); // Zero is also a valid saved offset.
-    if (offsetKnown[i]) scales[i].set_offset(prefs.getLong(key.c_str(), 0));
-    else missing |= (1U << i);
+    if (offsetKnown[i]) {
+      scales[i].set_offset(prefs.getLong(key.c_str(), 0));
+      known |= (1U << i);
+    } else {
+      sensorFaultReason[i] = "missing-offset";
+    }
     isSensorOk[i] = false;
   }
   loadcellsInitialized = true;
-  resetLoadcellBus();
-  if (missing) calibrateLoadcells(missing, false);
+  // Missing calibration stays blocked until an explicit empty-platform tare.
+  // Boot never overwrites saved offsets or treats a loaded platform as zero.
+  if (known) primeLoadcellsAtBoot(known);
+  else resetLoadcellBus();
 }
 
 uint8_t tareLoadcells() { return calibrateLoadcells(ALL_LOADCELLS, true); }
@@ -378,7 +594,11 @@ void enforceLoadcellSafety() {
   for (int i = 0; i < 4; ++i) {
     if (!measurementValidLocked(i, now)) {
       // An operating channel remains blocked until a successful tare or reboot.
-      if (!loadcellCalibrating && activeNozzles[i]) sensorFaultLatched[i] = true;
+      if (!loadcellCalibrating && !loadcellPriming && activeNozzles[i] && !sensorFaultLatched[i]) {
+        sensorFaultLatched[i] = true;
+        sensorFaultReason[i] = "stale-active";
+        sensorFaultAt[i] = now;
+      }
       isSensorOk[i] = false;
       digitalWrite(Config::SPRAY_PINS[i], HIGH);
     }
@@ -395,7 +615,7 @@ void monitorWeight() {
     float scale = scales[i].get_scale();
     float value = ((double)raw[i] - scales[i].get_offset()) / scale;
     if (!isfinite(scale) || scale == 0 || !isfinite(value) || value > 5000 || value < -500) {
-      latchSensorFault(i);
+      latchSensorFault(i, "out-of-range");
       continue;
     }
     portENTER_CRITICAL(&loadcellStateMux);
@@ -428,6 +648,39 @@ void resetWeightFilters() {
   for (int i = 0; i < 4; ++i) { sampleSeen[i] = false; isSensorOk[i] = false; }
   portEXIT_CRITICAL(&loadcellStateMux);
   for (int i = 0; i < 4; ++i) { weights[i] = 0; firstWeight[i] = true; }
+}
+
+
+void appendLoadcellDiagnostics(JsonDocument &doc) {
+  struct Snapshot { bool known, seen, latched, valid; unsigned long age, faultAt; const char *reason; };
+  Snapshot state[4];
+  const unsigned long now = millis();
+  portENTER_CRITICAL(&loadcellStateMux);
+  for (int i = 0; i < 4; ++i) {
+    state[i] = {offsetKnown[i], sampleSeen[i], sensorFaultLatched[i], measurementValidLocked(i, now),
+        now - lastSampleMillis[i], sensorFaultAt[i], sensorFaultReason[i]};
+  }
+  portEXIT_CRITICAL(&loadcellStateMux);
+  doc["loadcell_boot_attempts"] = bootAttempts;
+  doc["loadcell_boot_fault_mask"] = bootFaultMask;
+  JsonArray channels = doc["loadcells"].to<JsonArray>();
+  for (int i = 0; i < 4; ++i) {
+    JsonObject entry = channels.add<JsonObject>();
+    entry["channel"] = i + 1;
+    entry["offset_known"] = state[i].known;
+    entry["offset"] = scales[i].get_offset();
+    entry["raw"] = lastRawFrame[i];
+    entry["sample_seen"] = state[i].seen;
+    if (state[i].seen) entry["sample_age_ms"] = state[i].age;
+    else entry["sample_age_ms"] = nullptr;
+    entry["fault_latched"] = state[i].latched;
+    entry["valid"] = state[i].valid;
+    entry["reason"] = !state[i].known ? "missing-offset" : state[i].latched ? state[i].reason :
+        !state[i].seen ? "awaiting-sample" : state[i].age > SAMPLE_MAX_AGE_MS ? "stale-sample" : "ok";
+    entry["fault_at_ms"] = state[i].faultAt;
+    entry["weight_g"] = weights[i];
+    entry["percent"] = calculateScentPercent(weights[i]);
+  }
 }
 
 void printCalibrationInfo() {

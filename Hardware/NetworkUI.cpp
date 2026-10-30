@@ -18,11 +18,16 @@ struct PendingServerResponse {
   bool weatherRefresh;
   bool weatherRetry;
   uint32_t stopGeneration;
+  bool ambientRecommendation;
 };
 static QueueHandle_t serverResponseQueue = nullptr;
 static portMUX_TYPE commandOrderMux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t stopGeneration = 0;
 static int lastSyncedManualScent = 0;
+// Main-loop-owned recommendation diagnostics; separate from POLL snapshots.
+static String lastAmbientRecommendationResponse;
+static unsigned long lastAmbientRecommendationAt = 0;
+static const char *lastAmbientRecommendationDisposition = "none";
 // A matching request/response pair, captured at HTTP transmission rather than
 // enqueue time. Never hold this mutex during HTTP or actuator work.
 struct PollDiagnostic {
@@ -127,9 +132,9 @@ bool initializeServerResponseQueue() {
   return networkQueue != nullptr && serverResponseQueue != nullptr;
 }
 
-static void queueServerResponse(const String &body, bool weatherRefresh, uint32_t requestGeneration, bool weatherRetry = false) {
+static void queueServerResponse(const String &body, bool weatherRefresh, uint32_t requestGeneration, bool weatherRetry = false, bool ambientRecommendation = false) {
   if (!serverResponseQueue) return;
-  PendingServerResponse *message = new (std::nothrow) PendingServerResponse{body, weatherRefresh, weatherRetry, requestGeneration};
+  PendingServerResponse *message = new (std::nothrow) PendingServerResponse{body, weatherRefresh, weatherRetry, requestGeneration, ambientRecommendation};
   if (!message || message->body.length() != body.length()) {
     delete message;
     Serial.println("[Network] Unable to allocate server response; response discarded.");
@@ -247,8 +252,15 @@ void requestWeatherRefresh(const String &region) {
   sendServerRequest(buildWeatherRequestPayload(region));
 }
 
-static bool isWeatherRequestPayload(const String &payload) { return payload.indexOf("\"mode\":\"weather\"") >= 0; }
-static bool shouldProcessNetworkResponse(const String &payload) { return payload.indexOf("\"POLL\"") >= 0 || isWeatherRequestPayload(payload); }
+enum class ServerRequestKind { Ignored, Poll, Weather, AmbientRecommendation };
+static ServerRequestKind classifyServerRequest(const String &payload) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload) || !doc.is<JsonObject>()) return ServerRequestKind::Ignored;
+  if (doc["action"] == "POLL") return ServerRequestKind::Poll;
+  if (doc["mode"] == "weather") return ServerRequestKind::Weather;
+  if (doc["mode"] == "ambient") return ServerRequestKind::AmbientRecommendation;
+  return ServerRequestKind::Ignored;
+}
 static void allowWeatherRetry() { lastWeatherCallMillis = millis() - WEATHER_INTERVAL; }
 static bool isWeatherLikeResponse(const String &serverActiveMode, const String &weatherText, const String &targetRegion, bool isWeatherRefreshResponse) {
   return isWeatherRefreshResponse || serverActiveMode == "weather" || weatherText.length() > 0 || targetRegion.length() > 0;
@@ -386,9 +398,21 @@ void pollServer() {
   }
 }
 
-static void processServerResponse(const String& response, bool isPollRequest = true, bool isWeatherRefreshResponse = false) {
-  if (!isPollRequest) return;
-  JsonDocument doc; if (deserializeJson(doc, response)) return;
+static void applyAmbientMusic(JsonDocument &doc) {
+  int track = doc["music"] | 0;
+  if (track > 0 && track != currentAmbientTrack) {
+    playSound(track);
+    currentAmbientTrack = track;
+    nexSend("t_music.txt=\"" + getTrackName(track) + "\"");
+  }
+}
+
+static void processServerResponse(const String& response, bool isWeatherRefreshResponse = false, bool isAmbientRecommendation = false) {
+  JsonDocument doc;
+  if (deserializeJson(doc, response)) {
+    if (isAmbientRecommendation) lastAmbientRecommendationDisposition = "invalid-json";
+    return;
+  }
 
   if (isWeatherRefreshResponse && currentMode != MODE_WEATHER) {
     Serial.println(C_YELLOW "\r\n[Weather] Ignored stale response after leaving weather mode\r\n" C_RESET);
@@ -398,6 +422,16 @@ static void processServerResponse(const String& response, bool isPollRequest = t
   // 🟢 1. 앱 명령(마패) 확인 및 LED "최우선" 동기화 (함수 맨 위로 끌어올림!)
   bool isAppCmd = (doc["app_command"] == true || doc["pending_cmd"] == true || doc["command_source"] == "app");
   String serverActiveMode = doc["active_mode"] | ""; serverActiveMode.trim();
+  if (isAmbientRecommendation) {
+    // Recommendation responses may omit active_mode. Never let a late one
+    // enter ambient after the user has moved to another mode.
+    if (currentMode != MODE_AMBIENT || (serverActiveMode.length() > 0 && serverActiveMode != "ambient")) {
+      lastAmbientRecommendationDisposition = "discarded-mode";
+      recordControlDiagnostic("ambient-recommend", "discarded-mode");
+      return;
+    }
+    serverActiveMode = "ambient";
+  }
   const bool ambientResponse = serverActiveMode == "ambient";
   bool shouldApplySettings = ambientResponse || canApplyServerSettings() || isAppCmd;
 
@@ -421,7 +455,16 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     ledR = newR; ledG = newG; ledB = newB; ledBrightness = newBright; 
     ledEnabled = newBright > 0 && !(ledR == 0 && ledG == 0 && ledB == 0);
     prefs.putInt("ledBright", ledBrightness); prefs.putUChar("ledR", ledR); prefs.putUChar("ledG", ledG); prefs.putUChar("ledB", ledB); prefs.putBool("ledEnabled", ledEnabled);
-    setLedColor(ledEnabled ? ledR : 0, ledEnabled ? ledG : 0, ledEnabled ? ledB : 0);
+    systemHeartbeat();
+  }
+
+  if (isAmbientRecommendation) {
+    // The mailbox delivers spray commands via POLL. Applying only music/LED
+    // here avoids a second pump start without inventing time-based dedup IDs.
+    applyAmbientMusic(doc);
+    lastAmbientRecommendationDisposition = "music-led-only";
+    recordControlDiagnostic("ambient-recommend", "music-led-only");
+    return;
   }
 
   // 🟢 2. 모드 및 서버 상태 파싱
@@ -462,12 +505,7 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     }
     if (ambientResponse) {
       if (currentMode != MODE_AMBIENT) setSystemMode(MODE_AMBIENT, "Ambient Mode");
-      int track = doc["music"] | 0;
-      if (track > 0 && track != currentAmbientTrack) {
-        playSound(track);
-        currentAmbientTrack = track;
-        nexSend("t_music.txt=\"" + getTrackName(track) + "\"");
-      }
+      applyAmbientMusic(doc);
       if (cmd == 0) {
         markLocalStop();
         stopAmbientSpray();
@@ -568,13 +606,18 @@ void processPendingServerResponse() {
   if (!serverResponseQueue) return;
   PendingServerResponse *message = nullptr;
   if (xQueueReceive(serverResponseQueue, &message, 0) != pdTRUE) return;
-  if (!message->weatherRefresh && !message->weatherRetry) {
+  if (message->ambientRecommendation) {
+    lastAmbientRecommendationResponse = message->body;
+    lastAmbientRecommendationAt = millis();
+    lastAmbientRecommendationDisposition = "received";
+    Serial.println("[Ambient recommendation raw] " + message->body);
+  } else if (!message->weatherRefresh && !message->weatherRetry) {
     Serial.println("[POLL raw] " + message->body);
   }
   if (message->stopGeneration != currentStopGeneration()) {
     // Stops win even when their request predates a local stop. Old starts and
     // settings never reach the actuator/display handlers after the barrier.
-    if (!message->weatherRetry && isExplicitServerStopResponse(message->body)) {
+    if (!message->ambientRecommendation && !message->weatherRetry && isExplicitServerStopResponse(message->body)) {
       JsonDocument stale;
       deserializeJson(stale, message->body);
       if (currentMode == MODE_AMBIENT && stale["active_mode"] == "ambient" && stale["spray"] == 0) {
@@ -583,12 +626,13 @@ void processPendingServerResponse() {
       } else applyServerStop();
     }
     else {
+      if (message->ambientRecommendation) lastAmbientRecommendationDisposition = "discarded-old-generation";
       recordControlDiagnostic("old-response", "discarded");
       Serial.println("[Network] Ignored response requested before the latest stop.");
     }
   }
   else if (message->weatherRetry) allowWeatherRetry();
-  else processServerResponse(message->body, true, message->weatherRefresh);
+  else processServerResponse(message->body, message->weatherRefresh, message->ambientRecommendation);
   delete message;
 }
 
@@ -600,10 +644,13 @@ void networkTaskLoop(void *pvParameters) {
       String payload = currentMsgPtr->body;
       const uint32_t requestGeneration = currentMsgPtr->stopGeneration;
       delete currentMsgPtr;
-      bool isWeatherRefreshResponse = isWeatherRequestPayload(payload); bool shouldProcessResponse = shouldProcessNetworkResponse(payload);
+      const ServerRequestKind requestKind = classifyServerRequest(payload);
+      const bool isWeatherRefreshResponse = requestKind == ServerRequestKind::Weather;
+      const bool isAmbientRecommendation = requestKind == ServerRequestKind::AmbientRecommendation;
+      const bool shouldProcessResponse = requestKind != ServerRequestKind::Ignored;
       isCommunicate = true; initNetworkSession(); HTTPClient http; http.setTimeout(20000);
       
-      const bool isPoll = payload.indexOf("\"POLL\"") >= 0;
+      const bool isPoll = requestKind == ServerRequestKind::Poll;
       if (http.begin(sharedClient, serverName)) {
         http.addHeader("Content-Type", "application/json");
         if (isPoll) beginPollDiagnostic(payload);
@@ -611,7 +658,7 @@ void networkTaskLoop(void *pvParameters) {
         String response;
         if (httpCode == HTTP_CODE_OK || (isPoll && httpCode > 0)) response = http.getString();
         if (isPoll) finishPollDiagnostic(response, httpCode);
-        if (httpCode == HTTP_CODE_OK) { if (shouldProcessResponse) queueServerResponse(response, isWeatherRefreshResponse, requestGeneration); }
+        if (httpCode == HTTP_CODE_OK) { if (shouldProcessResponse) queueServerResponse(response, isWeatherRefreshResponse, requestGeneration, false, isAmbientRecommendation); }
         else { if (isWeatherRefreshResponse) queueServerResponse("", true, requestGeneration, true); Serial.printf(C_RED "⚠️ [Network] HTTP 에러: %d\r\n" C_RESET, httpCode); }
         http.end();
       } else { if (isWeatherRefreshResponse) queueServerResponse("", true, requestGeneration, true); }
@@ -691,7 +738,19 @@ static String buildControlDiagnosticJson() {
   portEXIT_CRITICAL(&diagnosticMux);
 
   JsonDocument doc;
-  doc["diagnostic_version"] = 3;
+  doc["diagnostic_version"] = 8;
+  appendLedDiagnostics(doc);
+  appendLoadcellDiagnostics(doc);
+  doc["led_status"] = getLedStatus();
+  doc["led_enabled"] = ledEnabled;
+  doc["led_brightness"] = ledBrightness;
+  JsonArray ledColor = doc["led_configured_rgb"].to<JsonArray>();
+  ledColor.add(ledR); ledColor.add(ledG); ledColor.add(ledB);
+  doc["low_fluid_threshold_percent"] = Config::MIN_SCENT_PERCENT;
+  doc["last_ambient_recommendation_response"] = lastAmbientRecommendationResponse;
+  doc["last_ambient_recommendation_at_ms"] = lastAmbientRecommendationAt;
+  doc["ambient_recommendation_disposition"] = lastAmbientRecommendationDisposition;
+  doc["ambient_spray_command_source"] = "POLL only";
   doc["poll_device_id"] = "SS";
   PollDiagnostic pollSnapshot;
   const bool pollSnapshotAvailable = pollDiagnosticMutex && xSemaphoreTake(pollDiagnosticMutex, 0) == pdTRUE;

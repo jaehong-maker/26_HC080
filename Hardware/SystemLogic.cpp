@@ -215,6 +215,7 @@ void runSystem() {
   // Reconnection must also run before ambient/sleep branches return.
   manageWiFi();
   runScheduler();
+  if (currentMode != MODE_SLEEP) systemHeartbeat();
 
   if (currentMode == MODE_AMBIENT) { 
     runAmbientMode(); 
@@ -232,7 +233,6 @@ void runSystem() {
     return; 
   } 
 
-  systemHeartbeat(); 
   autoWeatherScheduler(); 
   pollServer(); 
   
@@ -398,7 +398,7 @@ void processLedSettingInput(String input) {
     prefs.putBool("ledEnabled", ledEnabled);
 
     Serial.printf("\r\n✅ LED 설정 완료: R:%d G:%d B:%d 밝기:%d\r\n", ledR, ledG, ledB, ledBrightness);
-    setLedColor(ledR, ledG, ledB); 
+    systemHeartbeat();
     delay(1000);
     setSystemMode(MODE_READY, "Main Menu");
   } else {
@@ -468,7 +468,7 @@ void enterWeatherMode(bool runNow) {
   }
 }
 
-static const float MIN_SPRAY_SCENT_PERCENT = 15.0f;
+static const float MIN_SPRAY_SCENT_PERCENT = Config::MIN_SCENT_PERCENT;
 static bool stopLowFluidActiveNozzles();
 
 void stopAmbientSpray() {
