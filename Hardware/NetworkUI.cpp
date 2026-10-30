@@ -526,7 +526,7 @@ static void processServerResponse(const String& response, bool isPollRequest = t
     if (serverActiveMode == "weather") {
       if (currentMode != MODE_WEATHER) {
         stopSystem();
-        setSystemMode(MODE_WEATHER, "Weather Mode"); showWeatherPageByState(); requestWeatherRefresh(lastWeatherRegion);
+        setSystemMode(MODE_WEATHER, "Weather Mode"); showWeatherPageByState(); requestWeatherRefresh("");
       }
     } 
     else if (serverActiveMode == "manual") {
@@ -676,7 +676,7 @@ void recordAndSendVoice() {
   showPrompt();
 }
 
-void autoWeatherScheduler() { if (currentMode != MODE_WEATHER || isRunning) return; if (millis() - lastWeatherCallMillis >= WEATHER_INTERVAL) requestWeatherRefresh(lastWeatherRegion); }
+void autoWeatherScheduler() { if (currentMode != MODE_WEATHER || isRunning) return; if (millis() - lastWeatherCallMillis >= WEATHER_INTERVAL) requestWeatherRefresh(""); }
 static String buildControlDiagnosticJson() {
   ControlDiagnosticEvent events[DIAGNOSTIC_EVENT_COUNT];
   char lastCommand[sizeof(lastNextionCommand)];
