@@ -219,7 +219,7 @@ void showManualPageForServerScent(int activeScent) {
   showPage(lastManualPage);
 }
 static void exitBlendModeToManual(bool stopRunningBlend) {
-  if (stopRunningBlend && blendSprayActive) { forceAllOff(); myDFPlayer.stop(); isRunning = false; isSpraying = false; for (int i = 0; i < 4; i++) activeNozzles[i] = false; }
+  if (stopRunningBlend && blendSprayActive) { forceAllOff(); stopAudioPlayback(); isRunning = false; isSpraying = false; for (int i = 0; i < 4; i++) activeNozzles[i] = false; }
   blendModeEnabled = false; blendSelection = ""; blendSprayActive = false; pendingManualScent = "";
   currentMode = MODE_MANUAL; nexSend("b_blend.txt=\"blendON\""); lastManualPage = PAGE_MANUAL; showPage(PAGE_MANUAL);
 }

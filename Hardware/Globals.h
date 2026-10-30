@@ -307,6 +307,7 @@ void sensorTaskLoop(void *parameter);
 void forceAllOff();
 void stopSystem();
 void resetManualState();
+void stopAudioPlayback();
 void playSound(int trackNum);
 void bootAnimation();
 void systemHeartbeat();

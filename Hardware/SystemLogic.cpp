@@ -530,7 +530,7 @@ void runSprayLogic() {
         }
 
         int nextTrack = currentSlotTracks[currentPlaylistIdx];
-        myDFPlayer.stop();
+        stopAudioPlayback();
         delay(100);
         myDFPlayer.playMp3Folder(nextTrack);
         lastPlaylistChangeMillis = millis();
@@ -724,7 +724,7 @@ static bool stopLowFluidActiveNozzles() {
 
     if (!hasActiveNozzle) {
         forceAllOff();
-        myDFPlayer.stop();
+        stopAudioPlayback();
         isRunning = false;
         isSpraying = false;
         blendSelection = "";
@@ -771,7 +771,7 @@ void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
   forceAllOff();
   
   if (currentMode != MODE_AMBIENT && !isAlreadyRunningSameCmd) {
-    myDFPlayer.stop();
+    stopAudioPlayback();
   }
   
   isRunning = false;
