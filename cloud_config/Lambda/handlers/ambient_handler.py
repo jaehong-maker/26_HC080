@@ -26,6 +26,32 @@ def handle_ambient(mode, body, device_id, normalized_weights):
             now_kst = _get_kst_now()
             
             state = db_utils.get_device_state(device_id) or {}
+            is_entering_ambient = state.get("active_mode") != "ambient"
+            if (
+                not is_entering_ambient
+                and state.get("ambient_initial_started_at") is not None
+                and not bool(body.get("window_ready", state.get("db_window_ready", False)))
+            ):
+                # Duplicate start requests must not restart the initial spray
+                # or replace its music/LED while the first window is pending.
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({
+                        "result": "SUCCESS",
+                        "status": "SUCCESS",
+                        "message": "Initial ambient measurement in progress",
+                        "active_mode": "ambient",
+                        "active_scent": int(state.get("active_scent", 0)),
+                        "spray": -1,
+                        "cmd": -1,
+                        "app_command": False,
+                        "duration": 0,
+                        "music": 0,
+                        "ambient_context": state.get("ambient_context", ""),
+                        "db_window_ready": False,
+                    }, ensure_ascii=False),
+                }
             db_avg = float(body.get("db_avg", state.get("db_avg", state.get("db_level", 40))))
             db_1hr_avg = float(body.get("db_1hr_avg", state.get("db_1hr_avg", db_avg)))
             is_spike = bool(body.get("is_spike", state.get("is_spike", False)))
@@ -122,11 +148,8 @@ def handle_ambient(mode, body, device_id, normalized_weights):
             )
 
             request_action = str(body.get("action", "") or "").strip().lower()
-            explicit_spray_request = bool(
-                request_action in {"noise", "ambient"}
-                or body.get("force_spray", False)
-            )
-            is_entering_ambient = state.get("active_mode") != "ambient"
+            # Repeated start requests for an existing session are not new runs.
+            explicit_spray_request = bool(body.get("force_spray", False))
             spray_changed = int(spray_code) != int(current_spray)
             should_spray = bool(
                 spray_code > 0
@@ -148,7 +171,7 @@ def handle_ambient(mode, body, device_id, normalized_weights):
             COOLDOWN_SECONDS = 3 # 향 교체 직후의 최소 보호 시간 (짧은 간격 허용)
             is_blocked = False
             
-            if should_spray and spray_changed:
+            if should_spray and spray_changed and not is_entering_ambient:
                 try:
                     last_time = datetime.fromisoformat(last_time_str)
                     if (now_kst - last_time).total_seconds() < COOLDOWN_SECONDS:
@@ -210,14 +233,19 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                 db_stddev,
             )
 
-            duration = _parse_int(body.get("duration", config.AMBIENT_DURATION_SECONDS), config.AMBIENT_DURATION_SECONDS)
+            # The server owns the initial duration even if an older client
+            # supplies duration=3. Later bucket changes remain short pulses.
+            duration = (
+                int(config.AMBIENT_INITIAL_DURATION_SECONDS)
+                if is_entering_ambient
+                else _parse_int(body.get("duration", config.AMBIENT_DURATION_SECONDS), config.AMBIENT_DURATION_SECONDS)
+            )
 
             new_capacity = current_capacity
             if should_spray:
                 usage = duration * config.CONSUMPTION_PER_SEC
                 new_capacity = round(max(0.0, current_capacity - usage), 2)
-                db_utils.update_device_state(device_id, now_kst.isoformat(), new_capacity, spray_code, preserved_weights)
-                db_utils.manage_mailbox(
+                saved_command = db_utils.manage_mailbox(
                     device_id,
                     spray_code,
                     context_key,
@@ -226,7 +254,26 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                     save_active_scent=spray_code,
                     save_led=led_dict,
                     save_music=music_code,
+                    save_ambient_window_start=int(now_kst.timestamp()) if is_entering_ambient else None,
+                    expected_initial_state=state if is_entering_ambient else None,
                 )
+                if saved_command != spray_code:
+                    latest_state = db_utils.get_device_state(device_id) or {}
+                    return {
+                        "statusCode": 200,
+                        "headers": {"Content-Type": "application/json"},
+                        "body": json.dumps({
+                            "result": "SUCCESS",
+                            "message": "Ambient start superseded or not saved",
+                            "active_mode": latest_state.get("active_mode", "ready"),
+                            "active_scent": int(latest_state.get("active_scent", 0)),
+                            "spray": -1,
+                            "app_command": False,
+                            "duration": 0,
+                            "music": 0,
+                        }, ensure_ascii=False),
+                    }
+                db_utils.update_device_state(device_id, now_kst.isoformat(), new_capacity, spray_code, preserved_weights)
             else:
                 db_utils.state_table.update_item(
                     Key={"deviceId": device_id},

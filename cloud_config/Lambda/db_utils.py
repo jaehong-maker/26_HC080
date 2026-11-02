@@ -819,6 +819,8 @@ def manage_mailbox(
     save_active_scent=None,
     save_led=None,
     save_music=None,
+    save_ambient_window_start=None,
+    expected_initial_state=None,
 ):
     try:
         if save_cmd is not None:
@@ -852,10 +854,39 @@ def manage_mailbox(
                 update_exp += ", current_music = :music"
                 exp_vals[":music"] = int(save_music)
 
+            if save_ambient_window_start is not None:
+                # Start a fresh measurement session with the initial command.
+                # Its first hardware POLL establishes the first sample time.
+                update_exp += (
+                    ", ambient_initial_started_at = :aws, db_window_started_at = :aws, "
+                    "db_samples = :empty_samples, db_last_sample_time = :zero, "
+                    "db_window_ready = :not_ready, ambient_loud_since = :zero, "
+                    "ambient_sustained_loud = :not_ready REMOVE auto_stop_time"
+                )
+                exp_vals[":aws"] = int(save_ambient_window_start)
+                exp_vals[":empty_samples"] = []
+                exp_vals[":zero"] = 0
+                exp_vals[":not_ready"] = False
+
+            write_options = {}
+            if expected_initial_state is not None:
+                # Claim the initial run once, and reject a start superseded by
+                # a stop/mode change while its recommendation was in flight.
+                conditions = []
+                for field in ("active_mode", "last_mode_change_time"):
+                    if field in expected_initial_state:
+                        token = ":expected_" + field
+                        conditions.append(field + " = " + token)
+                        exp_vals[token] = expected_initial_state[field]
+                    else:
+                        conditions.append("attribute_not_exists(" + field + ")")
+                write_options["ConditionExpression"] = " AND ".join(conditions)
+
             state_table.update_item(
                 Key={"deviceId": device_id},
                 UpdateExpression=update_exp,
                 ExpressionAttributeValues=exp_vals,
+                **write_options,
             )
             logger.info(f"[Mailbox_Write] ID:{device_id} Cmd:{save_cmd}")
             return int(save_cmd)
@@ -891,6 +922,8 @@ def manage_mailbox(
         return -1, get_saved_region(device_id), 3
     except Exception as e:
         logger.error(f"Mailbox Error: {e}")
+        if expected_initial_state is not None:
+            return None
         return -1, get_saved_region(device_id), 3
 
 
