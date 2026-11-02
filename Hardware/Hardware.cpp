@@ -390,6 +390,45 @@ bool firstWeight[4] = {true, true, true, true};
 unsigned long lastSampleMillis[4] = {};
 bool waitingForReady = false;
 unsigned long readyWaitStart = 0;
+constexpr unsigned long RECOVERY_STABLE_MS = 1000;
+constexpr unsigned long RECOVERY_MAX_GAP_MS = 250;
+constexpr uint8_t RECOVERY_MIN_FRAMES = 10;
+constexpr float RECOVERY_MAX_SPREAD_G = 5.0f;
+struct LoadcellRecoveryWindow {
+  unsigned long since = 0;
+  unsigned long lastAt = 0;
+  uint8_t frames = 0;
+  float minimum = 0;
+  float maximum = 0;
+};
+LoadcellRecoveryWindow recoveryWindow[4];
+bool sensorRecoveryAllowed[4] = {};
+uint32_t sensorFaultCount[4] = {};
+uint32_t sensorRecoveryCount[4] = {};
+int32_t sensorFaultRaw[4] = {};
+long sensorFaultOffset[4] = {};
+float sensorFaultScale[4] = {};
+const char *sensorLastFaultReason[4] = {"none", "none", "none", "none"};
+
+static bool updateLoadcellRecoveryWindow(LoadcellRecoveryWindow &state,
+    bool eligible, float value, unsigned long now) {
+  if (!eligible) { state.frames = 0; return false; }
+  const float nextMin = value < state.minimum ? value : state.minimum;
+  const float nextMax = value > state.maximum ? value : state.maximum;
+  if (state.frames == 0 || now - state.lastAt > RECOVERY_MAX_GAP_MS ||
+      nextMax - nextMin > RECOVERY_MAX_SPREAD_G) {
+    state.frames = 1;
+    state.since = now;
+    state.minimum = value;
+    state.maximum = value;
+  } else {
+    if (state.frames < 255) ++state.frames;
+    state.minimum = nextMin;
+    state.maximum = nextMax;
+  }
+  state.lastAt = now;
+  return state.frames >= RECOVERY_MIN_FRAMES && now - state.since >= RECOVERY_STABLE_MS;
+}
 
 bool measurementValidLocked(int i, unsigned long now) {
   return loadcellsInitialized && !loadcellCalibrating && !loadcellPriming && offsetKnown[i] &&
@@ -397,11 +436,26 @@ bool measurementValidLocked(int i, unsigned long now) {
          now - lastSampleMillis[i] <= SAMPLE_MAX_AGE_MS;
 }
 
-void latchSensorFault(int i, const char *reason) {
+void latchSensorFault(int i, const char *reason, int32_t raw) {
   portENTER_CRITICAL(&loadcellStateMux);
+  // Preserve the first rejected frame; later faults must never make a shared
+  // clock desynchronization eligible for automatic recovery.
+  if (!sensorFaultLatched[i]) {
+    ++sensorFaultCount[i];
+    sensorFaultAt[i] = millis();
+    sensorFaultRaw[i] = raw;
+    sensorFaultOffset[i] = scales[i].get_offset();
+    sensorFaultScale[i] = scales[i].get_scale();
+    sensorLastFaultReason[i] = reason;
+    sensorFaultReason[i] = reason;
+    sensorRecoveryAllowed[i] = strcmp(reason, "out-of-range") == 0;
+  }
+  if (strcmp(reason, "out-of-range") != 0) {
+    sensorRecoveryAllowed[i] = false;
+    sensorFaultReason[i] = reason;
+  }
+  recoveryWindow[i].frames = 0;
   sensorFaultLatched[i] = true;
-  sensorFaultReason[i] = reason;
-  sensorFaultAt[i] = millis();
   if (loadcellPriming) bootFaultMask |= (1U << i);
   isSensorOk[i] = false;
   digitalWrite(Config::SPRAY_PINS[i], HIGH);
@@ -457,7 +511,7 @@ uint8_t readLoadcellFrame(int32_t raw[4]) {
     if (raw[i] & 0x800000) raw[i] -= 0x1000000;
     if (raw[i] == -8388608 || raw[i] == 8388607) valid &= ~(1U << i);
     // A channel that missed shared clocks must be reset/tared before reuse.
-    if (!(valid & (1U << i))) latchSensorFault(i, "frame-desync");
+    if (!(valid & (1U << i))) latchSensorFault(i, "frame-desync", raw[i]);
     lastRawFrame[i] = raw[i];
   }
   ++loadcellFrameSequence;
@@ -498,6 +552,8 @@ uint8_t calibrateLoadcells(uint8_t requested, bool persist) {
     portENTER_CRITICAL(&loadcellStateMux);
     offsetKnown[i] = ok;
     sensorFaultLatched[i] = !ok;
+    sensorRecoveryAllowed[i] = false;
+    recoveryWindow[i].frames = 0;
     sensorFaultReason[i] = ok ? "none" : "tare-failed";
     portEXIT_CRITICAL(&loadcellStateMux);
     Serial.printf("[LoadCell %d] tare %s\r\n", i + 1, ok ? "OK" : "TIMEOUT / INVALID");
@@ -538,7 +594,7 @@ void primeLoadcellsAtBoot(uint8_t required) {
           } else {
             consecutive[i] = 0;
             if ((valid & required & (1U << i)) && (!isfinite(value) || value > 5000 || value < -500))
-              latchSensorFault(i, "out-of-range");
+              latchSensorFault(i, "out-of-range", raw[i]);
           }
         }
         stable = 0;
@@ -554,6 +610,8 @@ void primeLoadcellsAtBoot(uint8_t required) {
   for (int i = 0; i < 4; ++i) {
     const bool ok = (stable & required & (1U << i)) != 0;
     sensorFaultLatched[i] = !ok;
+    sensorRecoveryAllowed[i] = false;
+    recoveryWindow[i].frames = 0;
     sensorFaultReason[i] = ok ? "none" : !offsetKnown[i] ? "missing-offset" :
         strcmp(sensorFaultReason[i], "none") == 0 ? "startup-not-stable" : sensorFaultReason[i];
     sampleSeen[i] = ok;
@@ -616,11 +674,18 @@ void enforceLoadcellSafety() {
   unsigned long now = millis();
   for (int i = 0; i < 4; ++i) {
     if (!measurementValidLocked(i, now)) {
-      // An operating channel remains blocked until a successful tare or reboot.
+      // A stale operating channel requires an explicit tare or reboot.
       if (!loadcellCalibrating && !loadcellPriming && activeNozzles[i] && !sensorFaultLatched[i]) {
         sensorFaultLatched[i] = true;
         sensorFaultReason[i] = "stale-active";
         sensorFaultAt[i] = now;
+        sensorRecoveryAllowed[i] = false;
+        recoveryWindow[i].frames = 0;
+        ++sensorFaultCount[i];
+        sensorFaultRaw[i] = lastRawFrame[i];
+        sensorFaultOffset[i] = scales[i].get_offset();
+        sensorFaultScale[i] = scales[i].get_scale();
+        sensorLastFaultReason[i] = "stale-active";
       }
       isSensorOk[i] = false;
       digitalWrite(Config::SPRAY_PINS[i], HIGH);
@@ -633,22 +698,36 @@ void monitorWeight() {
   if (!loadcellsInitialized) return;
   int32_t raw[4];
   uint8_t valid = readLoadcellFrame(raw);
+  bool pumpsIdle = !isRunning && !isSpraying;
+  for (int i = 0; i < 4; ++i) {
+    if (activeNozzles[i] || digitalRead(Config::SPRAY_PINS[i]) != HIGH) pumpsIdle = false;
+  }
   for (int i = 0; i < 4; ++i) {
     if (!(valid & (1U << i))) continue;
     float scale = scales[i].get_scale();
     float value = ((double)raw[i] - scales[i].get_offset()) / scale;
     if (!isfinite(scale) || scale == 0 || !isfinite(value) || value > 5000 || value < -500) {
-      latchSensorFault(i, "out-of-range");
+      latchSensorFault(i, "out-of-range", raw[i]);
       continue;
     }
     portENTER_CRITICAL(&loadcellStateMux);
+    const unsigned long now = millis();
+    const bool eligible = sensorFaultLatched[i] && sensorRecoveryAllowed[i] &&
+        offsetKnown[i] && !loadcellCalibrating && !loadcellPriming && pumpsIdle;
+    bool recovered = updateLoadcellRecoveryWindow(recoveryWindow[i], eligible, value, now);
+    if (recovered) {
+      sensorFaultLatched[i] = false;
+      sensorRecoveryAllowed[i] = false;
+      ++sensorRecoveryCount[i];
+    }
     bool usable = offsetKnown[i] && !sensorFaultLatched[i] && !loadcellCalibrating;
     if (usable) {
       sampleSeen[i] = true;
-      lastSampleMillis[i] = millis();
+      lastSampleMillis[i] = now;
       isSensorOk[i] = true;
     }
     portEXIT_CRITICAL(&loadcellStateMux);
+    if (recovered) recordControlDiagnostic("loadcell-recovered", String(i + 1) + ":stable-idle");
     if (usable) {
       weights[i] = firstWeight[i] ? value : value * 0.15f + weights[i] * 0.85f;
       firstWeight[i] = false;
@@ -675,23 +754,48 @@ void resetWeightFilters() {
 
 
 void appendLoadcellDiagnostics(JsonDocument &doc) {
-  struct Snapshot { bool known, seen, latched, valid; unsigned long age, faultAt; const char *reason; };
+  struct Snapshot {
+    bool known, seen, latched, valid;
+    unsigned long age, faultAt;
+    const char *reason;
+    bool recoveryAllowed;
+    uint8_t recoveryFrames;
+    uint32_t faults, recoveries;
+    int32_t faultRaw;
+    long faultOffset;
+    float faultScale;
+    const char *lastFaultReason;
+  };
   Snapshot state[4];
   const unsigned long now = millis();
   portENTER_CRITICAL(&loadcellStateMux);
   for (int i = 0; i < 4; ++i) {
     state[i] = {offsetKnown[i], sampleSeen[i], sensorFaultLatched[i], measurementValidLocked(i, now),
         now - lastSampleMillis[i], sensorFaultAt[i], sensorFaultReason[i]};
+    state[i].recoveryAllowed = sensorRecoveryAllowed[i];
+    state[i].recoveryFrames = recoveryWindow[i].frames;
+    state[i].faults = sensorFaultCount[i];
+    state[i].recoveries = sensorRecoveryCount[i];
+    state[i].faultRaw = sensorFaultRaw[i];
+    state[i].faultOffset = sensorFaultOffset[i];
+    state[i].faultScale = sensorFaultScale[i];
+    state[i].lastFaultReason = sensorLastFaultReason[i];
   }
   portEXIT_CRITICAL(&loadcellStateMux);
   doc["loadcell_boot_attempts"] = bootAttempts;
   doc["loadcell_boot_fault_mask"] = bootFaultMask;
+  doc["loadcell_recovery_policy"] = "out-of-range-only-stable-all-pumps-idle";
+  doc["loadcell_recovery_min_frames"] = RECOVERY_MIN_FRAMES;
+  doc["loadcell_recovery_min_ms"] = RECOVERY_STABLE_MS;
+  doc["loadcell_recovery_max_gap_ms"] = RECOVERY_MAX_GAP_MS;
+  doc["loadcell_recovery_max_spread_g"] = RECOVERY_MAX_SPREAD_G;
   JsonArray channels = doc["loadcells"].to<JsonArray>();
   for (int i = 0; i < 4; ++i) {
     JsonObject entry = channels.add<JsonObject>();
     entry["channel"] = i + 1;
     entry["offset_known"] = state[i].known;
     entry["offset"] = scales[i].get_offset();
+    entry["scale"] = scales[i].get_scale();
     entry["raw"] = lastRawFrame[i];
     entry["sample_seen"] = state[i].seen;
     if (state[i].seen) entry["sample_age_ms"] = state[i].age;
@@ -701,6 +805,18 @@ void appendLoadcellDiagnostics(JsonDocument &doc) {
     entry["reason"] = !state[i].known ? "missing-offset" : state[i].latched ? state[i].reason :
         !state[i].seen ? "awaiting-sample" : state[i].age > SAMPLE_MAX_AGE_MS ? "stale-sample" : "ok";
     entry["fault_at_ms"] = state[i].faultAt;
+    entry["fault_count"] = state[i].faults;
+    entry["recovery_count"] = state[i].recoveries;
+    entry["recovery_allowed"] = state[i].recoveryAllowed;
+    entry["recovery_candidate_frames"] = state[i].recoveryFrames;
+    if (state[i].faults) {
+      JsonObject fault = entry["last_fault"].to<JsonObject>();
+      fault["reason"] = state[i].lastFaultReason;
+      fault["at_ms"] = state[i].faultAt;
+      fault["raw"] = state[i].faultRaw;
+      fault["offset"] = state[i].faultOffset;
+      fault["scale"] = state[i].faultScale;
+    }
     entry["weight_g"] = weights[i];
     entry["percent"] = calculateScentPercent(weights[i]);
   }

@@ -385,7 +385,11 @@ void pollServer() {
     if (WiFi.status() == WL_CONNECTED) {
       JsonDocument doc; doc["action"] = "POLL"; doc["deviceId"] = "SS"; doc["status"] = lastWebMessage;
       MicrophoneLevel snapshot;
-      doc["db_level"] = getMicrophoneLevel(snapshot) ? snapshot.level : 0; doc["volume"] = currentVolume / 3; doc["led_br"] = ledEnabled ? ledBrightness : 0;
+      const bool microphoneValid = getMicrophoneLevel(snapshot);
+      doc["microphone_valid"] = microphoneValid;
+      // Missing/expired capture is not silence. A measured zero stays valid.
+      if (microphoneValid) doc["db_level"] = snapshot.level;
+      doc["volume"] = currentVolume / 3; doc["led_br"] = ledEnabled ? ledBrightness : 0;
       int currentPlayingTrack = 0;
       if (currentMode == MODE_AMBIENT) currentPlayingTrack = currentAmbientTrack; 
       else if (isRunning && currentSlotTracksCount > 0) currentPlayingTrack = currentSlotTracks[currentPlaylistIdx];
@@ -735,7 +739,7 @@ static String buildControlDiagnosticJson() {
   portEXIT_CRITICAL(&diagnosticMux);
 
   JsonDocument doc;
-  doc["diagnostic_version"] = 11;
+  doc["diagnostic_version"] = 13;
   appendLedDiagnostics(doc);
   appendLoadcellDiagnostics(doc);
   doc["led_status"] = getLedStatus();
