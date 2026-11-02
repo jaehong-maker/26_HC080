@@ -767,7 +767,48 @@ bool isRunningManualCommand(int cmd) {
   return currentMode == MODE_MANUAL && isRunning && activeSprayCommand == cmd;
 }
 
+static bool renewAmbientSprayIfUnchanged(int cmd, int dur, unsigned long now) {
+  if (currentMode != MODE_AMBIENT || !isRunning || activeSprayCommand != cmd ||
+      dur <= 0 || dur > MAX_RUN_TIME / 1000 ||
+      now - startTimeMillis >= sprayDuration ||
+      now - startTimeMillis >= (unsigned long)MAX_RUN_TIME) return false;
+
+  uint8_t requestedMask = 0;
+  int digits = cmd;
+  while (digits > 0) {
+    int channel = digits % 10;
+    if (channel < 1 || channel > 4) return false;
+    requestedMask |= 1U << (channel - 1);
+    digits /= 10;
+  }
+  if (requestedMask == 0) return false;
+  for (int i = 0; i < 4; ++i) {
+    bool requested = (requestedMask & (1U << i)) != 0;
+    if (activeNozzles[i] != requested) return false;
+    if (requested && (!isLoadcellMeasurementValid(i) ||
+        calculateScentPercent(weights[i]) < MIN_SPRAY_SCENT_PERCENT)) return false;
+  }
+
+  // Renew only the server-authorized session. Preserve relay levels, the
+  // current on/rest phase and its start time. Safety is checked independently.
+  sprayDuration = static_cast<unsigned long>(dur) * 1000UL;
+  startTimeMillis = now;
+  for (int i = 0; i < 4; ++i) {
+    if (activeNozzles[i]) lastNozzleSprayTime[i] = now;
+  }
+  return true;
+}
+
 void triggerSpray(int cmd, int dur, int music, String txt, bool isWeatherMode) {
+  if (currentMode == MODE_AMBIENT && (dur <= 0 || dur > MAX_RUN_TIME / 1000)) {
+    recordControlDiagnostic("ambient-rejected", "invalid-duration");
+    return;
+  }
+  if (renewAmbientSprayIfUnchanged(cmd, dur, millis())) {
+    lastWebMessage = "성공: " + txt;
+    recordControlDiagnostic("ambient-renew", String(cmd) + ":" + String(dur) + "s");
+    return;
+  }
   static int lastActiveCmd = -1;
   bool isAlreadyRunningSameCmd = (isRunning && lastActiveCmd == cmd);
   lastActiveCmd = cmd;
