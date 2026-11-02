@@ -121,6 +121,44 @@ def _parse_int(value, default=0):
     except Exception:
         return default
 
+def _parse_float(value, default=0.0):
+
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+def _resolve_ambient_effective_db(body, state, default=40.0):
+    """Resolve the sound level used for the ambient context.
+
+    A silence-gap measurement supplied by the device must win over a stored
+    value.  For an app-initiated ambient start, use the latest poll average
+    instead of forcing the old 40 dB default.
+    """
+    body = body if isinstance(body, dict) else {}
+    state = state if isinstance(state, dict) else {}
+
+    body_candidates = (
+        body.get("effective_db"),
+        body.get("db_avg"),
+        body.get("db_level"),
+    )
+    state_candidates = (
+        state.get("db_avg"),
+        state.get("db_level"),
+        state.get("ambient_effective_db"),
+    )
+
+    for value in body_candidates + state_candidates:
+        if value in (None, ""):
+            continue
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            continue
+
+    return max(0.0, _parse_float(default, 40.0))
+
 def _get_ambient_time_slot(now_kst=None):
 
     now_kst = now_kst or _get_kst_now()

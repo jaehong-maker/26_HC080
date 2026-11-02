@@ -11,7 +11,7 @@ import time
 import db_utils
 import api_utils
 import config
-from .common import _to_decimal_list
+from .common import _to_decimal_list, _get_ambient_noise_bucket
 
 logger = logging.getLogger()
 
@@ -95,9 +95,25 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                     or now_epoch - loud_since >= window_seconds
                 )
 
-            became_sustained_loud = sustained_loud and not previous_sustained_loud
-            effective_db = float(previous_state.get("ambient_effective_db", 40))
-            if became_sustained_loud:
+            previous_context = str(previous_state.get("ambient_context", ""))
+            previous_noise_bucket = (
+                previous_context.rsplit("_", 1)[-1]
+                if previous_context else ""
+            )
+            average_noise_bucket, _ = _get_ambient_noise_bucket(db_avg)
+            noise_bucket_changed = bool(
+                ambient_active
+                and window_ready
+                and previous_noise_bucket
+                and average_noise_bucket != previous_noise_bucket
+            )
+            if previous_context:
+                effective_db = float(previous_state.get("ambient_effective_db", db_avg))
+            else:
+                # The first ambient recommendation must use the latest device
+                # measurement, not the legacy fixed 40 dB default.
+                effective_db = db_avg
+            if noise_bucket_changed:
                 effective_db = db_avg
             
             update_exp = (
@@ -150,10 +166,14 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                 logger.error(f"무게 및 소음 DB 업데이트 실패: {e}")
 
             if previous_state.get("active_mode") == "ambient":
-                previous_context = str(previous_state.get("ambient_context", ""))
-                should_reevaluate = became_sustained_loud or not previous_context
+                should_reevaluate = noise_bucket_changed or not previous_context
                 if should_reevaluate:
                     try:
+                        logger.info(
+                            f"[AMBIENT_BUCKET_CHANGE] ID:{device_id} "
+                            f"{previous_noise_bucket or 'None'}->{average_noise_bucket} "
+                            f"Avg:{db_avg} WindowReady:{window_ready}"
+                        )
                         from .ambient_handler import handle_ambient
                         handle_ambient(
                             "ambient",
@@ -166,7 +186,8 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                                 "effective_db": effective_db,
                                 "window_ready": window_ready,
                                 "sustained_loud": sustained_loud,
-                                "music_only": bool(became_sustained_loud),
+                                "music_only": False,
+                                "force_spray": bool(noise_bucket_changed),
                                 "weights": normalized_weights,
                                 "duration": getattr(config, "AMBIENT_DURATION_SECONDS", 3),
                             },

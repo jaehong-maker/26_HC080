@@ -13,7 +13,8 @@ import db_utils
 import api_utils
 
 from .common import (
-    _get_kst_now, _parse_int, _build_ambient_context
+    _get_kst_now, _parse_int, _build_ambient_context,
+    _resolve_ambient_effective_db,
 )
 
 logger = logging.getLogger()
@@ -29,12 +30,9 @@ def handle_ambient(mode, body, device_id, normalized_weights):
             db_1hr_avg = float(body.get("db_1hr_avg", state.get("db_1hr_avg", db_avg)))
             is_spike = bool(body.get("is_spike", state.get("is_spike", False)))
             db_stddev = float(body.get("db_stddev", state.get("db_stddev", 0.0)))
-            effective_db = float(
-                body.get("effective_db", state.get("ambient_effective_db", 40))
-            )
+            effective_db = _resolve_ambient_effective_db(body, state)
 
             context_key, time_slot, noise_bucket, _ = _build_ambient_context(effective_db, now_kst)
-            db_utils.seed_ambient_defaults()
 
             last_time_str = state.get('last_spray_time', "2000-01-01T00:00:00")
             current_capacity = float(state.get('current_capacity', config.MAX_CAPACITY))
@@ -63,23 +61,24 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                     db_1hr_avg,
                     False,
                     db_stddev,
+                    current_music=current_music,
                 )
                 music_code = int(music_code or 0)
-                if music_code <= 0 or music_code == current_music:
-                    music_code = (current_music % 25) + 1
 
                 db_utils.state_table.update_item(
                     Key={"deviceId": device_id},
                     UpdateExpression=(
                         "set active_mode = :mode, current_music = :music, "
                         "ambient_last_eval_time = :t, ambient_context = :ctx, "
-                        "db_avg = :avg, db_stddev = :std, is_spike = :sp"
+                        "ambient_effective_db = :edb, db_avg = :avg, "
+                        "db_stddev = :std, is_spike = :sp"
                     ),
                     ExpressionAttributeValues={
                         ":mode": "ambient",
                         ":music": music_code,
                         ":t": int(now_kst.timestamp()),
                         ":ctx": context_key,
+                        ":edb": Decimal(str(round(effective_db, 2))),
                         ":avg": Decimal(str(round(db_avg, 2))),
                         ":std": Decimal(str(round(db_stddev, 2))),
                         ":sp": False,
@@ -94,6 +93,7 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({
                         "status": "SUCCESS",
+                        "result": "SUCCESS",
                         "message": "Music changed after sustained noise",
                         "spray": -1,
                         "app_command": False,
@@ -102,6 +102,7 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                         "active_mode": "ambient",
                         "active_scent": int(current_spray),
                         "ambient_context": context_key,
+                        "ambient_effective_db": round(effective_db, 2),
                         "db_level": int(state.get("db_level", db_avg)),
                         "db_avg": round(db_avg, 2),
                         "db_stddev": round(db_stddev, 2),
@@ -109,21 +110,42 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                     }, ensure_ascii=False),
                 }
 
-            # Roulette Scent Recommendation (AI 제외, 소음 알고리즘 단독 사용)
-            best_kind, ambient_scores = db_utils.get_ambient_recommendation(context_key, device_id)
-            spray_code = db_utils.get_spray_from_kind(device_id, best_kind)
-            if not spray_code:
-                spray_code = 1
+            # AI/룰렛 없이 소음 구간의 고정 향기 우선순위에서 선택함.
+            best_kind, scent_priority = db_utils.get_ambient_scent_recommendation(
+                noise_bucket,
+                device_id,
+            )
+            spray_code = db_utils.get_spray_from_kind(device_id, best_kind) or 0
+            logger.info(
+                f"[AMBIENT_FIXED_SCENT] ID:{device_id} Bucket:{noise_bucket} "
+                f"Priority:{scent_priority} Kind:{best_kind} Pump:{spray_code}"
+            )
 
+            request_action = str(body.get("action", "") or "").strip().lower()
+            explicit_spray_request = bool(
+                request_action in {"noise", "ambient"}
+                or body.get("force_spray", False)
+            )
             is_entering_ambient = state.get("active_mode") != "ambient"
             spray_changed = int(spray_code) != int(current_spray)
             should_spray = bool(
                 spray_code > 0
-                and (is_entering_ambient or current_spray <= 0 or spray_changed)
+                and (
+                    explicit_spray_request
+                    or is_entering_ambient
+                    or current_spray <= 0
+                    or spray_changed
+                )
+            )
+            logger.info(
+                f"[AMBIENT_SPRAY_DECISION] ID:{device_id} "
+                f"Action:{request_action or '-'} Explicit:{explicit_spray_request} "
+                f"Entering:{is_entering_ambient} Current:{current_spray} "
+                f"Target:{spray_code} ShouldSpray:{should_spray}"
             )
 
             # 10-second Cooldown & Fast-track logic (테스트용)
-            COOLDOWN_SECONDS = 10 # 향 교체 직후의 최소 보호 시간
+            COOLDOWN_SECONDS = 3 # 향 교체 직후의 최소 보호 시간 (짧은 간격 허용)
             is_blocked = False
             
             if should_spray and spray_changed:
@@ -141,13 +163,15 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                     UpdateExpression=(
                         "set active_mode = :mode, active_scent = :scent, "
                         "ambient_last_eval_time = :t, ambient_context = :ctx, "
-                        "db_avg = :avg, db_stddev = :std, noise_type = :nt, is_spike = :sp"
+                        "ambient_effective_db = :edb, db_avg = :avg, "
+                        "db_stddev = :std, noise_type = :nt, is_spike = :sp"
                     ),
                     ExpressionAttributeValues={
                         ":mode": "ambient",
                         ":scent": int(current_spray),
                         ":t": int(now_kst.timestamp()),
                         ":ctx": context_key,
+                        ":edb": Decimal(str(round(effective_db, 2))),
                         ":avg": Decimal(str(round(db_avg, 2))),
                         ":std": Decimal(str(round(db_stddev, 2))),
                         ":nt": state.get("noise_type", "분석 중"),
@@ -159,13 +183,17 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({
                         "status": "SUCCESS",
+                        "result": "SUCCESS",
                         "message": "Cooldown active",
-                        "spray": 0,
+                        "cmd": -1,
+                        "spray": -1,
+                        "app_command": False,
                         "duration": 0,
                         "active_mode": "ambient",
                         "active_scent": int(current_spray),
                         "context": f"Ambient_{context_key}",
                         "ambient_context": context_key,
+                        "ambient_effective_db": round(effective_db, 2),
                         "db_level": int(state.get("db_level", db_avg)),
                         "db_avg": round(db_avg, 2),
                         "db_stddev": round(db_stddev, 2),
@@ -222,11 +250,13 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                 Key={"deviceId": device_id},
                 UpdateExpression=(
                     "set ambient_last_eval_time = :t, ambient_context = :ctx, "
-                    "db_avg = :avg, db_stddev = :std, noise_type = :nt, is_spike = :sp"
+                    "ambient_effective_db = :edb, db_avg = :avg, "
+                    "db_stddev = :std, noise_type = :nt, is_spike = :sp"
                 ),
                 ExpressionAttributeValues={
                     ":t": int(now_kst.timestamp()),
                     ":ctx": context_key,
+                    ":edb": Decimal(str(round(effective_db, 2))),
                     ":avg": Decimal(str(round(db_avg, 2))),
                     ":std": Decimal(str(round(db_stddev, 2))),
                     ":nt": state.get("noise_type", "분석 중"),
@@ -234,7 +264,7 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                 },
             )
 
-            response_spray = int(spray_code) if should_spray else 0
+            response_spray = int(spray_code) if should_spray else -1
             response_duration = int(duration) if should_spray else 0
             response_active_scent = int(spray_code) if should_spray else int(current_spray)
 
@@ -261,9 +291,11 @@ def handle_ambient(mode, body, device_id, normalized_weights):
 
             response_payload = {
                 "status": "SUCCESS",
+                "result": "SUCCESS",
                 "message": "Ambient command created" if should_spray else "Ambient recommendation unchanged",
                 "cmd": response_spray,
                 "spray": response_spray,
+                "app_command": bool(should_spray),
                 "duration": response_duration,
                 "music": int(music_code),
                 "led_r": int(led_dict.get("led_r", 255)),
@@ -272,6 +304,7 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                 "led_bright": int(led_dict.get("led_bright", 150)),
                 "context": f"Ambient_{context_key}",
                 "ambient_context": context_key,
+                "ambient_effective_db": round(effective_db, 2),
                 "active_mode": "ambient",
                 "active_scent": response_active_scent,
                 "db_level": int(state.get("db_level", db_avg)),

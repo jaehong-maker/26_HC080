@@ -9,7 +9,13 @@ from datetime import datetime, timedelta, timezone
 import config
 import db_utils
 import api_utils
-from .common import _parse_int, _get_ambient_scent_ids, build_weather_context_key
+from .common import (
+    _parse_int,
+    _get_ambient_scent_ids,
+    _build_ambient_context,
+    _resolve_ambient_effective_db,
+    build_weather_context_key,
+)
 
 logger = logging.getLogger()
 
@@ -34,6 +40,10 @@ def handle_feedback(action, mode, body, device_id):
         ambient_context = str(body.get("ambient_context", "") or "").strip()
         feedback_context = str(body.get("context", "") or "").strip()
         feedback_data = str(body.get("data", "") or "").strip()
+        feedback_data_context = ""
+        if feedback_data:
+            feedback_parts = feedback_data.split("_", 1)
+            feedback_data_context = feedback_parts[1] if len(feedback_parts) > 1 else feedback_data
 
         # 명시적인 새 피드백은 이전 대체 향의 자동 +1 예약을 항상 취소함
         db_utils.cancel_implicit_like(device_id)
@@ -42,10 +52,8 @@ def handle_feedback(action, mode, body, device_id):
             ambient_context = feedback_context[len("Ambient_"):]
 
         if not ambient_context and feedback_data:
-            feedback_parts = feedback_data.split("_", 1)
-            data_context = feedback_parts[1] if len(feedback_parts) > 1 else ""
-            if data_context.startswith("Ambient_"):
-                ambient_context = data_context[len("Ambient_"):]
+            if feedback_data_context.startswith("Ambient_"):
+                ambient_context = feedback_data_context[len("Ambient_"):]
 
         if not ambient_context and mode == "ambient":
             if feedback_context:
@@ -53,6 +61,23 @@ def handle_feedback(action, mode, body, device_id):
             elif feedback_data:
                 feedback_parts = feedback_data.split("_", 1)
                 ambient_context = feedback_parts[1] if len(feedback_parts) > 1 else feedback_data
+
+        # The current app labels noise feedback as NOISE_ANALYSIS and sends it
+        # with mode=manual. Recover the canonical ambient context from the
+        # device state so the feedback updates AmbientWeights.
+        is_noise_feedback = (
+            feedback_context == "NOISE_ANALYSIS"
+            or feedback_data_context == "NOISE_ANALYSIS"
+            or ambient_context == "NOISE_ANALYSIS"
+        )
+        if is_noise_feedback and ambient_context == "NOISE_ANALYSIS":
+            ambient_context = ""
+        if not ambient_context and is_noise_feedback:
+            ambient_state = db_utils.get_device_state(device_id) or {}
+            ambient_context = str(ambient_state.get("ambient_context", "") or "").strip()
+            if not ambient_context:
+                effective_db = _resolve_ambient_effective_db({}, ambient_state)
+                ambient_context, _, _, _ = _build_ambient_context(effective_db)
 
         if ambient_context.startswith("Ambient_"):
             ambient_context = ambient_context[len("Ambient_"):]
@@ -107,9 +132,13 @@ def handle_feedback(action, mode, body, device_id):
                     "statusCode": 200,
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({
+                        "result": "SUCCESS",
+                        "status": "SUCCESS",
                         "message": "Ambient feedback saved",
                         "spray": response_spray,
                         "cmd": response_spray if not is_like else 0,
+                        "active_mode": "ambient",
+                        "active_scent": response_spray if not is_like else spray_no,
                         "context": f"Ambient_{ambient_context}",
                         "ambient_context": ambient_context,
                         "value": weight_val,

@@ -87,11 +87,11 @@ AMBIENT_DURATION_SECONDS = 3
 AMBIENT_ANALYSIS_WINDOW_SECONDS = 180
 AMBIENT_SAMPLE_GAP_RESET_SECONDS = 10
 AMBIENT_MAX_SAMPLES = 600
-AMBIENT_HIGH_THRESHOLD_DB = 40
-AMBIENT_RECOVERY_THRESHOLD_DB = 40
+AMBIENT_HIGH_THRESHOLD_DB = 60
+AMBIENT_RECOVERY_THRESHOLD_DB = 60
 AMBIENT_SPIKE_DELTA_DB = 15
-AMBIENT_SCENT_IDS = KIND_IDS
-AMBIENT_DEVICE_SCENT_IDS = KIND_IDS
+AMBIENT_SCENT_IDS = (1, 2, 3, 4, 5, 6)
+AMBIENT_DEVICE_SCENT_IDS = (1, 2, 3, 4, 5, 6)
 
 AMBIENT_TIME_SLOTS = (
     {"label": "Dawn", "start": 0, "end": 6},
@@ -101,7 +101,56 @@ AMBIENT_TIME_SLOTS = (
 )
 
 AMBIENT_NOISE_BUCKETS = (
-    {"label": "Quiet", "min": 0, "max": 40},
-    {"label": "Moderate", "min": 40, "max": 70},
-    {"label": "Loud", "min": 70, "max": None},
+    {"label": "Quiet", "min": 0, "max": 60},
+    {"label": "Moderate", "min": 60, "max": 80},
+    {"label": "Loud", "min": 80, "max": None},
 )
+
+# 소음 구간별 고정 향기 우선순위. 7번 물은 앰비언트 추천에서 제외함.
+AMBIENT_SCENTS_BY_BUCKET = {
+    # 라벤더 -> 바닐라 -> 센달우드 -> 패츄리 -> 시트러스 -> 페퍼민트
+    "Quiet": (5, 6, 2, 3, 1, 4),
+    # 센달우드 -> 패츄리 -> 라벤더 -> 시트러스 -> 바닐라 -> 페퍼민트
+    "Moderate": (2, 3, 5, 1, 6, 4),
+    # 페퍼민트 -> 시트러스 -> 라벤더 -> 센달우드 -> 패츄리 -> 바닐라
+    "Loud": (4, 1, 5, 2, 3, 6),
+}
+
+# 설정 오류로 구간 목록이 비어 있을 때만 사용할 안전 대체 순서임.
+AMBIENT_SCENT_FALLBACK_ORDER = (5, 6, 2, 3, 4, 1)
+
+# 앱의 실제 1~25번 트랙 목록을 곡의 분위기로 분류함.
+# 번호 크기는 분위기와 무관하며 26번은 테스트 음원이므로 추천에서 제외함.
+AMBIENT_MUSIC_CATALOG = {
+    1: {"title": "여행", "artist": "볼빨간사춘기"},
+    2: {"title": "Love Lee", "artist": "악동 뮤지션"},
+    3: {"title": "바이,썸머", "artist": "아이유"},
+    4: {"title": "Ai Wo Tsutaetaidatoka", "artist": "아이묭"},
+    5: {"title": "사계 - 봄", "artist": "비발디"},
+    6: {"title": "숲", "artist": "최유리"},
+    7: {"title": "salty", "artist": "데이먼스이어"},
+    8: {"title": "서울의 잠 못 이루는 밤", "artist": "10CM X 이수현"},
+    9: {"title": "언제라도 어디에서라도", "artist": "정승환"},
+    10: {"title": "사계 - 가을", "artist": "비발디"},
+    11: {"title": "비", "artist": "폴킴"},
+    12: {"title": "소나기", "artist": "이클립스"},
+    13: {"title": "잠 못 드는 밤 비는 내리고", "artist": "아이유"},
+    14: {"title": "비 오는날 듣기좋은 노래", "artist": "에픽하이"},
+    15: {"title": "사계 - 여름", "artist": "비발디"},
+    16: {"title": "첫 눈", "artist": "EXO"},
+    17: {"title": "겨울잠", "artist": "아이유"},
+    18: {"title": "첫 눈처럼 너에게 가겠다", "artist": "에일리"},
+    19: {"title": "눈사람", "artist": "정승환"},
+    20: {"title": "사계 - 겨울", "artist": "비발디"},
+    21: {"title": "킬링벌스", "artist": "창모"},
+    22: {"title": "밤바다", "artist": "최유리"},
+    23: {"title": "round and round", "artist": "jisokury"},
+    24: {"title": "lemon tree", "artist": "정예원"},
+    25: {"title": "그때가좋았어", "artist": "oysters"},
+}
+
+AMBIENT_MUSIC_BY_BUCKET = {
+    "Quiet": (6, 7, 8, 9, 11, 17, 18, 19, 22, 23, 24, 25),
+    "Moderate": (3, 4, 10, 12, 13, 14, 16, 20),
+    "Loud": (1, 2, 5, 15, 21),
+}

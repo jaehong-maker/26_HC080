@@ -11,6 +11,55 @@ import db_utils
 import api_utils
 from .common import build_weather_context_key, logic_weather_mode, logic_emotion_mode
 logger = logging.getLogger()
+
+
+def _kind_digits(kind_code):
+    return [int(value) for value in str(kind_code or "") if value.isdigit() and int(value) > 0]
+
+
+def _get_diary_safe_scent_policy(device_id):
+    """일기 모드에서 고장 카트리지를 제외한 향기와 펌프 매핑을 반환함."""
+    disabled_sprays = {
+        int(spray)
+        for spray in getattr(config, "DIARY_DISABLED_SPRAY_SLOTS", (2,))
+    }
+    mapping = {
+        int(spray): int(kind)
+        for spray, kind in db_utils.get_spray_mapping(device_id).items()
+    }
+    safe_kinds = []
+    for spray, kind in sorted(mapping.items()):
+        if spray in disabled_sprays or kind not in getattr(config, "SCENT_KINDS", {}):
+            continue
+        if kind not in safe_kinds:
+            safe_kinds.append(kind)
+    return mapping, disabled_sprays, safe_kinds
+
+
+def _is_diary_kind_allowed(kind_code, allowed_kinds):
+    requested_kinds = _kind_digits(kind_code)
+    allowed = set(int(kind) for kind in allowed_kinds)
+    return bool(requested_kinds) and all(kind in allowed for kind in requested_kinds)
+
+
+def _map_diary_kind_to_safe_pumps(kind_code, mapping, disabled_sprays):
+    pumps = []
+    for target_kind in _kind_digits(kind_code):
+        matching_pump = next(
+            (
+                int(spray)
+                for spray, kind in sorted(mapping.items())
+                if int(spray) not in disabled_sprays and int(kind) == target_kind
+            ),
+            None,
+        )
+        if matching_pump is None:
+            return 0
+        if matching_pump not in pumps:
+            pumps.append(matching_pump)
+    return int("".join(str(pump) for pump in pumps)) if pumps else 0
+
+
 # 날씨, 감정 등 메인 모드의 로직을 수행함
 def handle_core_modes(action, mode, body, device_id, normalized_weights, region):
     weight_g = normalized_weights[0]
@@ -24,6 +73,9 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
     context_key = "Unknown"
     weather_text = ""
     emotion_summary = ""
+    diary_mapping = {}
+    diary_disabled_sprays = set()
+    diary_allowed_kinds = []
     if mode == "emotion":
         user_emo_tag = body.get("user_emotion", "평범")
         diary_full_text = body.get("diary_text", user_emo_tag) 
@@ -34,7 +86,23 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
             u_email,
             contexts=[context_key],
         )
-        active_kinds = db_utils._active_kinds(device_id)
+        if context_key == "AI_DIARY":
+            diary_mapping, diary_disabled_sprays, diary_allowed_kinds = (
+                _get_diary_safe_scent_policy(device_id)
+            )
+            active_kinds = diary_allowed_kinds
+            if not active_kinds:
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({
+                        "result": "FAIL",
+                        "spray": 0,
+                        "message": "2번 카트리지를 제외하면 사용할 수 있는 향기가 없습니다."
+                    }, ensure_ascii=False)
+                }
+        else:
+            active_kinds = db_utils._active_kinds(device_id)
         kind_descriptions = {
             1: "1번(시트러스: 상쾌/에너지/우울감 극복)",
             2: "2번(센달우드: 차분/집중/안정)",
@@ -70,6 +138,20 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
             kind_code = int(gemini_kind_str) if gemini_kind_str != "0" else 0
         except Exception:
             kind_code = 0
+        if kind_code > 0 and context_key == "AI_DIARY" and not _is_diary_kind_allowed(
+            kind_code,
+            diary_allowed_kinds,
+        ):
+            original_kind_code = kind_code
+            kind_code = int(diary_allowed_kinds[0])
+            ai_reason = (
+                f"{ai_reason} 2번 카트리지 보호를 위해 "
+                f"다른 장착 향기({kind_code}번)로 대체했습니다."
+            )
+            logger.warning(
+                f"[DIARY_CARTRIDGE_GUARD_AI] ID:{device_id} "
+                f"Kind:{original_kind_code}->{kind_code} DisabledPumps:{sorted(diary_disabled_sprays)}"
+            )
         if kind_code == 0:
             return {
                 "statusCode": 200,
@@ -120,14 +202,24 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
                 spray_code, result_text, logic_name, duration = 4, "테스트 눈 실행", "Test_Weather", 3
                 context_key = build_weather_context_key("눈")
             else:
-                if not body.get("region"):
-                    voice_region = db_utils.get_latest_voice_region(device_id)
-                    if voice_region and voice_region in config.REGION_COORDS:
-                        region = voice_region
+                explicit_region = str(
+                    body.get("region") or body.get("data") or ""
+                ).strip()
+                if explicit_region:
+                    region = explicit_region
+                    logger.info(f"[WEATHER_REGION] Explicit request region selected: {region}")
+                else:
+                    # 앱에서 변경하여 사용자 정보에 저장된 지역을 최우선으로 사용함.
+                    # 앱 저장 지역이 없을 때만 최근 응답 지역을 대체값으로 사용함.
+                    saved_region = db_utils.get_saved_region(device_id)
+                    if saved_region and saved_region in config.REGION_COORDS:
+                        region = saved_region
+                        logger.info(f"[WEATHER_REGION] App saved region selected: {region}")
                     else:
-                        saved_region = db_utils.get_saved_region(device_id)
-                        if saved_region and saved_region in config.REGION_COORDS:
-                            region = saved_region
+                        voice_region = db_utils.get_voice_region(device_id)
+                        if voice_region and voice_region in config.REGION_COORDS:
+                            region = voice_region
+                            logger.info(f"[WEATHER_REGION] Recent response region selected: {region}")
                 if not region: region = "서울"
                 if region not in config.REGION_COORDS: region = "서울"
                 db_utils.remember_last_region(device_id, region)
@@ -160,11 +252,42 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
     if spray_code > 0:
         u_email = body.get("email")
         final_scent, ai_msg = db_utils.get_personalized_scent(device_id, context_key, spray_code, u_email)
+        if context_key == "AI_DIARY" and not _is_diary_kind_allowed(
+            final_scent,
+            diary_allowed_kinds,
+        ):
+            blocked_scent = final_scent
+            final_scent = int(diary_allowed_kinds[0])
+            ai_msg = "2번 카트리지 보호 대체"
+            logger.warning(
+                f"[DIARY_CARTRIDGE_GUARD_PERSONALIZATION] ID:{device_id} "
+                f"Kind:{blocked_scent}->{final_scent}"
+            )
         if final_scent != spray_code:
             logger.info(f"[AI Change] {spray_code} -> {final_scent} ({ai_msg})")
             result_text += f" -> [취향 맞춤: {final_scent}번]"
             spray_code = final_scent
-        mapped_pump, fb_msg = db_utils.get_smart_spray_mapping(device_id, spray_code)
+        if context_key == "AI_DIARY":
+            mapped_pump = _map_diary_kind_to_safe_pumps(
+                spray_code,
+                diary_mapping,
+                diary_disabled_sprays,
+            )
+            fb_msg = ""
+            if mapped_pump <= 0:
+                safe_kind = int(diary_allowed_kinds[0])
+                mapped_pump = _map_diary_kind_to_safe_pumps(
+                    safe_kind,
+                    diary_mapping,
+                    diary_disabled_sprays,
+                )
+                result_text += f" -> [2번 카트리지 제외: {safe_kind}번 향기로 대체]"
+            logger.info(
+                f"[DIARY_SAFE_PUMP] ID:{device_id} Kind:{spray_code} "
+                f"Pump:{mapped_pump} Disabled:{sorted(diary_disabled_sprays)}"
+            )
+        else:
+            mapped_pump, fb_msg = db_utils.get_smart_spray_mapping(device_id, spray_code)
         result_text += fb_msg
         spray_code = mapped_pump
     if spray_code > 0 and action != "START" and "_PREVIEW" not in action:

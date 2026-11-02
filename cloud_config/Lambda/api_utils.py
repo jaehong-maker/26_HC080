@@ -20,43 +20,6 @@ logger = logging.getLogger()
 s3 = boto3.client("s3")
 transcribe = boto3.client('transcribe')
 
-
-def _sanitize_diary_led(led_dict):
-    """감정 일기 모드의 노란색 LED만 주황색으로 보정함."""
-    try:
-        raw_red = int(led_dict.get("led_r", -1))
-        raw_green = int(led_dict.get("led_g", -1))
-        raw_blue = int(led_dict.get("led_b", -1))
-        raw_brightness = int(led_dict.get("led_bright", -1))
-        if min(raw_red, raw_green, raw_blue, raw_brightness) < 0:
-            return led_dict
-
-        red = max(0, min(255, raw_red))
-        green = max(0, min(255, raw_green))
-        blue = max(0, min(255, raw_blue))
-        brightness = max(0, min(255, raw_brightness))
-
-        is_yellow = (
-            red >= 180
-            and green >= 170
-            and blue <= 100
-            and abs(red - green) <= 100
-        )
-        if is_yellow:
-            logger.info(
-                f"[DIARY_LED_COLOR_GUARD] ({red}, {green}, {blue}) -> (255, 100, 0)"
-            )
-            return {
-                "led_r": 255,
-                "led_g": 100,
-                "led_b": 0,
-                "led_bright": brightness,
-            }
-    except Exception as e:
-        logger.warning(f"Diary LED color guard error: {e}")
-    return led_dict
-
-
 # Gemini AI에게 감정 일기 분석 및 추천을 요청함
 def ask_gemini_recommendation(diary_text, user_history_text, slot_info_str="1번 슬롯, 2번 슬롯, 3번 슬롯, 4번 슬롯"):
     """
@@ -85,15 +48,15 @@ def ask_gemini_recommendation(diary_text, user_history_text, slot_info_str="1번
     3. 단일 향기가 어울리면 1개만 고르고 시너지가 나면 2개를 블렌딩해라.
     4. 반드시 [현재 디퓨저에 장착된 향기 목록]에 명시된 향기 고유 번호 중에서만 골라주어야 한다. 장착되지 않은 향기는 절대 추천 금지.
     5. 추천할 향기의 고유 번호를 숫자로 대답해줘. (예: 1번 향기 1개면 1, 1번 향기와 3번 향기를 블렌딩하면 13, 2번과 4번이면 24). 그 숫자를 'kind' 필드에 넣어!! (슬롯 번호가 아니라 향기 고유 번호야!)
-    6. 감정에 따라 조명 색상(led_r, led_g, led_b)도 다양하게 추천해줘. 단, 글자가 잘 보이지 않으므로 노란색은 절대 추천하지 마. 노란색이 가장 어울리는 감정이라면 노란색 대신 주황색을 추천해. 다른 색상은 제한하지 않으며, 기기 특성상 연하게 보일 수 있으므로 파스텔톤을 피하고 진한 색상으로 설정해.
+    6. 감정에 따라 조명 색상(led_r, led_g, led_b)도 매우 다양하게 추천해줘. 단, 기기(LED) 특성상 빛이 연하게(하얗게) 보일 수 있으므로 파스텔톤을 피하고 매우 진한 색상이 되도록 해줘! (RGB 중 가장 큰 값은 무조건 255에 가깝게, 작은 값은 0에 가깝게 원색 위주로 설정할 것)
     7. 오늘 하루 사용자의 감정을 요약한 짧은 문장을 'emotion_summary' 필드에 작성해줘.
     8. 사용자의 핵심 감정을 나타내는 단어(예: 피곤함, 우울함, 행복함, 짜증남)를 'emotion_tag' 필드에 작성해줘.
     9. 중요★ 'reason' 필드에 향기를 추천하는 이유를 적을 때 절대 번호(예: 1번 시트러스, 2번 라벤더)를 언급하지 마! 반드시 향기 이름(예: 시트러스 향과 라벤더 향)으로 자연스럽게 적어주세요.
     10. [매우 중요/금지어] 생성하는 모든 텍스트('reason', 'emotion_summary' 등) 내부에 "정지", "중지", "대기", "꺼짐", "멈춰", "스톱" 이라는 단어를 절대 사용하지 마세요. (기기 오작동을 유발할 수 있습니다. 대신 "해소", "완화", "휴식" 등의 단어로 대체하세요.)
     
     반드시 아래와 같은 순수 JSON 형태로만 대답하고 다른 설명글은 절대 쓰지 마: 
-    (주의사항: 아래 값은 형식 예시일 뿐 그대로 베끼지 말고, 감정에 맞춰 매번 다채롭게 정해줘.):
-    {{"kind": 15, "led_r": 0, "led_g": 100, "led_b": 255, "led_bright": 200, "emotion_summary": "오늘 하루 감정은 짜증과 피곤함임.", "emotion_tag": "피곤함", "reason": "사용자의 일기 내용을 분석한 결과, 피로를 풀어줄 시트러스 향과 마음을 진정시킬 라벤더 향기를 추천함. 또한 편안한 푸른빛 조명으로 설정하였습니다."}}
+    (주의사항: 아래 예시의 값(15, 255, 100, 0)은 단지 예시일 뿐, 그대로 베끼지 말고, 매번 새롭게 분석하여 다채로운 값을 넣어줘!):
+    {{"kind": 15, "led_r": 255, "led_g": 100, "led_b": 0, "led_bright": 200, "emotion_summary": "오늘 하루 감정은 짜증과 피곤함임.", "emotion_tag": "피곤함", "reason": "사용자의 일기 내용을 분석한 결과, 피로를 풀어줄 시트러스 향과 마음을 진정시킬 라벤더 향기를 추천함. 또한 편안한 오렌지빛 조명으로 설정하였습니다."}}
     """
 
     payload = json.dumps({
@@ -124,7 +87,6 @@ def ask_gemini_recommendation(diary_text, user_history_text, slot_info_str="1번
                     "led_b": int(result_json.get("led_b", -1)),
                     "led_bright": int(result_json.get("led_bright", -1))
                 }
-                led_dict = _sanitize_diary_led(led_dict)
                 
                 logger.info(f"[Gemini API 성공] 추천 코드(kind): {kind_str}, 이유: {reason}, 조명: {led_dict}, 감정요약: {emotion_summary}, 감정태그: {emotion_tag}")
                 return kind_str, reason, led_dict, emotion_summary, emotion_tag

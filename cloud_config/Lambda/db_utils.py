@@ -202,6 +202,39 @@ def seed_ambient_defaults():
     return seeded
 
 
+def get_ambient_scent_recommendation(noise_bucket, device_id):
+    """소음 구간의 고정 우선순위에서 장착된 첫 향기를 반환함."""
+    try:
+        ambient_ids = set(_ambient_scent_ids())
+        ambient_ids.discard(7)
+
+        configured = getattr(config, "AMBIENT_SCENTS_BY_BUCKET", {})
+        priority = [
+            int(kind)
+            for kind in configured.get(str(noise_bucket), ())
+            if int(kind) in ambient_ids
+        ]
+        fallback_order = [
+            int(kind)
+            for kind in getattr(config, "AMBIENT_SCENT_FALLBACK_ORDER", ())
+            if int(kind) in ambient_ids and int(kind) not in priority
+        ]
+
+        installed_kinds = set(_active_kinds(device_id)) & ambient_ids
+        for kind in priority + fallback_order:
+            if kind in installed_kinds:
+                return kind, priority
+
+        logger.warning(
+            f"[AMBIENT_SCENT_UNAVAILABLE] ID:{device_id} "
+            f"Bucket:{noise_bucket} Installed:{sorted(installed_kinds)}"
+        )
+        return 0, priority
+    except Exception as e:
+        logger.error(f"Ambient Fixed Scent Recommendation Error: {e}")
+        return 0, []
+
+
 # 룰렛 알고리즘으로 앰비언트 모드 향기를 추천함
 def get_ambient_recommendation(context_key, device_id):
     """
@@ -876,21 +909,38 @@ def remember_last_region(device_id, region):
         logger.error(f"Remember Region Error: {e}")
 
 
-# get_saved_region 처리를 담당함
-def get_saved_region(device_id):
+# 앱의 사용자 정보에 저장된 지역만 조회함
+def get_latest_saved_region(device_id):
     try:
-        resp = user_table.scan(
-            FilterExpression=Attr("deviceId").eq(str(device_id)),
-            ProjectionExpression="#r",
-            ExpressionAttributeNames={"#r": "region"},
-        )
-        items = resp.get("Items") or []
-        if items:
-            region = str(items[0].get("region", "") or "").strip()
-            if region:
-                return region
+        scan_kwargs = {
+            "FilterExpression": Attr("deviceId").eq(str(device_id)),
+            "ProjectionExpression": "#r",
+            "ExpressionAttributeNames": {"#r": "region"},
+            "ConsistentRead": True,
+        }
+        while True:
+            resp = user_table.scan(**scan_kwargs)
+            for item in resp.get("Items") or []:
+                region = str(item.get("region", "") or "").strip()
+                if region in config.REGION_COORDS:
+                    logger.info(f"[APP_REGION] Device:{device_id} Region:{region}")
+                    return region
+
+            last_evaluated_key = resp.get("LastEvaluatedKey")
+            if not last_evaluated_key:
+                break
+            scan_kwargs["ExclusiveStartKey"] = last_evaluated_key
     except Exception as e:
         logger.error(f"User Region Load Error: {e}")
+
+    return ""
+
+
+# 앱 저장 지역을 우선하고, 없으면 상태/로그 지역까지 조회하는 범용 함수임
+def get_saved_region(device_id):
+    app_region = get_latest_saved_region(device_id)
+    if app_region:
+        return app_region
 
     try:
         res = state_table.get_item(Key={"deviceId": device_id})
@@ -936,6 +986,11 @@ def get_latest_voice_region(device_id="SS"):
         logger.error(f"Voice Region Load Error: {e}")
 
     return ""
+
+
+# core_mode_handler 첨부본과 호환되는 최근 응답 지역 조회 함수임
+def get_voice_region(device_id="SS"):
+    return get_latest_voice_region(device_id)
 
 
 # get_device_state 처리를 담당함
