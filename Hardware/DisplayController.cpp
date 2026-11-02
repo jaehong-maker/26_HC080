@@ -130,6 +130,14 @@ static void syncDisplayModeToServer(const String &activeMode, int activeScent = 
   if (WiFi.status() != WL_CONNECTED) return;
   sendServerRequest(buildDisplayModePayload(activeMode, activeScent));
 }
+static void syncAmbientStopToServer() {
+  // DISPLAY_MODE ready alone leaves the server's pending spray mailbox intact.
+  // STOP_ALL clears that mailbox and the ambient mode. Enqueue after the local
+  // stop barrier, before the next POLL, using the existing FIFO request order.
+  JsonDocument doc;
+  doc["action"] = "STOP_ALL";
+  String payload; serializeJson(doc, payload); sendServerRequest(payload);
+}
 static void syncLocalIntensityToServer() {
   JsonDocument doc; doc["action"] = "SET_INTENSITY"; doc["intensity"] = currentIntensity;
   String payload; serializeJson(doc, payload); sendServerRequest(payload);
@@ -355,18 +363,23 @@ static void toggleBlendMode() {
 
 static void enterManualSprayFromDisplay() {
   bool leavingWeatherMode = currentMode == MODE_WEATHER;
+  bool leavingAmbientMode = currentMode == MODE_AMBIENT;
   currentMode = MODE_MANUAL;
-  if (!leavingWeatherMode) return;
+  if (!leavingWeatherMode && !leavingAmbientMode) return;
 
   markLocalStop();
   stopSystem();
-  clearWeatherState();
-  Serial.println(C_CYAN "\r\n[Display] Weather spray stopped before manual spray\r\n" C_RESET);
+  if (leavingWeatherMode) clearWeatherState();
+  Serial.println(C_CYAN "\r\n[Display] Previous automatic mode stopped before manual spray\r\n" C_RESET);
 }
 
 static void openManualModeFromDisplay() {
   showManualPageByState();
-  if (currentMode != MODE_WEATHER) setSystemMode(MODE_MANUAL, "Manual Mode");
+  // Navigation alone must not change the active automatic session. Otherwise
+  // the next ambient POLL re-enters MODE_AMBIENT via stopSystem(), cancelling
+  // the current spray/music even when that POLL contains no new command.
+  if (currentMode != MODE_WEATHER && currentMode != MODE_AMBIENT) setSystemMode(MODE_MANUAL, "Manual Mode");
+  recordControlDiagnostic("manual-view", "navigation-only");
 }
 
 static void openWeatherModeFromDisplay() {
@@ -455,6 +468,7 @@ void handleNextionCmd(const String &cmd) {
     SystemMode modeBeforeStop = currentMode; lastManualPage = PAGE_MANUAL; markLocalStop(); setSystemMode(MODE_READY, "Stopped"); pendingManualScent = "";
     if (modeBeforeStop == MODE_WEATHER) { hasWeatherSnapshot = false; hasTempHumiSnapshot = false; lastWeatherLabel = ""; lastWeatherIconId = 0; syncDisplayModeToServer("ready"); showWeatherOffPage(); } 
     else if (modeBeforeStop == MODE_MANUAL) { lastStoppedManualScent = (currentDisplayPage >= PAGE_MANUAL_SCENT_BASE + 1 && currentDisplayPage <= PAGE_MANUAL_SCENT_BASE + 4) ? (currentDisplayPage - PAGE_MANUAL_SCENT_BASE) : 0; manualModeOffMillis = millis(); syncDisplayModeToServer("ready"); showPage(PAGE_MANUAL); } 
+    else if (modeBeforeStop == MODE_AMBIENT) { syncAmbientStopToServer(); showPage(PAGE_MODE_SELECT); }
     else showPage(PAGE_MODE_SELECT);
   } 
   else if (cmd == "BM") toggleBlendMode(); 

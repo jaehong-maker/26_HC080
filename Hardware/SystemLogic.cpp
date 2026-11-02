@@ -485,20 +485,24 @@ void runSprayLogic() {
   checkSafety();
   if (!isRunning) return;
 
+  // Ambient duration is the whole server-authorized session, including rest
+  // phases. Expire it before any pulse can resume, keeping music/LED intact.
+  if (currentMode == MODE_AMBIENT && millis() - startTimeMillis >= sprayDuration) {
+    stopAmbientSpray();
+    return;
+  }
+
   if (stopLowFluidActiveNozzles()) return;
 
+  const unsigned long pulseDuration = currentMode == MODE_AMBIENT ? 3000UL : sprayDuration;
   if (isSpraying) {
-    if (millis() - prevMotorMillis >= sprayDuration) {
-      if (currentMode == MODE_AMBIENT) {
-        stopAmbientSpray();
-        return;
-      }
+    if (millis() - prevMotorMillis >= pulseDuration) {
       forceAllOff();
       isSpraying = false;
       prevMotorMillis = millis();
       recordControlDiagnostic("pulse-off", "rest");
     }
-  } else if (currentMode != MODE_DEMO && currentMode != MODE_AMBIENT && millis() - prevMotorMillis >= REST_TIME) {
+  } else if (currentMode != MODE_DEMO && millis() - prevMotorMillis >= REST_TIME) {
     forceAllOff();
     bool enabledAny = false;
     for (int i = 0; i < 4; i++) {

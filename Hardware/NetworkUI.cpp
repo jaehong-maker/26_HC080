@@ -735,7 +735,7 @@ static String buildControlDiagnosticJson() {
   portEXIT_CRITICAL(&diagnosticMux);
 
   JsonDocument doc;
-  doc["diagnostic_version"] = 10;
+  doc["diagnostic_version"] = 11;
   appendLedDiagnostics(doc);
   appendLoadcellDiagnostics(doc);
   doc["led_status"] = getLedStatus();
@@ -774,6 +774,8 @@ static String buildControlDiagnosticJson() {
   doc["microphone_valid"] = getMicrophoneLevel(microphoneSnapshot);
   doc["ambient_pump_safety_limit_ms"] = MAX_RUN_TIME;
   doc["ambient_pump_safety_scope"] = "per_server_spray_excludes_waiting";
+  doc["ambient_duration_scope"] = "session-including-pulse-and-rest";
+  doc["spray_rest_ms"] = REST_TIME;
   doc["db_level"] = currentDbLevel;
   doc["ambient_track"] = currentAmbientTrack;
   doc["spray_duration_ms"] = sprayDuration;
