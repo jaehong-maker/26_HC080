@@ -1,382 +1,166 @@
-# 주변 소음(dB)을 바탕으로 무드와 향기를 자동 추천하는 앰비언트 모드 핸들러임
-
-
-#기본 대기 모드 및 기본 조명 제어를 담당하는 람다 핸들러
+# 주변 소음의 초기 측정, 향 선택 및 유한 시간 분사 명령을 처리함.
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import config
 import db_utils
 import api_utils
-
-from .common import (
-    _get_kst_now, _parse_int, _build_ambient_context,
-    _resolve_ambient_effective_db,
-)
+from .common import _get_kst_now, _build_ambient_context, _resolve_ambient_effective_db
 
 logger = logging.getLogger()
 
-# 주변 소음에 맞춰 조명과 향기를 추천함
+
+def _ambient_wait_response(state, message):
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({
+            "result": "SUCCESS", "status": "SUCCESS", "message": message,
+            "active_mode": state.get("active_mode", "ready"),
+            "active_scent": int(state.get("active_scent", 0)),
+            "spray": -1, "cmd": -1, "app_command": False, "duration": 0, "music": 0,
+            "ambient_context": state.get("ambient_context", ""),
+            "db_window_ready": bool(state.get("db_window_ready", False)),
+            "ambient_startup_pending": bool(state.get("ambient_startup_pending", False)),
+        }, ensure_ascii=False),
+    }
+
+
 def handle_ambient(mode, body, device_id, normalized_weights):
-    if mode == "ambient":
+    if mode != "ambient":
+        return None
+    try:
+        now_kst = _get_kst_now()
+        state = db_utils.get_device_state(device_id) or {}
+        startup_token = body.get("_ambient_startup_token")
+        completing_startup = bool(
+            startup_token
+            and state.get("active_mode") == "ambient"
+            and state.get("ambient_startup_pending", False)
+            and startup_token == state.get("ambient_startup_token")
+        )
+        if startup_token and not completing_startup:
+            return _ambient_wait_response(state, "Ambient measurement superseded")
+
+        action = str(body.get("action", "") or "").strip().lower()
+        restarting = (
+            action in {"noise", "ambient"}
+            and not state.get("ambient_startup_pending", False)
+            and not state.get("ambient_renewal_enabled", False)
+        )
+        if state.get("active_mode") != "ambient" or restarting:
+            saved = db_utils.manage_mailbox(
+                device_id, 0, save_active_mode="ambient", save_active_scent=0,
+                save_music=0, save_ambient_probe_start=int(now_kst.timestamp()),
+                expected_initial_state=state,
+            )
+            latest = db_utils.get_device_state(device_id) or {}
+            return _ambient_wait_response(
+                latest,
+                "Collecting fresh startup sound levels" if saved == 0 else "Ambient start superseded or not saved",
+            )
+
+        if state.get("ambient_startup_pending", False) and not completing_startup:
+            return _ambient_wait_response(state, "Collecting fresh startup sound levels")
+        if action in {"noise", "ambient"} and not completing_startup:
+            return _ambient_wait_response(state, "Ambient session already active")
+
+        effective_db = _resolve_ambient_effective_db(body, state)
+        db_avg = float(body.get("db_avg", state.get("db_avg", effective_db)))
+        db_stddev = float(body.get("db_stddev", state.get("db_stddev", 0)))
+        context_key, _, noise_bucket, _ = _build_ambient_context(effective_db, now_kst)
+        current_spray = int(state.get("active_scent", 0) or state.get("current_spray", 0) or 0)
+        weights = body.get("weights", state.get("weights", normalized_weights))
+        if not isinstance(weights, list):
+            weights = normalized_weights
+        best_kind, spray_code, _ = db_utils.get_ambient_spray_recommendation(
+            noise_bucket, device_id, weights,
+        )
+        if spray_code <= 0:
+            return _ambient_wait_response(state, "No usable ambient cartridge is available")
+        if not (completing_startup or body.get("force_spray", False) or spray_code != current_spray):
+            return _ambient_wait_response(state, "Ambient recommendation unchanged")
+
+        music_code, raw_led = api_utils.ask_gemini_ambient_mood(
+            effective_db, float(body.get("db_1hr_avg", db_avg)), False, db_stddev,
+        )
+        current_music = int(state.get("current_music", 0) or 0)
+        music_code = int(music_code or 0)
+        if not 1 <= music_code <= 25:
+            music_code = current_music
+        led_dict = {}
+        for field, state_field, default in (
+            ("led_r", "led_r", 255), ("led_g", "led_g", 180),
+            ("led_b", "led_b", 0), ("led_bright", "led_br", 150),
+        ):
+            candidate = int((raw_led or {}).get(field, -1))
+            led_dict[field] = candidate if 0 <= candidate <= 255 else int(state.get(state_field, default))
+
+        # Analysis time and actuator authorization are separate settings.
+        # Every actual scent command permits a finite run, including changes.
+        duration = int(config.AMBIENT_DURATION_SECONDS)
+        issued_at = _get_kst_now()
+        metadata = {
+            "ambient_context": context_key,
+            "ambient_effective_db": Decimal(str(round(effective_db, 2))),
+            "ambient_last_eval_time": int(issued_at.timestamp()),
+            "ambient_music_changed_at": int(issued_at.timestamp()),
+            "db_avg": Decimal(str(round(db_avg, 2))),
+            "db_stddev": Decimal(str(round(db_stddev, 2))),
+            "noise_type": str(state.get("noise_type", "분석 중")),
+            "is_spike": bool(body.get("is_spike", state.get("is_spike", False))),
+        }
+        saved = db_utils.manage_mailbox(
+            device_id, spray_code, context_key, duration,
+            save_active_mode="ambient", save_active_scent=spray_code,
+            save_led=led_dict, save_music=music_code,
+            save_ambient_window_start=int(issued_at.timestamp()) if completing_startup else None,
+            save_ambient_lease_duration=duration, save_ambient_metadata=metadata,
+            expected_initial_state=state,
+        )
+        if saved != spray_code:
+            latest = db_utils.get_device_state(device_id) or {}
+            return _ambient_wait_response(latest, "Ambient command superseded or not saved")
+
+        logger.info(
+            "[AMBIENT_COMMAND] ID:%s Context:%s Kind:%s Slot:%s->%s Duration:%s Weights:%s",
+            device_id, context_key, best_kind, current_spray, spray_code, duration, weights,
+        )
+        capacity = float(state.get("current_capacity", config.MAX_CAPACITY))
+        new_capacity = max(0.0, round(capacity - duration * config.CONSUMPTION_PER_SEC, 2))
+        db_utils.update_device_state(device_id, issued_at.isoformat(), new_capacity, spray_code, weights)
         try:
-            now_kst = _get_kst_now()
-            
-            state = db_utils.get_device_state(device_id) or {}
-            is_entering_ambient = state.get("active_mode") != "ambient"
-            if (
-                not is_entering_ambient
-                and state.get("ambient_initial_started_at") is not None
-                and not bool(body.get("window_ready", state.get("db_window_ready", False)))
-            ):
-                # Duplicate start requests must not restart the initial spray
-                # or replace its music/LED while the first window is pending.
-                return {
-                    "statusCode": 200,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({
-                        "result": "SUCCESS",
-                        "status": "SUCCESS",
-                        "message": "Initial ambient measurement in progress",
-                        "active_mode": "ambient",
-                        "active_scent": int(state.get("active_scent", 0)),
-                        "spray": -1,
-                        "cmd": -1,
-                        "app_command": False,
-                        "duration": 0,
-                        "music": 0,
-                        "ambient_context": state.get("ambient_context", ""),
-                        "db_window_ready": False,
-                    }, ensure_ascii=False),
-                }
-            db_avg = float(body.get("db_avg", state.get("db_avg", state.get("db_level", 40))))
-            db_1hr_avg = float(body.get("db_1hr_avg", state.get("db_1hr_avg", db_avg)))
-            is_spike = bool(body.get("is_spike", state.get("is_spike", False)))
-            db_stddev = float(body.get("db_stddev", state.get("db_stddev", 0.0)))
-            effective_db = _resolve_ambient_effective_db(body, state)
+            db_utils.log_table.put_item(Item={
+                "deviceId": device_id, "timestamp": issued_at.isoformat(),
+                "mode": "Ambient_Mode", "spray_code": spray_code, "duration": duration,
+                "region": context_key, "db_level": Decimal(str(round(effective_db, 2))),
+                "result_text": "Initial ambient run" if completing_startup else "Ambient bucket change",
+            })
+        except Exception as error:
+            logger.warning("Ambient log save failed: %s", error)
 
-            context_key, time_slot, noise_bucket, _ = _build_ambient_context(effective_db, now_kst)
-
-            last_time_str = state.get('last_spray_time', "2000-01-01T00:00:00")
-            current_capacity = float(state.get('current_capacity', config.MAX_CAPACITY))
-            last_spray_code = int(state.get('last_spray_code', 0))
-            current_spray = int(
-                state.get('active_scent', 0)
-                or state.get('current_spray', 0)
-                or last_spray_code
-            )
-
-            # Weights preservation
-            state_weights = body.get('weights', state.get('weights', normalized_weights))
-            preserved_weights = []
-            for weight in state_weights if isinstance(state_weights, list) else normalized_weights:
-                try: preserved_weights.append(float(weight))
-                except Exception: preserved_weights.append(0.0)
-            while len(preserved_weights) < 4: preserved_weights.append(0.0)
-            preserved_weights = preserved_weights[:4]
-
-            # A sustained-noise reevaluation changes only the background
-            # music. Scent, pump state and LED settings stay untouched.
-            if bool(body.get("music_only", False)):
-                current_music = int(state.get("current_music", 0) or 0)
-                music_code, _ = api_utils.ask_gemini_ambient_mood(
-                    effective_db,
-                    db_1hr_avg,
-                    False,
-                    db_stddev,
-                    current_music=current_music,
-                )
-                music_code = int(music_code or 0)
-
-                db_utils.state_table.update_item(
-                    Key={"deviceId": device_id},
-                    UpdateExpression=(
-                        "set active_mode = :mode, current_music = :music, "
-                        "ambient_last_eval_time = :t, ambient_context = :ctx, "
-                        "ambient_effective_db = :edb, db_avg = :avg, "
-                        "db_stddev = :std, is_spike = :sp"
-                    ),
-                    ExpressionAttributeValues={
-                        ":mode": "ambient",
-                        ":music": music_code,
-                        ":t": int(now_kst.timestamp()),
-                        ":ctx": context_key,
-                        ":edb": Decimal(str(round(effective_db, 2))),
-                        ":avg": Decimal(str(round(db_avg, 2))),
-                        ":std": Decimal(str(round(db_stddev, 2))),
-                        ":sp": False,
-                    },
-                )
-                logger.info(
-                    f"[AMBIENT_SUSTAINED_MUSIC_CHANGE] ID:{device_id} "
-                    f"DB:{db_avg} Music:{current_music}->{music_code}"
-                )
-                return {
-                    "statusCode": 200,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({
-                        "status": "SUCCESS",
-                        "result": "SUCCESS",
-                        "message": "Music changed after sustained noise",
-                        "spray": -1,
-                        "app_command": False,
-                        "duration": 0,
-                        "music": music_code,
-                        "active_mode": "ambient",
-                        "active_scent": int(current_spray),
-                        "ambient_context": context_key,
-                        "ambient_effective_db": round(effective_db, 2),
-                        "db_level": int(state.get("db_level", db_avg)),
-                        "db_avg": round(db_avg, 2),
-                        "db_stddev": round(db_stddev, 2),
-                        "is_spike": False,
-                    }, ensure_ascii=False),
-                }
-
-            # AI/룰렛 없이 소음 구간의 고정 향기 우선순위에서 선택함.
-            best_kind, scent_priority = db_utils.get_ambient_scent_recommendation(
-                noise_bucket,
-                device_id,
-            )
-            spray_code = db_utils.get_spray_from_kind(device_id, best_kind) or 0
-            logger.info(
-                f"[AMBIENT_FIXED_SCENT] ID:{device_id} Bucket:{noise_bucket} "
-                f"Priority:{scent_priority} Kind:{best_kind} Pump:{spray_code}"
-            )
-
-            request_action = str(body.get("action", "") or "").strip().lower()
-            # Repeated start requests for an existing session are not new runs.
-            explicit_spray_request = bool(body.get("force_spray", False))
-            spray_changed = int(spray_code) != int(current_spray)
-            should_spray = bool(
-                spray_code > 0
-                and (
-                    explicit_spray_request
-                    or is_entering_ambient
-                    or current_spray <= 0
-                    or spray_changed
-                )
-            )
-            logger.info(
-                f"[AMBIENT_SPRAY_DECISION] ID:{device_id} "
-                f"Action:{request_action or '-'} Explicit:{explicit_spray_request} "
-                f"Entering:{is_entering_ambient} Current:{current_spray} "
-                f"Target:{spray_code} ShouldSpray:{should_spray}"
-            )
-
-            # 10-second Cooldown & Fast-track logic (테스트용)
-            COOLDOWN_SECONDS = 3 # 향 교체 직후의 최소 보호 시간 (짧은 간격 허용)
-            is_blocked = False
-            
-            if should_spray and spray_changed and not is_entering_ambient:
-                try:
-                    last_time = datetime.fromisoformat(last_time_str)
-                    if (now_kst - last_time).total_seconds() < COOLDOWN_SECONDS:
-                        is_blocked = True
-                except Exception:
-                    pass
-
-            if is_blocked:
-                logger.info(f"[{device_id}] Ambient cooldown active (Scent {last_spray_code}->{spray_code}). (is_spike={is_spike})")
-                db_utils.state_table.update_item(
-                    Key={"deviceId": device_id},
-                    UpdateExpression=(
-                        "set active_mode = :mode, active_scent = :scent, "
-                        "ambient_last_eval_time = :t, ambient_context = :ctx, "
-                        "ambient_effective_db = :edb, db_avg = :avg, "
-                        "db_stddev = :std, noise_type = :nt, is_spike = :sp"
-                    ),
-                    ExpressionAttributeValues={
-                        ":mode": "ambient",
-                        ":scent": int(current_spray),
-                        ":t": int(now_kst.timestamp()),
-                        ":ctx": context_key,
-                        ":edb": Decimal(str(round(effective_db, 2))),
-                        ":avg": Decimal(str(round(db_avg, 2))),
-                        ":std": Decimal(str(round(db_stddev, 2))),
-                        ":nt": state.get("noise_type", "분석 중"),
-                        ":sp": bool(is_spike),
-                    },
-                )
-                return {
-                    "statusCode": 200,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({
-                        "status": "SUCCESS",
-                        "result": "SUCCESS",
-                        "message": "Cooldown active",
-                        "cmd": -1,
-                        "spray": -1,
-                        "app_command": False,
-                        "duration": 0,
-                        "active_mode": "ambient",
-                        "active_scent": int(current_spray),
-                        "context": f"Ambient_{context_key}",
-                        "ambient_context": context_key,
-                        "ambient_effective_db": round(effective_db, 2),
-                        "db_level": int(state.get("db_level", db_avg)),
-                        "db_avg": round(db_avg, 2),
-                        "db_stddev": round(db_stddev, 2),
-                        "noise_type": state.get("noise_type", "분석 중"),
-                        "is_spike": is_spike,
-                    }, ensure_ascii=False)
-                }
-
-            # 순간 스파이크로 바로 변경하지 않고, 서버의 분석 구간 평균을 사용함
-            music_code, led_dict = api_utils.ask_gemini_ambient_mood(
-                effective_db,
-                db_1hr_avg,
-                False,
-                db_stddev,
-            )
-
-            # The server owns the initial duration even if an older client
-            # supplies duration=3. Later bucket changes remain short pulses.
-            duration = (
-                int(config.AMBIENT_INITIAL_DURATION_SECONDS)
-                if is_entering_ambient
-                else _parse_int(body.get("duration", config.AMBIENT_DURATION_SECONDS), config.AMBIENT_DURATION_SECONDS)
-            )
-
-            new_capacity = current_capacity
-            if should_spray:
-                usage = duration * config.CONSUMPTION_PER_SEC
-                new_capacity = round(max(0.0, current_capacity - usage), 2)
-                saved_command = db_utils.manage_mailbox(
-                    device_id,
-                    spray_code,
-                    context_key,
-                    duration,
-                    save_active_mode="ambient",
-                    save_active_scent=spray_code,
-                    save_led=led_dict,
-                    save_music=music_code,
-                    save_ambient_window_start=int(now_kst.timestamp()) if is_entering_ambient else None,
-                    expected_initial_state=state if is_entering_ambient else None,
-                )
-                if saved_command != spray_code:
-                    latest_state = db_utils.get_device_state(device_id) or {}
-                    return {
-                        "statusCode": 200,
-                        "headers": {"Content-Type": "application/json"},
-                        "body": json.dumps({
-                            "result": "SUCCESS",
-                            "message": "Ambient start superseded or not saved",
-                            "active_mode": latest_state.get("active_mode", "ready"),
-                            "active_scent": int(latest_state.get("active_scent", 0)),
-                            "spray": -1,
-                            "app_command": False,
-                            "duration": 0,
-                            "music": 0,
-                        }, ensure_ascii=False),
-                    }
-                db_utils.update_device_state(device_id, now_kst.isoformat(), new_capacity, spray_code, preserved_weights)
-            else:
-                db_utils.state_table.update_item(
-                    Key={"deviceId": device_id},
-                    UpdateExpression=(
-                        "set active_mode = :mode, active_scent = :scent, "
-                        "led_r = :lr, led_g = :lg, led_b = :lb, led_br = :lbr, "
-                        "current_music = :music"
-                    ),
-                    ExpressionAttributeValues={
-                        ":mode": "ambient",
-                        ":scent": int(current_spray),
-                        ":lr": int(led_dict.get("led_r", 255)),
-                        ":lg": int(led_dict.get("led_g", 180)),
-                        ":lb": int(led_dict.get("led_b", 0)),
-                        ":lbr": int(led_dict.get("led_bright", 150)),
-                        ":music": int(music_code),
-                    },
-                )
-
-            db_utils.state_table.update_item(
-                Key={"deviceId": device_id},
-                UpdateExpression=(
-                    "set ambient_last_eval_time = :t, ambient_context = :ctx, "
-                    "ambient_effective_db = :edb, db_avg = :avg, "
-                    "db_stddev = :std, noise_type = :nt, is_spike = :sp"
-                ),
-                ExpressionAttributeValues={
-                    ":t": int(now_kst.timestamp()),
-                    ":ctx": context_key,
-                    ":edb": Decimal(str(round(effective_db, 2))),
-                    ":avg": Decimal(str(round(db_avg, 2))),
-                    ":std": Decimal(str(round(db_stddev, 2))),
-                    ":nt": state.get("noise_type", "분석 중"),
-                    ":sp": bool(is_spike),
-                },
-            )
-
-            response_spray = int(spray_code) if should_spray else -1
-            response_duration = int(duration) if should_spray else 0
-            response_active_scent = int(spray_code) if should_spray else int(current_spray)
-
-            # DB Log
-            try:
-                def safe_dec(v): return Decimal(str(v)) if v is not None else Decimal("0")
-                db_utils.log_table.put_item(Item={
-                    "deviceId": device_id,
-                    "timestamp": now_kst.isoformat(),
-                    "mode": "Ambient_Mode",
-                    "result_text": f"Recommended {spray_code} / Command {response_spray} / Spike: {is_spike}",
-                    "spray_code": response_spray,
-                    "duration": response_duration,
-                    "region": context_key,
-                    "weight_g": safe_dec(preserved_weights[0]),
-                    "weights": [safe_dec(weight) for weight in preserved_weights],
-                    "temp": safe_dec(0),
-                    "humid": 0,
-                    "feedback": 1,
-                    "db_level": int(db_avg)
-                })
-            except Exception as e:
-                logger.warning(f"Ambient log save failed: {e}")
-
-            response_payload = {
-                "status": "SUCCESS",
-                "result": "SUCCESS",
-                "message": "Ambient command created" if should_spray else "Ambient recommendation unchanged",
-                "cmd": response_spray,
-                "spray": response_spray,
-                "app_command": bool(should_spray),
-                "duration": response_duration,
-                "music": int(music_code),
-                "led_r": int(led_dict.get("led_r", 255)),
-                "led_g": int(led_dict.get("led_g", 180)),
-                "led_b": int(led_dict.get("led_b", 0)),
-                "led_bright": int(led_dict.get("led_bright", 150)),
-                "context": f"Ambient_{context_key}",
-                "ambient_context": context_key,
-                "ambient_effective_db": round(effective_db, 2),
-                "active_mode": "ambient",
-                "active_scent": response_active_scent,
-                "db_level": int(state.get("db_level", db_avg)),
-                "db_avg": round(db_avg, 2),
-                "db_stddev": round(db_stddev, 2),
-                "noise_type": state.get("noise_type", "분석 중"),
-                "is_spike": is_spike,
-            }
-
-            return {
-                "statusCode": 200,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps(response_payload, ensure_ascii=False)
-            }
-        except Exception as e:
-            logger.error(f"[AMBIENT_MODE_CRASH] {e}")
-            return {
-                "statusCode": 500,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({
-                    "status": "ERROR",
-                    "spray": 0,
-                    "duration": 0,
-                    "message": f"Ambient error: {str(e)}"
-                }, ensure_ascii=False)
-            }
-    
-    return None
+        # Hardware outputs are delivered by the mailbox through POLL.
+        return {
+            "statusCode": 200, "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "result": "SUCCESS", "status": "SUCCESS", "message": "Ambient command created",
+                "active_mode": "ambient", "active_scent": int(spray_code),
+                "spray": int(spray_code), "cmd": int(spray_code),
+                "app_command": True, "duration": duration,
+                "music": music_code if music_code != current_music else 0,
+                **led_dict, "context": "Ambient_" + context_key,
+                "ambient_context": context_key, "ambient_effective_db": round(effective_db, 2),
+                "ambient_startup_pending": False, "db_level": int(state.get("db_level", db_avg)),
+                "db_avg": round(db_avg, 2), "db_stddev": round(db_stddev, 2),
+                "noise_type": metadata["noise_type"], "is_spike": metadata["is_spike"],
+            }, ensure_ascii=False),
+        }
+    except Exception as error:
+        logger.exception("Ambient command failed")
+        return {
+            "statusCode": 500, "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"status": "ERROR", "spray": -1, "app_command": False,
+                                "duration": 0, "message": str(error)}, ensure_ascii=False),
+        }

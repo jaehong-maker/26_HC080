@@ -13,7 +13,7 @@ import api_utils
 from handlers.voice_handler import handle_voice
 from handlers.auth_handler import handle_auth
 from handlers.settings_handler import handle_settings
-from handlers.device_handler import handle_device
+from handlers.device_handler import handle_device, _read_microphone_level
 from handlers.feedback_handler import handle_feedback
 from handlers.ambient_handler import handle_ambient
 from handlers.core_mode_handler import handle_core_modes
@@ -58,12 +58,13 @@ def _route_request(event, context):
         # POLL 요청인 경우 간단하게 핵심 데이터만 로그로 남김
         if action == "POLL":
             weights = parsed_preview.get("weights", [])
-            db_level = parsed_preview.get("db_level", 0)
+            db_level = _read_microphone_level(parsed_preview)
             is_app = "email" in parsed_preview
             sender = "모바일 앱" if is_app else "디퓨저 기기"
             
             if not is_app:
-                logger.info(f"📡 [기기 POLL] {sender} 상태 업데이트 -> 무게: {weights}, 소음: {db_level}dB")
+                sound_text = f"{db_level}dB" if db_level is not None else "측정 무효(샘플 제외)"
+                logger.info(f"📡 [기기 POLL] {sender} 상태 업데이트 -> 무게: {weights}, 소음: {sound_text}")
         else:
             logger.info("============== [REQUEST START] ==============")
             mode = parsed_preview.get("mode", "")

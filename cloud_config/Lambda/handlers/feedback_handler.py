@@ -105,20 +105,33 @@ def handle_feedback(action, mode, body, device_id):
                 response_spray = spray_no
                 implicit_like_scheduled = False
                 if not is_like:
+                    ambient_state = db_utils.get_device_state(device_id) or {}
+                    if ambient_state.get("active_mode") != "ambient" or ambient_state.get("ambient_startup_pending", False):
+                        return {"statusCode": 200, "body": json.dumps({
+                            "result": "SUCCESS", "message": "Feedback saved without starting a spray",
+                            "spray": -1, "app_command": False,
+                        })}
                     replacement_kind = db_utils.get_ambient_alternative(
                         ambient_context,
                         device_id,
                         scent_kind,
                     )
                     response_spray = db_utils.get_spray_from_kind(device_id, replacement_kind) or 1
-                    db_utils.manage_mailbox(
+                    saved_command = db_utils.manage_mailbox(
                         device_id,
                         response_spray,
                         ambient_context,
-                        3,
+                        config.AMBIENT_DURATION_SECONDS,
                         save_active_mode="ambient",
                         save_active_scent=response_spray,
+                        save_ambient_lease_duration=config.AMBIENT_DURATION_SECONDS,
+                        expected_initial_state=ambient_state,
                     )
+                    if saved_command != response_spray:
+                        return {"statusCode": 200, "body": json.dumps({
+                            "result": "SUCCESS", "message": "Feedback spray superseded",
+                            "spray": -1, "app_command": False,
+                        })}
                     implicit_like_scheduled = db_utils.schedule_implicit_like(
                         device_id,
                         ambient_context,

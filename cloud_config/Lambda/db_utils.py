@@ -7,6 +7,7 @@
 import boto3
 import random
 import logging
+import math
 from decimal import Decimal
 from boto3.dynamodb.conditions import Attr, Key
 import uuid
@@ -202,8 +203,8 @@ def seed_ambient_defaults():
     return seeded
 
 
-def get_ambient_scent_recommendation(noise_bucket, device_id):
-    """소음 구간의 고정 우선순위에서 장착된 첫 향기를 반환함."""
+def get_ambient_spray_recommendation(noise_bucket, device_id, weights=None):
+    """Return a ranked scent and its usable physical slot, excluding low fluid."""
     try:
         ambient_ids = set(_ambient_scent_ids())
         ambient_ids.discard(7)
@@ -220,19 +221,41 @@ def get_ambient_scent_recommendation(noise_bucket, device_id):
             if int(kind) in ambient_ids and int(kind) not in priority
         ]
 
-        installed_kinds = set(_active_kinds(device_id)) & ambient_ids
+        mapping = get_spray_mapping(device_id)
+        usable_slots = {}
+        minimum = float(getattr(config, "AMBIENT_MIN_SCENT_PERCENT", 15))
+        for raw_slot, raw_kind in mapping.items():
+            try:
+                slot, kind = int(raw_slot), int(raw_kind)
+                if slot not in (1, 2, 3, 4) or kind not in ambient_ids:
+                    continue
+                if weights is not None:
+                    if not isinstance(weights, list) or slot > len(weights):
+                        continue
+                    percent = float(weights[slot - 1])
+                    if not math.isfinite(percent) or percent < minimum:
+                        continue
+                usable_slots.setdefault(kind, []).append(slot)
+            except (TypeError, ValueError, OverflowError):
+                continue
         for kind in priority + fallback_order:
-            if kind in installed_kinds:
-                return kind, priority
+            if kind in usable_slots:
+                return kind, min(usable_slots[kind]), priority
 
         logger.warning(
             f"[AMBIENT_SCENT_UNAVAILABLE] ID:{device_id} "
-            f"Bucket:{noise_bucket} Installed:{sorted(installed_kinds)}"
+            f"Bucket:{noise_bucket} UsableKinds:{sorted(usable_slots)} Weights:{weights}"
         )
-        return 0, priority
+        return 0, 0, priority
     except Exception as e:
         logger.error(f"Ambient Fixed Scent Recommendation Error: {e}")
-        return 0, []
+        return 0, 0, []
+
+
+def get_ambient_scent_recommendation(noise_bucket, device_id):
+    """Compatibility wrapper for callers that only need the installed kind."""
+    kind, _, priority = get_ambient_spray_recommendation(noise_bucket, device_id)
+    return kind, priority
 
 
 # 룰렛 알고리즘으로 앰비언트 모드 향기를 추천함
@@ -821,6 +844,9 @@ def manage_mailbox(
     save_music=None,
     save_ambient_window_start=None,
     expected_initial_state=None,
+    save_ambient_probe_start=None,
+    save_ambient_lease_duration=None,
+    save_ambient_metadata=None,
 ):
     try:
         if save_cmd is not None:
@@ -854,26 +880,83 @@ def manage_mailbox(
                 update_exp += ", current_music = :music"
                 exp_vals[":music"] = int(save_music)
 
+            remove_fields = []
+            if save_ambient_lease_duration is None:
+                # An explicit stop or a command from another mode supersedes
+                # any older continuous-ambient authorization.
+                update_exp += ", ambient_renewal_enabled = :renewal_off"
+                exp_vals[":renewal_off"] = False
+                remove_fields.extend(["ambient_lease_expires_at", "ambient_renew_at", "ambient_lease_token"])
+
+            if save_ambient_probe_start is not None:
+                update_exp += (
+                    ", ambient_startup_pending = :probe_pending, "
+                    "ambient_startup_awaiting_poll = :probe_pending, "
+                    "ambient_startup_started_at = :probe_start, "
+                    "ambient_startup_samples = :probe_samples, "
+                    "ambient_startup_token = :probe_token, ambient_context = :probe_context, "
+                    "db_samples = :probe_samples, "
+                    "db_window_started_at = :probe_start, db_window_ready = :probe_false"
+                )
+                exp_vals.update({
+                    ":probe_pending": True, ":probe_start": int(save_ambient_probe_start),
+                    ":probe_samples": [], ":probe_token": uuid.uuid4().hex,
+                    ":probe_context": "", ":probe_false": False,
+                })
+                remove_fields.extend(["auto_stop_time", "ambient_initial_started_at", "ambient_music_changed_at"])
+
             if save_ambient_window_start is not None:
                 # Start a fresh measurement session with the initial command.
                 # Its first hardware POLL establishes the first sample time.
+                # Keep the actual last-valid timestamp across window resets.
                 update_exp += (
                     ", ambient_initial_started_at = :aws, db_window_started_at = :aws, "
-                    "db_samples = :empty_samples, db_last_sample_time = :zero, "
+                    "db_samples = :empty_samples, "
                     "db_window_ready = :not_ready, ambient_loud_since = :zero, "
-                    "ambient_sustained_loud = :not_ready REMOVE auto_stop_time"
+                    "ambient_sustained_loud = :not_ready, ambient_startup_pending = :not_ready"
                 )
                 exp_vals[":aws"] = int(save_ambient_window_start)
                 exp_vals[":empty_samples"] = []
                 exp_vals[":zero"] = 0
                 exp_vals[":not_ready"] = False
+                remove_fields.append("auto_stop_time")
+
+            if save_ambient_lease_duration is not None:
+                lease_duration = int(save_ambient_lease_duration)
+                margin = int(config.AMBIENT_RENEWAL_MARGIN_SECONDS)
+                if not 0 < margin < lease_duration <= 270 or int(save_cmd) <= 0:
+                    raise ValueError("Invalid ambient lease duration/margin")
+                update_exp += (
+                    ", ambient_lease_duration = :lease_duration, "
+                    "ambient_lease_token = :lease_token, ambient_renewal_enabled = :renewal_on"
+                )
+                exp_vals.update({":lease_duration": lease_duration, ":lease_token": uuid.uuid4().hex, ":renewal_on": True})
+                remove_fields.extend(["ambient_lease_expires_at", "ambient_renew_at"])
+
+            if save_ambient_metadata:
+                allowed_fields = {
+                    "ambient_context", "ambient_effective_db", "ambient_last_eval_time", "ambient_music_changed_at",
+                    "db_avg", "db_stddev", "noise_type", "is_spike",
+                }
+                for index, (field, value) in enumerate(save_ambient_metadata.items()):
+                    if field not in allowed_fields:
+                        raise ValueError("Unexpected ambient metadata field: " + field)
+                    token = ":ambient_meta_" + str(index)
+                    update_exp += ", " + field + " = " + token
+                    exp_vals[token] = value
+
+            if remove_fields:
+                update_exp += " REMOVE " + ", ".join(dict.fromkeys(remove_fields))
 
             write_options = {}
             if expected_initial_state is not None:
                 # Claim the initial run once, and reject a start superseded by
                 # a stop/mode change while its recommendation was in flight.
                 conditions = []
-                for field in ("active_mode", "last_mode_change_time"):
+                for field in (
+                    "active_mode", "last_mode_change_time", "ambient_startup_token",
+                    "ambient_startup_pending", "ambient_lease_token", "ambient_renewal_enabled", "pending_cmd",
+                ):
                     if field in expected_initial_state:
                         token = ":expected_" + field
                         conditions.append(field + " = " + token)
@@ -891,7 +974,7 @@ def manage_mailbox(
             logger.info(f"[Mailbox_Write] ID:{device_id} Cmd:{save_cmd}")
             return int(save_cmd)
 
-        res = state_table.get_item(Key={"deviceId": device_id})
+        res = state_table.get_item(Key={"deviceId": device_id}, ConsistentRead=True)
         if "Item" in res:
             item = res["Item"]
             cmd = int(item.get("pending_cmd", -1))
@@ -902,10 +985,30 @@ def manage_mailbox(
 
             if cmd != -1:
                 if not is_peek:
+                    read_update = "set pending_cmd = :z, pending_region = :e, pending_duration = :d"
+                    read_values = {":z": -1, ":e": "", ":d": 3, ":expected_cmd": cmd}
+                    read_condition = "pending_cmd = :expected_cmd"
+                    if (
+                        cmd > 0 and item.get("active_mode") == "ambient"
+                        and item.get("ambient_renewal_enabled", False)
+                        and item.get("ambient_lease_token")
+                    ):
+                        # Time the authorization from delivery, not queueing or
+                        # an app's peek. The device starts its timer on receipt.
+                        delivered_at = int(_get_kst_now().timestamp())
+                        margin = int(config.AMBIENT_RENEWAL_MARGIN_SECONDS)
+                        read_update += ", ambient_lease_expires_at = :expires, ambient_renew_at = :renew"
+                        read_values.update({
+                            ":expires": delivered_at + saved_duration,
+                            ":renew": delivered_at + saved_duration - margin,
+                            ":expected_lease": item["ambient_lease_token"],
+                        })
+                        read_condition += " AND ambient_lease_token = :expected_lease"
                     state_table.update_item(
                         Key={"deviceId": device_id},
-                        UpdateExpression="set pending_cmd = :z, pending_region = :e, pending_duration = :d",
-                        ExpressionAttributeValues={":z": -1, ":e": "", ":d": 3},
+                        UpdateExpression=read_update,
+                        ExpressionAttributeValues=read_values,
+                        ConditionExpression=read_condition,
                     )
                     logger.info(f"[Mailbox_Read] ID:{device_id} Executing Cmd:{cmd}")
                 else:
@@ -925,6 +1028,88 @@ def manage_mailbox(
         if expected_initial_state is not None:
             return None
         return -1, get_saved_region(device_id), 3
+
+
+def renew_ambient_lease(device_id, now_epoch=None):
+    """Queue a finite extension only when due, using the active session's scent."""
+    state = state_table.get_item(Key={"deviceId": device_id}, ConsistentRead=True).get("Item", {})
+    now_epoch = int(_get_kst_now().timestamp()) if now_epoch is None else int(now_epoch)
+    due = int(state.get("ambient_renew_at", 0) or 0)
+    scent = int(state.get("active_scent", 0) or 0)
+    if (
+        state.get("active_mode") != "ambient" or state.get("ambient_startup_pending", False)
+        or not state.get("ambient_renewal_enabled", False) or scent <= 0
+        or int(state.get("pending_cmd", -1)) != -1 or due <= 0 or now_epoch < due
+    ):
+        return False
+    duration = int(config.AMBIENT_DURATION_SECONDS)
+    saved = manage_mailbox(
+        device_id, scent, state.get("ambient_context", ""), duration,
+        save_active_mode="ambient", save_active_scent=scent,
+        save_ambient_lease_duration=duration, expected_initial_state=state,
+    )
+    return saved == scent
+
+
+def rotate_ambient_music(device_id, now_epoch, reported_music=None):
+    """Change only the track after a valid, unchanged noise window."""
+    try:
+        state = state_table.get_item(Key={"deviceId": device_id}, ConsistentRead=True).get("Item", {})
+        now_timestamp = float(now_epoch)
+        now_epoch = int(now_epoch)
+        context = str(state.get("ambient_context", ""))
+        bucket = context.rsplit("_", 1)[-1]
+        last_change = int(state.get("ambient_music_changed_at", state.get("ambient_last_eval_time", now_epoch)))
+        last_sample = float(state.get("db_last_sample_time", 0) or 0)
+        if (
+            state.get("active_mode") != "ambient" or state.get("ambient_startup_pending", False)
+            or not state.get("ambient_renewal_enabled", False) or int(state.get("active_scent", 0)) <= 0
+            or int(state.get("pending_cmd", -1)) == 0 or state.get("microphone_valid") is not True
+            or not state.get("db_window_ready", False)
+            or not 0 <= now_timestamp - last_sample < config.AMBIENT_SAMPLE_GAP_RESET_SECONDS
+            or now_epoch - last_change < config.AMBIENT_MUSIC_ROTATION_SECONDS
+        ):
+            return False
+        average = float(state.get("db_avg", float("nan")))
+        actual_bucket = next((item["label"] for item in config.AMBIENT_NOISE_BUCKETS
+                              if average >= item["min"] and (item["max"] is None or average < item["max"])), "")
+        if not math.isfinite(average) or actual_bucket != bucket:
+            return False
+        current = int(state.get("current_music", 0) or 0)
+        # A POLL reports the playing track. Wait for delivery of the previous
+        # selection instead of replacing a command the device has not applied.
+        if reported_music is not None and int(reported_music) != current:
+            return False
+        tracks = [track for track in config.AMBIENT_MUSIC_BY_BUCKET.get(bucket, ())
+                  if track in config.AMBIENT_MUSIC_CATALOG]
+        if len(set(tracks)) < 2:
+            return False
+        start = (tracks.index(current) + 1) % len(tracks) if current in tracks else 0
+        selected = next(track for track in tracks[start:] + tracks[:start] if track != current)
+        values = {":music": selected, ":changed": now_epoch}
+        conditions = []
+        for field in (
+            "active_mode", "last_mode_change_time", "ambient_startup_token", "ambient_startup_pending",
+            "ambient_renewal_enabled", "ambient_lease_token", "active_scent", "ambient_context",
+            "current_music", "ambient_music_changed_at", "ambient_last_eval_time", "pending_cmd",
+            "microphone_valid", "db_last_sample_time", "db_window_ready", "db_avg",
+        ):
+            if field in state:
+                token = ":expected_" + field
+                values[token] = state[field]
+                conditions.append(field + " = " + token)
+            else:
+                conditions.append("attribute_not_exists(" + field + ")")
+        state_table.update_item(
+            Key={"deviceId": device_id},
+            UpdateExpression="set current_music = :music, ambient_music_changed_at = :changed",
+            ExpressionAttributeValues=values, ConditionExpression=" AND ".join(conditions),
+        )
+        logger.info("[AMBIENT_MUSIC_ROTATE] ID:%s Bucket:%s Track:%s->%s", device_id, bucket, current, selected)
+        return True
+    except Exception as error:
+        logger.warning("Ambient music rotation not saved: %s", error)
+        return False
 
 
 # remember_last_region 처리를 담당함

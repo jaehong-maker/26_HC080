@@ -3,6 +3,7 @@
 
 import json
 import logging
+import math
 import statistics
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -15,6 +16,156 @@ from .common import _to_decimal_list, _get_ambient_noise_bucket
 
 logger = logging.getLogger()
 
+
+def _read_microphone_level(body):
+    """Accept only the explicit firmware validity flag and a finite sample."""
+    if body.get("microphone_valid") is not True or "db_level" not in body:
+        return None
+    raw_level = body["db_level"]
+    if isinstance(raw_level, bool):
+        return None
+    try:
+        level = float(raw_level)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return level if math.isfinite(level) and level >= 0 else None
+
+
+def _noise_records(raw_samples, now, cutoff=None):
+    records = []
+    for sample in raw_samples if isinstance(raw_samples, list) else []:
+        try:
+            timestamp, value = float(sample["timestamp"]), float(sample["value"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if (
+            math.isfinite(timestamp) and math.isfinite(value) and value >= 0
+            and timestamp <= now and (cutoff is None or timestamp >= cutoff)
+        ):
+            records.append({"timestamp": timestamp, "value": value})
+    return records
+
+
+def _decimal_records(records):
+    return [{"timestamp": Decimal(str(sample["timestamp"])), "value": Decimal(str(sample["value"]))}
+            for sample in records]
+
+
+def _collect_ambient_startup(state, body, now_epoch):
+    """Collect fresh POLL samples spanning at least the startup interval."""
+    if state.get("ambient_startup_awaiting_poll", False):
+        # This snapshot predates the device receiving the pump/audio stop.
+        # Exclude it so the previous mode cannot choose the initial scent.
+        return [], 0, False, 0.0, 0.0
+
+    records = _noise_records(state.get("ambient_startup_samples", []), now_epoch)
+    gap = int(config.AMBIENT_SAMPLE_GAP_RESET_SECONDS)
+    if records and now_epoch - records[-1]["timestamp"] >= gap:
+        records = []
+    value = _read_microphone_level(body)
+    if value is not None:
+        records.append({"timestamp": now_epoch, "value": value})
+    started_at = records[0]["timestamp"] if records else 0
+    duration = int(config.AMBIENT_STARTUP_MEASUREMENT_SECONDS)
+    ready = bool(value is not None and len(records) >= 2 and records[-1]["timestamp"] - started_at >= duration)
+    values = [sample["value"] for sample in records]
+    average = round(sum(values) / len(values), 2) if values else 0.0
+    stddev = round(statistics.pstdev(values), 2) if len(values) > 1 else 0.0
+    return records, started_at, ready, average, stddev
+
+
+def _prepare_noise_update(state, body, now):
+    """Produce measurement-only writes; invalid POLLs still run device control."""
+    current_db = _read_microphone_level(body)
+    valid = current_db is not None
+    window = int(config.AMBIENT_ANALYSIS_WINDOW_SECONDS)
+    gap = int(config.AMBIENT_SAMPLE_GAP_RESET_SECONDS)
+    last_valid = float(state.get("db_last_sample_time", 0) or 0)
+    # Old records may contain synthetic zeroes from the previous protocol.
+    # Discard them once rather than treating them as verified measurements.
+    migrating = state.get("noise_sample_validity_version") != 1
+    reset = migrating or last_valid <= 0 or now - last_valid >= gap
+    records = [] if reset else _noise_records(state.get("db_samples", []), now, now - window)
+    started_at = float(state.get("db_window_started_at", now) or now)
+    if reset or not records:
+        started_at = now
+    if valid:
+        records.append({"timestamp": now, "value": current_db})
+    records = records[-int(config.AMBIENT_MAX_SAMPLES):]
+    updates = {
+        "microphone_valid": valid, "noise_sample_validity_version": 1,
+        "db_samples": _decimal_records(records),
+        "db_window_started_at": Decimal(str(started_at)),
+        "db_window_ready": bool(valid and now - started_at >= window),
+        "ambient_loud_since": 0, "ambient_sustained_loud": False, "is_spike": False,
+        "ambient_noise_rule_version": 2,
+    }
+    remove = []
+    average = stddev = effective_db = None
+    previous_context = str(state.get("ambient_context", ""))
+    previous_bucket = previous_context.rsplit("_", 1)[-1] if previous_context else ""
+    average_bucket = ""
+    bucket_changed = False
+    if valid:
+        values = [sample["value"] for sample in records]
+        average = round(sum(values) / len(values), 2)
+        stddev = round(statistics.pstdev(values), 2) if len(values) > 1 else 0.0
+        previous_db = float(state.get("db_level", current_db))
+        is_spike = bool(
+            not reset and state.get("microphone_valid") is True
+            and abs(current_db - previous_db) >= config.AMBIENT_SPIKE_DELTA_DB
+        )
+        average_bucket, _ = _get_ambient_noise_bucket(average)
+        bucket_changed = bool(
+            state.get("active_mode") == "ambient" and updates["db_window_ready"]
+            and previous_bucket and average_bucket != previous_bucket
+        )
+        effective_db = float(state.get("ambient_effective_db", average)) if previous_context else average
+        if bucket_changed:
+            effective_db = average
+        updates.update({
+            "db_level": Decimal(str(current_db)), "db_last_sample_time": Decimal(str(now)),
+            "db_avg": Decimal(str(average)), "db_stddev": Decimal(str(stddev)),
+            "noise_type": "불규칙적(대화/활동)" if stddev > 8.0 else "안정적(음악/정적)",
+            "is_spike": is_spike, "ambient_effective_db": Decimal(str(effective_db)),
+        })
+        if state.get("active_mode") == "ambient" and current_db >= config.AMBIENT_HIGH_THRESHOLD_DB:
+            continuous = not reset and state.get("microphone_valid") is True
+            loud_since = float(state.get("ambient_loud_since", 0) or 0) if continuous else 0
+            if loud_since <= 0:
+                loud_since = now
+            updates["ambient_loud_since"] = Decimal(str(loud_since))
+            updates["ambient_sustained_loud"] = now - loud_since >= window
+    elif reset:
+        # No mean exists after a long gap. Preserve the last valid reading's
+        # value/time for diagnostics, but never advertise a new zero sample.
+        remove = ["db_avg", "db_stddev", "noise_type"]
+
+    startup_ready = False
+    startup_avg = startup_stddev = 0.0
+    if state.get("ambient_startup_pending", False) and state.get("active_mode") == "ambient":
+        startup_state = state
+        if reset:
+            startup_state = {**state, "ambient_startup_samples": []}
+        samples, startup_start, startup_ready, startup_avg, startup_stddev = _collect_ambient_startup(
+            startup_state, body, now,
+        )
+        updates.update({
+            "ambient_startup_samples": _decimal_records(samples),
+            "ambient_startup_started_at": Decimal(str(startup_start)),
+            "ambient_startup_awaiting_poll": False,
+        })
+        if valid and samples:
+            updates["ambient_startup_avg"] = Decimal(str(startup_avg))
+        elif reset:
+            remove.append("ambient_startup_avg")
+    return updates, remove, {
+        "valid": valid, "current_db": current_db, "db_avg": average, "db_stddev": stddev,
+        "effective_db": effective_db, "previous_bucket": previous_bucket, "average_bucket": average_bucket,
+        "bucket_changed": bucket_changed, "startup_ready": startup_ready,
+        "startup_avg": startup_avg, "startup_stddev": startup_stddev,
+    }
+
 def handle_device(action, mode, body, device_id, normalized_weights):
     if action == "POLL":
         is_app_request = True if body.get("email") else False
@@ -22,151 +173,73 @@ def handle_device(action, mode, body, device_id, normalized_weights):
         
         if not is_app_request:
             previous_state = db_utils.get_device_state(device_id) or {}
-            current_w = normalized_weights[0]
-            current_db = int(body.get("db_level", 0))
-            logger.debug(f"[POLL_HARDWARE] ID:{device_id} Weights:{normalized_weights} DB:{current_db}")
-
-            now_epoch = int(time.time())
-            window_seconds = int(getattr(config, "AMBIENT_ANALYSIS_WINDOW_SECONDS", 60))
-            gap_reset_seconds = int(getattr(config, "AMBIENT_SAMPLE_GAP_RESET_SECONDS", 10))
-            max_samples = int(getattr(config, "AMBIENT_MAX_SAMPLES", 600))
-            last_sample_time = int(previous_state.get("db_last_sample_time", 0))
-            window_started_at = int(previous_state.get("db_window_started_at", now_epoch))
-            previous_samples = previous_state.get("db_samples", [])
-            sample_records = []
-
-            if last_sample_time <= 0 or now_epoch - last_sample_time > gap_reset_seconds:
-                window_started_at = now_epoch
-            elif isinstance(previous_samples, list):
-                cutoff_epoch = now_epoch - window_seconds
-                for sample in previous_samples:
-                    if not isinstance(sample, dict):
-                        continue
-                    try:
-                        sample_time = int(sample.get("timestamp", 0))
-                        sample_value = float(sample.get("value", 0))
-                    except Exception:
-                        continue
-                    if sample_time >= cutoff_epoch:
-                        sample_records.append({"timestamp": sample_time, "value": sample_value})
-
-            sample_records.append({"timestamp": now_epoch, "value": float(current_db)})
-            sample_records = sample_records[-max_samples:]
-            sample_values = [sample["value"] for sample in sample_records]
-            db_avg = round(sum(sample_values) / len(sample_values), 2)
-            db_stddev = round(statistics.pstdev(sample_values), 2) if len(sample_values) > 1 else 0.0
-            window_ready = now_epoch - window_started_at >= window_seconds
-            previous_db = int(previous_state.get("db_level", current_db))
-            spike_delta = int(getattr(config, "AMBIENT_SPIKE_DELTA_DB", 15))
-            is_spike = (
-                last_sample_time > 0
-                and abs(current_db - previous_db) >= spike_delta
-            )
-            noise_type = "불규칙적(대화/활동)" if db_stddev > 8.0 else "안정적(음악/정적)"
-
-            high_threshold = float(getattr(config, "AMBIENT_HIGH_THRESHOLD_DB", 40))
-            rule_version = int(previous_state.get("ambient_noise_rule_version", 0) or 0)
-            previous_sustained_loud = (
-                bool(previous_state.get("ambient_sustained_loud", False))
-                if rule_version == 2 else False
-            )
-            loud_since = (
-                int(previous_state.get("ambient_loud_since", 0) or 0)
-                if rule_version == 2 else 0
-            )
-            ambient_active = previous_state.get("active_mode") == "ambient"
-            continuity_broken = (
-                last_sample_time <= 0
-                or now_epoch - last_sample_time > gap_reset_seconds
-            )
-
-            # A music change is allowed only after the *current* sound level
-            # has remained at or above the threshold continuously for the
-            # whole window. A short spike starts no recommendation.
-            if not ambient_active or current_db < high_threshold:
-                loud_since = 0
-                sustained_loud = False
-            else:
-                if continuity_broken or loud_since <= 0:
-                    loud_since = now_epoch
-                    previous_sustained_loud = False
-                sustained_loud = bool(
-                    previous_sustained_loud
-                    or now_epoch - loud_since >= window_seconds
-                )
-
+            now_timestamp = time.time()
+            now_epoch = int(now_timestamp)
+            startup_pending = bool(previous_state.get("ambient_startup_pending", False))
+            noise_updates, noise_removals, noise = _prepare_noise_update(previous_state, body, now_timestamp)
+            sample_valid = noise["valid"]
+            current_db, db_avg, db_stddev = noise["current_db"], noise["db_avg"], noise["db_stddev"]
+            effective_db = noise["effective_db"]
             previous_context = str(previous_state.get("ambient_context", ""))
-            previous_noise_bucket = (
-                previous_context.rsplit("_", 1)[-1]
-                if previous_context else ""
-            )
-            average_noise_bucket, _ = _get_ambient_noise_bucket(db_avg)
-            noise_bucket_changed = bool(
-                ambient_active
-                and window_ready
-                and previous_noise_bucket
-                and average_noise_bucket != previous_noise_bucket
-            )
-            if previous_context:
-                effective_db = float(previous_state.get("ambient_effective_db", db_avg))
-            else:
-                # The first ambient recommendation must use the latest device
-                # measurement, not the legacy fixed 40 dB default.
-                effective_db = db_avg
-            if noise_bucket_changed:
-                effective_db = db_avg
-            
-            update_exp = (
-                "set weight_g = :wg, weights = :w, db_level = :db, "
-                "db_samples = :samples, db_avg = :avg, db_stddev = :std, "
-                "noise_type = :nt, is_spike = :sp, db_window_started_at = :ws, "
-                "db_last_sample_time = :ls, db_window_ready = :wr, "
-                "ambient_sustained_loud = :sl, ambient_effective_db = :edb, "
-                "ambient_loud_since = :als, ambient_noise_rule_version = :arv"
-            )
-            exp_vals = {
-                ':wg': Decimal(str(current_w)),
-                ':w': _to_decimal_list(normalized_weights),
-                ':db': current_db,
-                ':samples': [
-                    {
-                        "timestamp": Decimal(str(sample["timestamp"])),
-                        "value": Decimal(str(sample["value"])),
-                    }
-                    for sample in sample_records
-                ],
-                ':avg': Decimal(str(db_avg)),
-                ':std': Decimal(str(db_stddev)),
-                ':nt': noise_type,
-                ':sp': bool(is_spike),
-                ':ws': window_started_at,
-                ':ls': now_epoch,
-                ':wr': bool(window_ready),
-                ':sl': bool(sustained_loud),
-                ':edb': Decimal(str(effective_db)),
-                ':als': int(loud_since),
-                ':arv': 2,
-            }
-            
-            # 기기가 현재 재생 중인 곡 번호 업데이트
-            current_music = body.get("music")
-            # Ambient music is server-owned. Do not let a slightly delayed
-            # device POLL overwrite a newly selected server track.
-            if current_music is not None and previous_state.get("active_mode") != "ambient":
-                update_exp += ", current_music = :cm"
-                exp_vals[':cm'] = int(current_music)
+            previous_noise_bucket, average_noise_bucket = noise["previous_bucket"], noise["average_bucket"]
+            noise_bucket_changed = noise["bucket_changed"]
+            startup_ready = noise["startup_ready"]
+            startup_avg, startup_stddev = noise["startup_avg"], noise["startup_stddev"]
+            window_ready = noise_updates["db_window_ready"]
+            sustained_loud, is_spike = noise_updates["ambient_sustained_loud"], noise_updates["is_spike"]
+            logger.debug("[POLL_HARDWARE] ID:%s Weights:%s MicrophoneValid:%s DB:%s",
+                         device_id, normalized_weights, sample_valid, current_db)
 
+            updates = {
+                "weight_g": Decimal(str(normalized_weights[0])),
+                "weights": _to_decimal_list(normalized_weights),
+                **noise_updates,
+            }
+            current_music = body.get("music")
+            if current_music is not None and previous_state.get("active_mode") != "ambient":
+                updates["current_music"] = int(current_music)
+            exp_vals = {}
+            assignments = []
+            for index, (field, value) in enumerate(updates.items()):
+                token = ":poll_" + str(index)
+                assignments.append(field + " = " + token)
+                exp_vals[token] = value
+            update_exp = "set " + ", ".join(assignments)
+            if noise_removals:
+                update_exp += " REMOVE " + ", ".join(noise_removals)
+            measurement_updated = False
             try:
+                probe_write_options = {}
+                if startup_pending and previous_state.get("active_mode") == "ambient":
+                    exp_vals.update({
+                        ":probe_mode": "ambient",
+                        ":probe_token": previous_state.get("ambient_startup_token"),
+                        ":probe_pending": True,
+                    })
+                    probe_write_options["ConditionExpression"] = (
+                        "active_mode = :probe_mode AND ambient_startup_token = :probe_token "
+                        "AND ambient_startup_pending = :probe_pending"
+                    )
                 db_utils.state_table.update_item(
-                    Key={'deviceId': device_id},
-                    UpdateExpression=update_exp,
-                    ExpressionAttributeValues=exp_vals
+                    Key={"deviceId": device_id}, UpdateExpression=update_exp,
+                    ExpressionAttributeValues=exp_vals, **probe_write_options,
                 )
-            except Exception as e:
-                logger.error(f"무게 및 소음 DB 업데이트 실패: {e}")
+                measurement_updated = True
+            except Exception as error:
+                startup_ready = False
+                logger.error("Weight/noise update failed: %s", error)
 
             if previous_state.get("active_mode") == "ambient":
-                should_reevaluate = noise_bucket_changed or not previous_context
+                # Only a hardware POLL may request a due finite extension.
+                # Renew without AI so an unchanged environment keeps running.
+                try:
+                    db_utils.renew_ambient_lease(device_id, now_epoch)
+                except Exception as error:
+                    logger.error("Ambient renewal failed: %s", error)
+                should_reevaluate = sample_valid and measurement_updated and (
+                    startup_ready if startup_pending
+                    else noise_bucket_changed or not previous_context
+                )
                 if should_reevaluate:
                     try:
                         logger.info(
@@ -179,23 +252,28 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                             "ambient",
                             {
                                 "db_level": current_db,
-                                "db_avg": db_avg,
+                                "db_avg": startup_avg if startup_pending else db_avg,
                                 "db_1hr_avg": db_avg,
-                                "db_stddev": db_stddev,
+                                "db_stddev": startup_stddev if startup_pending else db_stddev,
                                 "is_spike": is_spike,
-                                "effective_db": effective_db,
+                                "effective_db": startup_avg if startup_pending else effective_db,
                                 "window_ready": window_ready,
                                 "sustained_loud": sustained_loud,
                                 "music_only": False,
                                 "force_spray": bool(noise_bucket_changed),
                                 "weights": normalized_weights,
-                                "duration": getattr(config, "AMBIENT_DURATION_SECONDS", 3),
+                                "duration": getattr(config, "AMBIENT_DURATION_SECONDS", 60),
+                                "_ambient_startup_token": previous_state.get("ambient_startup_token") if startup_pending else None,
                             },
                             device_id,
                             normalized_weights,
                         )
                     except Exception as e:
                         logger.error(f"[AMBIENT_AUTO_RECOMMEND_ERROR] ID:{device_id} {e}")
+                elif sample_valid and measurement_updated and not startup_pending and not noise_bucket_changed:
+                    # Track rotation neither queues a spray command nor renews
+                    # its lease. The normal POLL response delivers music only.
+                    db_utils.rotate_ambient_music(device_id, now_timestamp, body.get("music"))
 
         state = db_utils.get_device_state(device_id) or {}
         
@@ -222,6 +300,13 @@ def handle_device(action, mode, body, device_id, normalized_weights):
             except: pass
 
         spray_code, target_region, duration = db_utils.manage_mailbox(device_id, is_peek=is_app_request)
+        # A stop may have won while the mailbox was being consumed. Build
+        # the response from the latest state and never return an old start.
+        state = db_utils.state_table.get_item(
+            Key={"deviceId": device_id}, ConsistentRead=True,
+        ).get("Item", state)
+        if state.get("active_mode") in ("ready", "off") and spray_code > 0:
+            spray_code, duration = -1, 0
         
         current_spray = int(state.get('current_spray', 0))
         active_spray = spray_code if spray_code > 0 else current_spray
@@ -231,24 +316,16 @@ def handle_device(action, mode, body, device_id, normalized_weights):
         else:
             music_code = db_utils.get_music_track(device_id, active_spray, is_pump=True) if active_spray > 0 else 0
         
-        # [BUG FIX] 음악 무한 재시작 방지 로직
-        # 기기는 0이 아닌 music 값을 받으면 무조건 트랙을 처음부터 다시 재생합니다.
-        # 따라서 새 명령이거나, 앱에서 음악 설정을 바꿨을 때만 0이 아닌 값을 내려보냅니다.
+        # A lease extension must not restart the same song. Prefer the track
+        # actually reported by the hardware; app peeks never consume music.
         last_sent_music = int(state.get('last_sent_music', -1))
-        
-        if spray_code > 0:
-            final_music_code = music_code
-            if music_code > 0:
-                try:
-                    db_utils.state_table.update_item(
-                        Key={'deviceId': device_id},
-                        UpdateExpression="set last_sent_music = :m",
-                        ExpressionAttributeValues={':m': music_code}
-                    )
-                except: pass
-        else:
-            can_send_music = active_mode == "ambient" or active_spray > 0
-            if can_send_music and music_code > 0 and music_code != last_sent_music:
+        reported_music = last_sent_music
+        if active_mode == "ambient" and not is_app_request and "music" in body:
+            reported_music = int(body.get("music", 0) or 0)
+        can_send_music = active_mode == "ambient" or active_spray > 0
+        final_music_code = 0
+        if not is_app_request and can_send_music and music_code > 0:
+            if music_code != reported_music or (active_mode != "ambient" and spray_code > 0):
                 final_music_code = music_code
                 try:
                     db_utils.state_table.update_item(
@@ -257,8 +334,6 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                         ExpressionAttributeValues={':m': music_code}
                     )
                 except: pass
-            else:
-                final_music_code = 0
         
         intensity = int(state.get('intensity', 2)) 
 
@@ -266,8 +341,13 @@ def handle_device(action, mode, body, device_id, normalized_weights):
         led_g = int(state.get('led_g', 255))
         led_b = int(state.get('led_b', 255))
         led_br = int(state.get('led_br', 150))
-        db_level = int(state.get('db_level', 0))
-        db_avg = float(state.get('db_avg', db_level))
+        last_level = _read_microphone_level({"microphone_valid": True, "db_level": state.get("db_level")})
+        last_valid_time = float(state.get("db_last_sample_time", 0) or 0)
+        microphone_valid = bool(
+            state.get("microphone_valid") is True and last_level is not None and last_valid_time > 0
+            and 0 <= time.time() - last_valid_time < config.AMBIENT_SAMPLE_GAP_RESET_SECONDS
+        )
+        db_avg = float(state.get('db_avg', 0))
         db_stddev = float(state.get('db_stddev', 0))
         noise_type = str(state.get('noise_type', '분석 전'))
         is_spike = bool(state.get('is_spike', False))
@@ -294,20 +374,29 @@ def handle_device(action, mode, body, device_id, normalized_weights):
             "led_b": led_b,
             "led_br": led_br,
             "led_bright": led_br,
-            "db_level": db_level,
+            "microphone_valid": microphone_valid,
             "db_avg": round(db_avg, 2),
             "db_stddev": round(db_stddev, 2),
             "noise_type": noise_type,
             "is_spike": is_spike,
-            "db_window_ready": bool(state.get("db_window_ready", False)),
-            "ambient_sustained_loud": bool(state.get("ambient_sustained_loud", False)),
+            "db_window_ready": bool(microphone_valid and state.get("db_window_ready", False)),
+            "ambient_sustained_loud": bool(microphone_valid and state.get("ambient_sustained_loud", False)),
             "ambient_effective_db": float(state.get("ambient_effective_db", 40)),
             "ambient_context": state.get("ambient_context", ""),
+            "ambient_startup_pending": bool(state.get("ambient_startup_pending", False)),
+            "ambient_startup_avg": float(state.get("ambient_startup_avg", 0)),
             "weights": final_weights,
             "mapping": mapping_dict,
             "music_tracks": state.get('music_tracks', '1_6_11_16'),
             "result_text": "" if spray_code in [0, -1] else f"명령:{spray_code}"
         }
+        if microphone_valid:
+            response_body["db_level"] = last_level
+        for field in ("db_avg", "db_stddev", "ambient_startup_avg", "ambient_effective_db"):
+            if field not in state:
+                response_body.pop(field, None)
+        if last_valid_time > 0:
+            response_body["db_last_sample_time"] = last_valid_time
         if implicit_like_result:
             response_body["implicit_like_applied"] = True
             response_body["implicit_like_context"] = implicit_like_result["context"]
@@ -333,8 +422,12 @@ def handle_device(action, mode, body, device_id, normalized_weights):
         try:
             db_utils.state_table.update_item(
                 Key={'deviceId': device_id},
-                UpdateExpression="set active_mode = :m, active_scent = :z, current_spray = :z, pending_cmd = :z, last_sent_music = :n, last_mode_change_time = :t",
-                ExpressionAttributeValues={':m': 'ready', ':t': int(time.time()), ':z': 0, ':n': -1}
+                UpdateExpression=(
+                    "set active_mode = :m, active_scent = :z, current_spray = :z, "
+                    "pending_cmd = :z, last_sent_music = :n, last_mode_change_time = :t, "
+                    "ambient_startup_pending = :pending, ambient_startup_awaiting_poll = :pending"
+                ),
+                ExpressionAttributeValues={':m': 'ready', ':t': int(time.time()), ':z': 0, ':n': -1, ':pending': False}
             )
         except: pass
         return {
@@ -449,13 +542,15 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                 }
             
             # 2. 구버전 펌웨어용 3초 방어 로직
-            if state.get("active_mode") == "ready" and req_mode != "ready" and (now_ts - last_change < 3):
+            if state.get("active_mode") == "ready" and req_mode not in ("ready", "off") and (now_ts - last_change < 3):
                 return {
                     "statusCode": 200,
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({"result": "IGNORED", "message": "앱에서 이미 기기를 정지했습니다."}, ensure_ascii=False)
                 }
             
+            if req_mode in ("ready", "off"):
+                req_scent = 0
             expr = "set active_mode = :m, active_scent = :s"
             vals = {':m': req_mode, ':s': req_scent}
             
@@ -463,6 +558,15 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                 expr += ", current_spray = :z, last_sent_music = :n"
                 vals[':z'] = 0
                 vals[':n'] = -1
+
+            if req_mode in ("ready", "off"):
+                expr += (
+                    ", pending_cmd = :z, ambient_renewal_enabled = :renewal_off, "
+                    "ambient_startup_pending = :renewal_off, "
+                    "ambient_startup_awaiting_poll = :renewal_off, last_mode_change_time = :stop_time "
+                    "REMOVE ambient_lease_expires_at, ambient_renew_at, ambient_lease_token"
+                )
+                vals.update({":z": 0, ":renewal_off": False, ":stop_time": now_ts})
                 
             db_utils.state_table.update_item(
                 Key={'deviceId': device_id},
