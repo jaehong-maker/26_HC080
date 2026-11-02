@@ -739,7 +739,7 @@ static String buildControlDiagnosticJson() {
   portEXIT_CRITICAL(&diagnosticMux);
 
   JsonDocument doc;
-  doc["diagnostic_version"] = 13;
+  doc["diagnostic_version"] = 14;
   appendLedDiagnostics(doc);
   appendLoadcellDiagnostics(doc);
   doc["led_status"] = getLedStatus();
