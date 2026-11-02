@@ -430,7 +430,13 @@ static void processServerResponse(const String& response, bool isWeatherRefreshR
       recordControlDiagnostic("ambient-recommend", "discarded-mode");
       return;
     }
-    serverActiveMode = "ambient";
+    // The server delivers music, LED and spray together through subsequent
+    // POLL responses. Retain this direct response for diagnostics only: it
+    // must not apply settings or restart/stop a spray, regardless of arrival
+    // order relative to POLL. Do not deduplicate distinct POLL commands by time.
+    lastAmbientRecommendationDisposition = "deferred-to-poll";
+    recordControlDiagnostic("ambient-recommend", "deferred-to-poll");
+    return;
   }
   const bool ambientResponse = serverActiveMode == "ambient";
   bool shouldApplySettings = ambientResponse || canApplyServerSettings() || isAppCmd;
@@ -456,15 +462,6 @@ static void processServerResponse(const String& response, bool isWeatherRefreshR
     ledEnabled = newBright > 0 && !(ledR == 0 && ledG == 0 && ledB == 0);
     prefs.putInt("ledBright", ledBrightness); prefs.putUChar("ledR", ledR); prefs.putUChar("ledG", ledG); prefs.putUChar("ledB", ledB); prefs.putBool("ledEnabled", ledEnabled);
     systemHeartbeat();
-  }
-
-  if (isAmbientRecommendation) {
-    // The mailbox delivers spray commands via POLL. Applying only music/LED
-    // here avoids a second pump start without inventing time-based dedup IDs.
-    applyAmbientMusic(doc);
-    lastAmbientRecommendationDisposition = "music-led-only";
-    recordControlDiagnostic("ambient-recommend", "music-led-only");
-    return;
   }
 
   // 🟢 2. 모드 및 서버 상태 파싱
@@ -738,7 +735,7 @@ static String buildControlDiagnosticJson() {
   portEXIT_CRITICAL(&diagnosticMux);
 
   JsonDocument doc;
-  doc["diagnostic_version"] = 9;
+  doc["diagnostic_version"] = 10;
   appendLedDiagnostics(doc);
   appendLoadcellDiagnostics(doc);
   doc["led_status"] = getLedStatus();
@@ -751,6 +748,8 @@ static String buildControlDiagnosticJson() {
   doc["last_ambient_recommendation_at_ms"] = lastAmbientRecommendationAt;
   doc["ambient_recommendation_disposition"] = lastAmbientRecommendationDisposition;
   doc["ambient_spray_command_source"] = "POLL only";
+  doc["ambient_music_command_source"] = "POLL only";
+  doc["ambient_led_command_source"] = "POLL only";
   doc["poll_device_id"] = "SS";
   PollDiagnostic pollSnapshot;
   const bool pollSnapshotAvailable = pollDiagnosticMutex && xSemaphoreTake(pollDiagnosticMutex, 0) == pdTRUE;
