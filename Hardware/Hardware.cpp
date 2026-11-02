@@ -36,10 +36,23 @@ float calculateStdDev(int* samples, int count, float average) {
 
 namespace {
 const char *ledOutputStage = "startup";
+bool solidLedFrameValid = false;
+uint8_t solidLedR = 0, solidLedG = 0, solidLedB = 0;
+int solidLedBrightness = 0;
+uint32_t ledOutputSkippedCount = 0;
 }
-static void recordLedOutput(uint8_t r, uint8_t g, uint8_t b, const char *source);
+static void recordLedOutput(uint8_t r, uint8_t g, uint8_t b, const char *source, bool transmitted = true);
 
 void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
+  // NeoPixels retain the last frame. Do not retransmit an unchanged solid
+  // frame on every loop (including unchanged warning on/off phases).
+  // Keep semantic status/source transitions in the trace even without a write.
+  if (solidLedFrameValid && solidLedR == r && solidLedG == g &&
+      solidLedB == b && solidLedBrightness == ledBrightness) {
+    ++ledOutputSkippedCount;
+    recordLedOutput(r, g, b, ledOutputStage, false);
+    return;
+  }
   strip.setBrightness(ledBrightness); 
   
   for(int i = 0; i < NUM_LEDS; i++) {
@@ -54,6 +67,11 @@ void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
   }
   
   strip.show();
+  solidLedR = r;
+  solidLedG = g;
+  solidLedB = b;
+  solidLedBrightness = ledBrightness;
+  solidLedFrameValid = true;
   recordLedOutput(r, g, b, ledOutputStage);
 }
 
@@ -116,10 +134,10 @@ uint32_t ledOutputShowCount = 0;
 }
 const char *getLedStatus() { return ledStatus; }
 
-static void recordLedOutput(uint8_t r, uint8_t g, uint8_t b, const char *source) {
+static void recordLedOutput(uint8_t r, uint8_t g, uint8_t b, const char *source, bool transmitted) {
   // Main-loop/boot owned. Record commands sent to the strip, not optical
-  // feedback; unchanged redraws are counted without flooding the history.
-  ++ledOutputShowCount;
+  // feedback; show count includes only actual calls to strip.show().
+  if (transmitted) ++ledOutputShowCount;
   if (ledOutputHistoryCount) {
     const LedOutputEvent &last = ledOutputHistory[(ledOutputWriteIndex + LED_OUTPUT_HISTORY_SIZE - 1) % LED_OUTPUT_HISTORY_SIZE];
     if (last.r == r && last.g == g && last.b == b && last.brightness == ledBrightness &&
@@ -207,6 +225,9 @@ void systemHeartbeat() {
             }
           }
           strip.setBrightness(ledBrightness);
+          // A later solid frame must replace every rainbow pixel, even when
+          // its requested RGB matches the solid frame preceding the rainbow.
+          solidLedFrameValid = false;
           strip.show();
           uint32_t color = strip.getPixelColor(4);
           recordLedOutput((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff, "rainbow");
@@ -240,6 +261,8 @@ void appendLedDiagnostics(JsonDocument &doc) {
   doc["led_effect"] = static_cast<int>(ledEffect);
   doc["led_output_trace_kind"] = "commanded-rgb-not-optical-feedback";
   doc["led_output_show_count"] = ledOutputShowCount;
+  doc["led_output_skipped_count"] = ledOutputSkippedCount;
+  doc["led_output_policy"] = "solid-on-change-rainbow-20ms";
   doc["led_output_change_count"] = ledOutputChangeCount;
   JsonArray output = doc["led_output_events"].to<JsonArray>();
   const size_t oldest = (ledOutputWriteIndex + LED_OUTPUT_HISTORY_SIZE - ledOutputHistoryCount) % LED_OUTPUT_HISTORY_SIZE;
