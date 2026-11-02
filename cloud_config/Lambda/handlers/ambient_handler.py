@@ -202,7 +202,7 @@ def handle_ambient(mode, body, device_id, normalized_weights):
                     }, ensure_ascii=False)
                 }
 
-            # 순간 스파이크는 추천을 바꾸지 않고, 서버가 확정한 3분 지속 소음만 사용함
+            # 순간 스파이크로 바로 변경하지 않고, 서버의 분석 구간 평균을 사용함
             music_code, led_dict = api_utils.ask_gemini_ambient_mood(
                 effective_db,
                 db_1hr_avg,

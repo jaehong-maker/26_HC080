@@ -84,7 +84,7 @@ DEFAULT_SPRAY_TO_KIND = {
 
 AMBIENT_DEFAULT_SCENT = 1
 AMBIENT_DURATION_SECONDS = 3
-AMBIENT_ANALYSIS_WINDOW_SECONDS = 180
+AMBIENT_ANALYSIS_WINDOW_SECONDS = 60  # 테스트용 1분 분석 구간 (기존 180초)
 AMBIENT_SAMPLE_GAP_RESET_SECONDS = 10
 AMBIENT_MAX_SAMPLES = 600
 AMBIENT_HIGH_THRESHOLD_DB = 60
@@ -100,6 +100,8 @@ AMBIENT_TIME_SLOTS = (
     {"label": "Night", "start": 18, "end": 24},
 )
 
+# 소음 구간: Quiet < 60, Moderate 60~79, Loud >= 80.
+# max는 미포함 경계이므로 소수 평균값 79.9도 Moderate로 분류함.
 AMBIENT_NOISE_BUCKETS = (
     {"label": "Quiet", "min": 0, "max": 60},
     {"label": "Moderate", "min": 60, "max": 80},

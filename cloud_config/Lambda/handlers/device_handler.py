@@ -27,7 +27,7 @@ def handle_device(action, mode, body, device_id, normalized_weights):
             logger.debug(f"[POLL_HARDWARE] ID:{device_id} Weights:{normalized_weights} DB:{current_db}")
 
             now_epoch = int(time.time())
-            window_seconds = int(getattr(config, "AMBIENT_ANALYSIS_WINDOW_SECONDS", 180))
+            window_seconds = int(getattr(config, "AMBIENT_ANALYSIS_WINDOW_SECONDS", 60))
             gap_reset_seconds = int(getattr(config, "AMBIENT_SAMPLE_GAP_RESET_SECONDS", 10))
             max_samples = int(getattr(config, "AMBIENT_MAX_SAMPLES", 600))
             last_sample_time = int(previous_state.get("db_last_sample_time", 0))
