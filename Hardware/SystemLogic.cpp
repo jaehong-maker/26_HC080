@@ -127,7 +127,9 @@ void initSystem() {
 
   mySoftwareSerial.begin(9600, SERIAL_8N1, DFPLAYER_RX_PIN, DFPLAYER_TX_PIN);
   
-  if (!myDFPlayer.begin(mySoftwareSerial, true, false)) { 
+  // Missing DFPlayer ACKs must not stall the main-loop loadcell refresh.
+  // Keep reset disabled and retain the independent sensor/pump safety checks.
+  if (!myDFPlayer.begin(mySoftwareSerial, false, false)) {
     Serial.println(C_RED "⚠️ [Audio] 스피커 연결 불량! 무음 모드로 바이패스합니다." C_RESET);
   }
 

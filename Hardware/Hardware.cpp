@@ -409,6 +409,16 @@ int32_t sensorFaultRaw[4] = {};
 long sensorFaultOffset[4] = {};
 float sensorFaultScale[4] = {};
 const char *sensorLastFaultReason[4] = {"none", "none", "none", "none"};
+struct LoadcellFrameEvidence {
+  bool captured = false;
+  unsigned long atMillis = 0;
+  uint8_t readyMask = 0;
+  uint8_t completedMask = 0;
+  uint32_t highSpanMaxUs = 0;
+  int32_t raw = 0;
+};
+LoadcellFrameEvidence sensorFrameEvidence[4];
+uint32_t loadcellHighSpanMaxUs = 0;
 
 static bool updateLoadcellRecoveryWindow(LoadcellRecoveryWindow &state,
     bool eligible, float value, unsigned long now) {
@@ -436,11 +446,13 @@ bool measurementValidLocked(int i, unsigned long now) {
          now - lastSampleMillis[i] <= SAMPLE_MAX_AGE_MS;
 }
 
-void latchSensorFault(int i, const char *reason, int32_t raw) {
+void latchSensorFault(int i, const char *reason, int32_t raw,
+    uint8_t readyMask = 0, uint8_t completedMask = 0, uint32_t highSpanMaxUs = 0) {
   portENTER_CRITICAL(&loadcellStateMux);
   // Preserve the first rejected frame; later faults must never make a shared
   // clock desynchronization eligible for automatic recovery.
   if (!sensorFaultLatched[i]) {
+    sensorFrameEvidence[i].captured = false;
     ++sensorFaultCount[i];
     sensorFaultAt[i] = millis();
     sensorFaultRaw[i] = raw;
@@ -453,6 +465,14 @@ void latchSensorFault(int i, const char *reason, int32_t raw) {
   if (strcmp(reason, "out-of-range") != 0) {
     sensorRecoveryAllowed[i] = false;
     sensorFaultReason[i] = reason;
+  }
+  if (strcmp(reason, "frame-desync") == 0 && !sensorFrameEvidence[i].captured) {
+    sensorFrameEvidence[i].captured = true;
+    sensorFrameEvidence[i].atMillis = millis();
+    sensorFrameEvidence[i].readyMask = readyMask;
+    sensorFrameEvidence[i].completedMask = completedMask;
+    sensorFrameEvidence[i].highSpanMaxUs = highSpanMaxUs;
+    sensorFrameEvidence[i].raw = raw;
   }
   recoveryWindow[i].frames = 0;
   sensorFaultLatched[i] = true;
@@ -488,30 +508,39 @@ uint8_t readLoadcellFrame(int32_t raw[4]) {
 
   // Never call HX711::read/get_units/tare individually on this shared clock.
   // Keep each high pulse below 50 us, including protection from interrupts.
+  uint32_t highSpanMaxUs = 0;
   portENTER_CRITICAL(&loadcellClockMux);
   for (int bit = 0; bit < 24; ++bit) {
+    const uint32_t pulseStartedAt = micros();
     digitalWrite(LOADCELL_SCK[0], HIGH);
     delayMicroseconds(1);
     for (int i = 0; i < 4; ++i) raw[i] = (raw[i] << 1) | digitalRead(LOADCELL_DT[i]);
     digitalWrite(LOADCELL_SCK[0], LOW);
+    // Measure outside the HIGH interval: include both GPIO call overheads.
+    const uint32_t highSpanUs = micros() - pulseStartedAt;
+    if (highSpanUs > highSpanMaxUs) highSpanMaxUs = highSpanUs;
     delayMicroseconds(1);
   }
+  const uint32_t pulseStartedAt = micros();
   digitalWrite(LOADCELL_SCK[0], HIGH); // Pulse 25: next conversion A / gain 128.
   delayMicroseconds(1);
   digitalWrite(LOADCELL_SCK[0], LOW);
+  const uint32_t highSpanUs = micros() - pulseStartedAt;
+  if (highSpanUs > highSpanMaxUs) highSpanMaxUs = highSpanUs;
   delayMicroseconds(1);
   uint8_t completed = 0;
   for (int i = 0; i < 4; ++i) {
     if (digitalRead(LOADCELL_DT[i]) == HIGH) completed |= (1U << i);
   }
   portEXIT_CRITICAL(&loadcellClockMux);
+  if (highSpanMaxUs > loadcellHighSpanMaxUs) loadcellHighSpanMaxUs = highSpanMaxUs;
 
   uint8_t valid = ready & completed;
   for (int i = 0; i < 4; ++i) {
     if (raw[i] & 0x800000) raw[i] -= 0x1000000;
     if (raw[i] == -8388608 || raw[i] == 8388607) valid &= ~(1U << i);
     // A channel that missed shared clocks must be reset/tared before reuse.
-    if (!(valid & (1U << i))) latchSensorFault(i, "frame-desync", raw[i]);
+    if (!(valid & (1U << i))) latchSensorFault(i, "frame-desync", raw[i], ready, completed, highSpanMaxUs);
     lastRawFrame[i] = raw[i];
   }
   ++loadcellFrameSequence;
@@ -765,6 +794,7 @@ void appendLoadcellDiagnostics(JsonDocument &doc) {
     long faultOffset;
     float faultScale;
     const char *lastFaultReason;
+    LoadcellFrameEvidence frame;
   };
   Snapshot state[4];
   const unsigned long now = millis();
@@ -780,10 +810,13 @@ void appendLoadcellDiagnostics(JsonDocument &doc) {
     state[i].faultOffset = sensorFaultOffset[i];
     state[i].faultScale = sensorFaultScale[i];
     state[i].lastFaultReason = sensorLastFaultReason[i];
+    state[i].frame = sensorFrameEvidence[i];
   }
   portEXIT_CRITICAL(&loadcellStateMux);
   doc["loadcell_boot_attempts"] = bootAttempts;
   doc["loadcell_boot_fault_mask"] = bootFaultMask;
+  doc["loadcell_sck_high_span_max_us"] = loadcellHighSpanMaxUs;
+  doc["loadcell_sck_span_note"] = "software-span-includes-gpio-call-overhead-not-oscilloscope";
   doc["loadcell_recovery_policy"] = "out-of-range-only-stable-all-pumps-idle";
   doc["loadcell_recovery_min_frames"] = RECOVERY_MIN_FRAMES;
   doc["loadcell_recovery_min_ms"] = RECOVERY_STABLE_MS;
@@ -816,6 +849,19 @@ void appendLoadcellDiagnostics(JsonDocument &doc) {
       fault["raw"] = state[i].faultRaw;
       fault["offset"] = state[i].faultOffset;
       fault["scale"] = state[i].faultScale;
+    }
+    if (state[i].frame.captured) {
+      const LoadcellFrameEvidence &evidence = state[i].frame;
+      const uint8_t channelBit = 1U << i;
+      JsonObject frame = entry["last_frame_fault"].to<JsonObject>();
+      frame["at_ms"] = evidence.atMillis;
+      frame["raw"] = evidence.raw;
+      frame["ready_mask"] = evidence.readyMask;
+      frame["completed_mask"] = evidence.completedMask;
+      frame["sck_high_span_max_us"] = evidence.highSpanMaxUs;
+      frame["cause"] = !(evidence.readyMask & channelBit) ? "not-ready-before-clock" :
+          !(evidence.completedMask & channelBit) ? "not-high-after-clock" :
+          (evidence.raw == -8388608 || evidence.raw == 8388607) ? "adc-saturated" : "invalid-frame";
     }
     entry["weight_g"] = weights[i];
     entry["percent"] = calculateScentPercent(weights[i]);
