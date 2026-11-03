@@ -3,6 +3,7 @@
 import os
 import json
 import logging
+import math
 import random
 from datetime import datetime, timedelta, timezone
 
@@ -18,6 +19,72 @@ from .common import (
 )
 
 logger = logging.getLogger()
+
+
+def _replace_diary_feedback(device_id, context, spray_no, rejected_kind, email):
+    """Queue a complete replacement after the diary app's explicit stop."""
+    state = db_utils.state_table.get_item(
+        Key={"deviceId": device_id}, ConsistentRead=True,
+    ).get("Item", {})
+    mapping = db_utils.get_spray_mapping(device_id)
+    disabled = {int(slot) for slot in getattr(config, "DIARY_DISABLED_SPRAY_SLOTS", (2,))}
+    rejected = {int(digit) for digit in str(rejected_kind) if digit.isdigit()}
+    weights = state.get("weights")
+    candidates = []
+    for slot, kind in sorted((int(slot), int(kind)) for slot, kind in mapping.items()):
+        if slot not in (1, 2, 3, 4) or slot in disabled or kind in rejected or kind not in config.SCENT_KINDS:
+            continue
+        if isinstance(weights, list):
+            try:
+                percent = float(weights[slot - 1])
+            except (IndexError, TypeError, ValueError):
+                continue
+            if not math.isfinite(percent) or percent < config.AMBIENT_MIN_SCENT_PERCENT:
+                continue
+        music = int(db_utils.get_music_track(device_id, slot, is_pump=True) or 0)
+        candidates.append((kind, slot, music))
+
+    if not candidates:
+        return {"statusCode": 200, "body": json.dumps({
+            "result": "FAIL", "message": "대체할 수 있는 정상 장착 향기가 없습니다.",
+        }, ensure_ascii=False)}
+
+    old_music = int(state.get("current_music", 0) or 0)
+    if old_music <= 0:
+        old_music = int(db_utils.get_music_track(device_id, spray_no, is_pump=True) or 0)
+    different_music = [item for item in candidates if item[2] > 0 and item[2] != old_music]
+    pool = different_music or candidates
+    new_kind = db_utils.get_preferred_alternative(
+        device_id, context, rejected_kind, email,
+        allowed_kinds=[item[0] for item in pool],
+    )
+    new_kind, new_spray, music = next((item for item in pool if item[0] == new_kind), pool[0])
+    duration = 3
+    saved = db_utils.manage_mailbox(
+        device_id, new_spray, context, duration,
+        save_active_mode="manual", save_active_scent=new_spray, save_music=music,
+        save_diary_music=music,
+        expected_initial_state=state,
+    )
+    if saved != new_spray:
+        return {"statusCode": 200, "body": json.dumps({
+            "result": "FAIL", "message": "새 정지 또는 모드 변경으로 대체 명령을 적용하지 않았습니다.",
+        }, ensure_ascii=False)}
+
+    scheduled = db_utils.schedule_implicit_like(
+        device_id, context, new_kind, email, delay_seconds=600,
+    )
+    return {
+        "statusCode": 200, "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({
+            "result": "SUCCESS", "status": "SUCCESS",
+            "message": f"싫어요를 반영해 {new_spray}번 향기와 음악 변경 명령을 보냈습니다.",
+            "spray": new_spray, "active_mode": "manual", "active_scent": new_spray,
+            "app_command": True, "duration": duration, "music": music, "context": context,
+            "implicit_like_scheduled": scheduled,
+            "implicit_like_after_seconds": 600 if scheduled else 0,
+        }, ensure_ascii=False),
+    }
 
 # handle_feedback 처리를 담당함
 def handle_feedback(action, mode, body, device_id):
@@ -220,6 +287,8 @@ def handle_feedback(action, mode, body, device_id):
             db_utils.save_feedback(device_id, ctx, real_kind_code, weight_val, u_email)
 
             if not is_like:
+                if ctx == "AI_DIARY":
+                    return _replace_diary_feedback(device_id, ctx, spray_no, real_kind_code, u_email)
                 db_utils.state_table.update_item(
                     Key={'deviceId': device_id},
                     UpdateExpression="set last_spray_time = :t",

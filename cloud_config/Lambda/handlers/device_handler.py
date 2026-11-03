@@ -120,14 +120,16 @@ def _prepare_noise_update(state, body, now):
             state.get("active_mode") == "ambient" and updates["db_window_ready"]
             and previous_bucket and average_bucket != previous_bucket
         )
-        effective_db = float(state.get("ambient_effective_db", average)) if previous_context else average
+        applied_effective_db = float(state.get("ambient_effective_db", average)) if previous_context else average
+        effective_db = applied_effective_db
         if bucket_changed:
             effective_db = average
         updates.update({
             "db_level": Decimal(str(current_db)), "db_last_sample_time": Decimal(str(now)),
             "db_avg": Decimal(str(average)), "db_stddev": Decimal(str(stddev)),
             "noise_type": "불규칙적(대화/활동)" if stddev > 8.0 else "안정적(음악/정적)",
-            "is_spike": is_spike, "ambient_effective_db": Decimal(str(effective_db)),
+            # A candidate bucket is applied only when the command commits.
+            "is_spike": is_spike, "ambient_effective_db": Decimal(str(applied_effective_db)),
         })
         if state.get("active_mode") == "ambient" and current_db >= config.AMBIENT_HIGH_THRESHOLD_DB:
             continuous = not reset and state.get("microphone_valid") is True
@@ -196,6 +198,10 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                 **noise_updates,
             }
             current_music = body.get("music")
+            updates["device_last_poll_time"] = Decimal(str(now_timestamp))
+            if current_music is not None:
+                updates["device_reported_music"] = int(current_music)
+            updates["device_music_finish_reporting"] = isinstance(body.get("music_finished"), bool)
             if current_music is not None and previous_state.get("active_mode") != "ambient":
                 updates["current_music"] = int(current_music)
             exp_vals = {}
@@ -228,6 +234,9 @@ def handle_device(action, mode, body, device_id, normalized_weights):
             except Exception as error:
                 startup_ready = False
                 logger.error("Weight/noise update failed: %s", error)
+
+            if previous_state.get("diary_restart_pending", False):
+                db_utils.activate_diary_playback(device_id, current_music)
 
             if previous_state.get("active_mode") == "ambient":
                 # Only a hardware POLL may request a due finite extension.
@@ -270,10 +279,12 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                         )
                     except Exception as e:
                         logger.error(f"[AMBIENT_AUTO_RECOMMEND_ERROR] ID:{device_id} {e}")
-                elif sample_valid and measurement_updated and not startup_pending and not noise_bucket_changed:
+                elif not startup_pending:
                     # Track rotation neither queues a spray command nor renews
                     # its lease. The normal POLL response delivers music only.
-                    db_utils.rotate_ambient_music(device_id, now_timestamp, body.get("music"))
+                    db_utils.rotate_ambient_music(
+                        device_id, now_timestamp, body.get("music"), body.get("music_finished"),
+                    )
 
         state = db_utils.get_device_state(device_id) or {}
         
@@ -311,8 +322,15 @@ def handle_device(action, mode, body, device_id, normalized_weights):
         current_spray = int(state.get('current_spray', 0))
         active_spray = spray_code if spray_code > 0 else current_spray
         active_mode = state.get('active_mode', 'ready')
+        fixed_diary_music = int(state.get("diary_music_track", 0) or 0)
+        is_fixed_diary = (
+            active_mode == "manual" and fixed_diary_music > 0
+            and int(state.get("diary_music_spray", 0) or 0) == active_spray
+        )
         if active_mode == "ambient":
             music_code = int(state.get("current_music", 0))
+        elif is_fixed_diary:
+            music_code = fixed_diary_music
         else:
             music_code = db_utils.get_music_track(device_id, active_spray, is_pump=True) if active_spray > 0 else 0
         
@@ -384,6 +402,14 @@ def handle_device(action, mode, body, device_id, normalized_weights):
             "ambient_effective_db": float(state.get("ambient_effective_db", 40)),
             "ambient_context": state.get("ambient_context", ""),
             "ambient_startup_pending": bool(state.get("ambient_startup_pending", False)),
+            "ambient_music_policy": "finished-or-60s-v2",
+            "ambient_bucket_music_policy": "immediate-bucket-v1",
+            "ambient_music_changed_at": int(state.get("ambient_music_changed_at", 0)),
+            "ambient_music_rotation_seconds": int(config.AMBIENT_MUSIC_ROTATION_SECONDS),
+            "ambient_renewal_enabled": bool(state.get("ambient_renewal_enabled", False)),
+            "device_reported_music": int(state.get("device_reported_music", 0)),
+            "device_last_poll_time": float(state.get("device_last_poll_time", 0)),
+            "device_music_finish_reporting": bool(state.get("device_music_finish_reporting", False)),
             "ambient_startup_avg": float(state.get("ambient_startup_avg", 0)),
             "weights": final_weights,
             "mapping": mapping_dict,
@@ -392,6 +418,13 @@ def handle_device(action, mode, body, device_id, normalized_weights):
         }
         if microphone_valid:
             response_body["db_level"] = last_level
+        if is_fixed_diary and not is_app_request:
+            # The device builds its playlist from music_tracks, not music.
+            # Give it one song for this session without changing saved settings.
+            slots = [int(digit) for digit in str(active_spray) if digit in "1234"]
+            playback_tracks = ["0"] * 4
+            playback_tracks[slots[0] - 1] = str(fixed_diary_music)
+            response_body["music_tracks"] = "_".join(playback_tracks)
         for field in ("db_avg", "db_stddev", "ambient_startup_avg", "ambient_effective_db"):
             if field not in state:
                 response_body.pop(field, None)
@@ -564,7 +597,9 @@ def handle_device(action, mode, body, device_id, normalized_weights):
                     ", pending_cmd = :z, ambient_renewal_enabled = :renewal_off, "
                     "ambient_startup_pending = :renewal_off, "
                     "ambient_startup_awaiting_poll = :renewal_off, last_mode_change_time = :stop_time "
-                    "REMOVE ambient_lease_expires_at, ambient_renew_at, ambient_lease_token"
+                    "REMOVE ambient_lease_expires_at, ambient_renew_at, ambient_lease_token, "
+                    "diary_restart_pending, diary_start_token, diary_pending_spray, diary_pending_music, "
+                    "diary_pending_duration, diary_music_track, diary_music_spray"
                 )
                 vals.update({":z": 0, ":renewal_off": False, ":stop_time": now_ts})
                 

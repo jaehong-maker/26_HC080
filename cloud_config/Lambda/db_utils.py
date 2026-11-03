@@ -523,10 +523,10 @@ def _active_kinds(device_id):
 
 # get_music_track 처리를 담당함
 def get_music_track(device_id, spray_or_kind_code, is_pump=False):
-    """Return a music track for the resolved spray slot.
+    """Resolve the first playable track in the selected cartridge order.
 
-    The argument may be a spray number, a kind number, or a blend-like code.
-    If a kind is loaded in a spray slot, that slot's saved music is used.
+    For a pump blend, use the participating slots in command order, matching
+    the device playlist. Never interpret a two-slot pump code as a track ID.
     """
     original_code = spray_or_kind_code
     try:
@@ -537,19 +537,28 @@ def get_music_track(device_id, spray_or_kind_code, is_pump=False):
 
         code = int(spray_or_kind_code)
         if is_pump:
-            spray_no = int(str(code)[0])
+            spray_slots = list(dict.fromkeys(int(digit) for digit in str(code) if digit in "1234"))
         else:
             spray_no = get_spray_from_kind(device_id, code)
             if spray_no is None and 1 <= code <= 4:
                 spray_no = code
+            spray_slots = [int(spray_no)] if spray_no is not None else []
 
-        res = state_table.get_item(Key={"deviceId": device_id})
+        res = state_table.get_item(Key={"deviceId": device_id}, ConsistentRead=True)
         if "Item" in res and "music_tracks" in res["Item"]:
             track_list = str(res["Item"]["music_tracks"]).split("_")
-            if spray_no is not None and 1 <= int(spray_no) <= 4 and len(track_list) == 4:
-                raw_track = track_list[int(spray_no) - 1]
-                first_track = raw_track.split(",")[0].strip()
-                return int(first_track)
+            if len(track_list) == 4:
+                for slot in spray_slots:
+                    if not 1 <= slot <= 4:
+                        continue
+                    for raw_track in track_list[slot - 1].split(","):
+                        try:
+                            track = int(raw_track.strip())
+                        except ValueError:
+                            continue
+                        if track > 0:
+                            return track
+                return 0
     except Exception as e:
         logger.error(f"Music Load Error: {e}")
 
@@ -760,13 +769,16 @@ def get_personalized_scent(device_id, context, default_kind, email=None):
         return default_kind, "에러(기본값)"
 
 
-def get_preferred_alternative(device_id, context, excluded_kind, email=None):
+def get_preferred_alternative(device_id, context, excluded_kind, email=None, allowed_kinds=None):
     """현재 향을 제외하고 해당 context에서 점수가 가장 높은 장착 향을 고름."""
     try:
         excluded_no = int(excluded_kind)
         candidates = [kind for kind in _active_kinds(device_id) if int(kind) != excluded_no]
         if not candidates:
             candidates = [kind for kind in _kind_ids() if int(kind) != excluded_no]
+        if allowed_kinds is not None:
+            allowed = {int(kind) for kind in allowed_kinds}
+            candidates = [kind for kind in candidates if int(kind) in allowed]
         if not candidates:
             return None
 
@@ -847,6 +859,8 @@ def manage_mailbox(
     save_ambient_probe_start=None,
     save_ambient_lease_duration=None,
     save_ambient_metadata=None,
+    save_diary_start=None,
+    save_diary_music=None,
 ):
     try:
         if save_cmd is not None:
@@ -881,6 +895,34 @@ def manage_mailbox(
                 exp_vals[":music"] = int(save_music)
 
             remove_fields = []
+            diary_fields = [
+                "diary_restart_pending", "diary_start_token", "diary_pending_spray",
+                "diary_pending_music", "diary_pending_duration", "diary_music_track", "diary_music_spray",
+            ]
+            if save_diary_start is not None:
+                target = int(save_diary_start["spray"])
+                track = int(save_diary_start["music"])
+                duration = int(save_diary_start["duration"])
+                if int(save_cmd) != 0 or target <= 0 or track <= 0 or not 0 < duration <= 270:
+                    raise ValueError("Invalid diary playback start")
+                update_exp += (
+                    ", diary_restart_pending = :diary_pending, diary_start_token = :diary_token, "
+                    "diary_pending_spray = :diary_spray, diary_pending_music = :diary_music, "
+                    "diary_pending_duration = :diary_duration"
+                )
+                exp_vals.update({
+                    ":diary_pending": True, ":diary_token": uuid.uuid4().hex,
+                    ":diary_spray": target, ":diary_music": track, ":diary_duration": duration,
+                })
+                remove_fields.extend(["diary_music_track", "diary_music_spray"])
+            elif save_diary_music is not None:
+                if int(save_cmd) <= 0 or int(save_diary_music) <= 0:
+                    raise ValueError("Invalid fixed diary music")
+                update_exp += ", diary_music_track = :diary_music, diary_music_spray = :diary_spray"
+                exp_vals.update({":diary_music": int(save_diary_music), ":diary_spray": int(save_cmd)})
+                remove_fields.extend(diary_fields[:5])
+            else:
+                remove_fields.extend(diary_fields)
             if save_ambient_lease_duration is None:
                 # An explicit stop or a command from another mode supersedes
                 # any older continuous-ambient authorization.
@@ -956,6 +998,7 @@ def manage_mailbox(
                 for field in (
                     "active_mode", "last_mode_change_time", "ambient_startup_token",
                     "ambient_startup_pending", "ambient_lease_token", "ambient_renewal_enabled", "pending_cmd",
+                    "diary_restart_pending", "diary_start_token",
                 ):
                     if field in expected_initial_state:
                         token = ":expected_" + field
@@ -1030,6 +1073,25 @@ def manage_mailbox(
         return -1, get_saved_region(device_id), 3
 
 
+def activate_diary_playback(device_id, reported_music):
+    """Start the fixed song only after hardware consumed and applied the stop."""
+    state = state_table.get_item(Key={"deviceId": device_id}, ConsistentRead=True).get("Item", {})
+    if (not state.get("diary_restart_pending", False) or state.get("active_mode") != "ready"
+        or int(state.get("pending_cmd", -1)) != -1 or reported_music is None or int(reported_music) != 0):
+        return False
+    spray = int(state.get("diary_pending_spray", 0))
+    music = int(state.get("diary_pending_music", 0))
+    duration = int(state.get("diary_pending_duration", 3))
+    if spray <= 0 or music <= 0:
+        return False
+    saved = manage_mailbox(
+        device_id, spray, "AI_DIARY", duration,
+        save_active_mode="manual", save_active_scent=spray, save_music=music,
+        save_diary_music=music, expected_initial_state=state,
+    )
+    return saved == spray
+
+
 def renew_ambient_lease(device_id, now_epoch=None):
     """Queue a finite extension only when due, using the active session's scent."""
     state = state_table.get_item(Key={"deviceId": device_id}, ConsistentRead=True).get("Item", {})
@@ -1051,48 +1113,56 @@ def renew_ambient_lease(device_id, now_epoch=None):
     return saved == scent
 
 
-def rotate_ambient_music(device_id, now_epoch, reported_music=None):
-    """Change only the track after a valid, unchanged noise window."""
+def select_ambient_music(bucket, suggested_music=0, current_music=0):
+    """Keep AI suggestions and deterministic fallbacks inside the bucket."""
+    tracks = list(dict.fromkeys(track for track in config.AMBIENT_MUSIC_BY_BUCKET.get(bucket, ())
+                                if track in config.AMBIENT_MUSIC_CATALOG))
+    if not tracks:
+        return 0
+    if suggested_music in tracks and suggested_music != current_music:
+        return suggested_music
+    start = (tracks.index(current_music) + 1) % len(tracks) if current_music in tracks else 0
+    return tracks[start]
+
+
+def rotate_ambient_music(device_id, now_epoch, reported_music=None, music_finished=None):
+    """Advance at EOF; retain timed rotation only for older firmware."""
     try:
         state = state_table.get_item(Key={"deviceId": device_id}, ConsistentRead=True).get("Item", {})
-        now_timestamp = float(now_epoch)
         now_epoch = int(now_epoch)
         context = str(state.get("ambient_context", ""))
         bucket = context.rsplit("_", 1)[-1]
         last_change = int(state.get("ambient_music_changed_at", state.get("ambient_last_eval_time", now_epoch)))
-        last_sample = float(state.get("db_last_sample_time", 0) or 0)
         if (
             state.get("active_mode") != "ambient" or state.get("ambient_startup_pending", False)
             or not state.get("ambient_renewal_enabled", False) or int(state.get("active_scent", 0)) <= 0
-            or int(state.get("pending_cmd", -1)) == 0 or state.get("microphone_valid") is not True
-            or not state.get("db_window_ready", False)
-            or not 0 <= now_timestamp - last_sample < config.AMBIENT_SAMPLE_GAP_RESET_SECONDS
-            or now_epoch - last_change < config.AMBIENT_MUSIC_ROTATION_SECONDS
+            or int(state.get("pending_cmd", -1)) == 0
         ):
             return False
-        average = float(state.get("db_avg", float("nan")))
-        actual_bucket = next((item["label"] for item in config.AMBIENT_NOISE_BUCKETS
-                              if average >= item["min"] and (item["max"] is None or average < item["max"])), "")
-        if not math.isfinite(average) or actual_bucket != bucket:
-            return False
+        if music_finished is not None:
+            # Completion belongs to the reported track, not a timer or a new
+            # microphone window. Explicit False means keep playing the song.
+            if music_finished is not True or reported_music is None:
+                return False
+        else:
+            # The established ambient context already owns this playlist.
+            # Missing microphone samples must not stop legacy music playback.
+            if now_epoch - last_change < config.AMBIENT_MUSIC_ROTATION_SECONDS:
+                return False
         current = int(state.get("current_music", 0) or 0)
         # A POLL reports the playing track. Wait for delivery of the previous
         # selection instead of replacing a command the device has not applied.
-        if reported_music is not None and int(reported_music) != current:
+        if current <= 0 or (reported_music is not None and int(reported_music) != current):
             return False
-        tracks = [track for track in config.AMBIENT_MUSIC_BY_BUCKET.get(bucket, ())
-                  if track in config.AMBIENT_MUSIC_CATALOG]
-        if len(set(tracks)) < 2:
+        selected = select_ambient_music(bucket, current_music=current)
+        if selected <= 0 or selected == current:
             return False
-        start = (tracks.index(current) + 1) % len(tracks) if current in tracks else 0
-        selected = next(track for track in tracks[start:] + tracks[:start] if track != current)
         values = {":music": selected, ":changed": now_epoch}
         conditions = []
         for field in (
             "active_mode", "last_mode_change_time", "ambient_startup_token", "ambient_startup_pending",
             "ambient_renewal_enabled", "ambient_lease_token", "active_scent", "ambient_context",
             "current_music", "ambient_music_changed_at", "ambient_last_eval_time", "pending_cmd",
-            "microphone_valid", "db_last_sample_time", "db_window_ready", "db_avg",
         ):
             if field in state:
                 token = ":expected_" + field

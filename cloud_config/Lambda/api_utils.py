@@ -112,14 +112,22 @@ def ask_gemini_recommendation(diary_text, user_history_text, slot_info_str="1번
 # ask_gemini_ambient_mood 처리를 담당함
 def ask_gemini_ambient_mood(db_avg, db_1hr_avg, is_spike, db_stddev):
     """
-    소음 모드(Ambient Mode)에서 15분 쿨타임 만료 시 또는 Spike 발생 시 호출되어,
-    현재 소음 환경에 어울리는 조명(LED)과 배경음악(Music)을 추천함.
+    소음 모드의 초기 측정 완료나 구간 변경 시 조명과 구간 내 음악을 추천함.
     """
     api_key = getattr(config, "GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", "")).strip()
     if not api_key:
         logger.error("Gemini API 키가 없습니다.")
         return 0, {"led_r": -1, "led_g": -1, "led_b": -1, "led_bright": -1}
 
+    noise_bucket = next((item["label"] for item in config.AMBIENT_NOISE_BUCKETS
+                         if db_avg >= item["min"] and (item["max"] is None or db_avg < item["max"])), "Quiet")
+    tracks = [track for track in config.AMBIENT_MUSIC_BY_BUCKET.get(noise_bucket, ())
+              if track in config.AMBIENT_MUSIC_CATALOG]
+    track_options = "\n".join(
+        f"    - {track}: {config.AMBIENT_MUSIC_CATALOG[track]['title']} / "
+        f"{config.AMBIENT_MUSIC_CATALOG[track]['artist']}" for track in tracks
+    )
+    example_music = tracks[0] if tracks else 0
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
 
     prompt = f"""
@@ -132,8 +140,9 @@ def ask_gemini_ambient_mood(db_avg, db_1hr_avg, is_spike, db_stddev):
     - 급격한 소음 변화(Spike) 발생 여부: {is_spike}
 
     [조건]
-    1. 'music' 필드에 1부터 25 사이의 숫자로 배경 음악 트랙 번호를 추천해줘. 
-       - 소음이 적고 안정적이면 잔잔한 음악(낮은 번호대), 소음이 크거나 변화가 크면 활기찬 음악(높은 번호대) 추천.
+    1. 현재 소음 구간은 {noise_bucket}이다. 'music'은 아래 목록 안에서만 선택해줘.
+       곡 번호 크기는 분위기와 무관하다. 제목과 가수, 소음 환경을 기준으로 선택해줘.
+{track_options}
     2. 'led_r', 'led_g', 'led_b' 필드에 0~255 사이의 RGB 조명 색상을 추천해줘.
        - 시끄러운 환경이면 차분한 색상(파란색, 보라색 계열) 또는 역동적인 색상(빨간색, 주황색).
        - 조용한 환경이면 따뜻한 색상(노란색, 초록색).
@@ -141,7 +150,7 @@ def ask_gemini_ambient_mood(db_avg, db_1hr_avg, is_spike, db_stddev):
     3. 'led_bright' 필드에 0~255 사이의 밝기를 추천해줘. (기본적으로 100~255 사이)
 
     반드시 아래와 같은 순수 JSON 형태로만 대답해:
-    {{"music": 6, "led_r": 255, "led_g": 180, "led_b": 0, "led_bright": 150}}
+    {{"music": {example_music}, "led_r": 255, "led_g": 180, "led_b": 0, "led_bright": 150}}
     """
 
     payload = json.dumps({

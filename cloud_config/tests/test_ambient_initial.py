@@ -13,7 +13,7 @@ import types
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 
 LAMBDA_DIR = Path(__file__).resolve().parents[1] / "Lambda"
@@ -65,7 +65,7 @@ class AmbientInitialTests(unittest.TestCase):
         cls.feedback = importlib.import_module("handlers.feedback_handler")
         nodes = ast.parse((LAMBDA_DIR / "db_utils.py").read_text(encoding="utf-8-sig"))
         selected = [node for node in nodes.body if isinstance(node, ast.FunctionDef)
-                    and node.name in ("manage_mailbox", "get_ambient_scent_recommendation", "get_ambient_spray_recommendation", "renew_ambient_lease", "rotate_ambient_music")]
+                    and node.name in ("manage_mailbox", "get_ambient_scent_recommendation", "get_ambient_spray_recommendation", "renew_ambient_lease", "select_ambient_music", "rotate_ambient_music")]
         cls.db.__dict__.update(config=cls.config, uuid=uuid, math=math, logger=logging.getLogger("ambient-tests"))
         exec(compile(ast.Module(body=selected, type_ignores=[]), "db_utils.py", "exec"), cls.db.__dict__)
 
@@ -121,8 +121,10 @@ class AmbientInitialTests(unittest.TestCase):
         self.assertEqual(response["statusCode"], 200, response)
         return json.loads(response["body"])
 
-    def poll(self, level=50, microphone_valid=True, include_db=True):
+    def poll(self, level=50, microphone_valid=True, include_db=True, music_finished=None):
         payload = {"music": self.playing_music}
+        if music_finished is not None:
+            payload["music_finished"] = music_finished
         if microphone_valid is not None:
             payload["microphone_valid"] = microphone_valid
         if include_db:
@@ -221,7 +223,7 @@ class AmbientInitialTests(unittest.TestCase):
             self.assertGreater(self.pump_expires_at, self.epoch)
             response = self.poll()
             if elapsed % 30 == 0:
-                self.assertEqual((response["spray"], response["duration"], response["music"]), (2, 60, 0))
+                self.assertEqual((response["spray"], response["duration"]), (2, 60))
             else:
                 self.assertEqual(response["spray"], -1)
         self.assertTrue(response["db_window_ready"])
@@ -239,13 +241,164 @@ class AmbientInitialTests(unittest.TestCase):
             response = self.poll(45 if elapsed % 4 == 0 else 55)
             if response["music"] > 0:
                 changes.append((elapsed, response["music"]))
-                self.assertEqual((response["spray"], response["app_command"]), (-1, False))
+                # The independent 30-second lease renewal can share this POLL.
+                self.assertEqual(response["spray"], initial_scent)
             self.assertEqual(response["active_scent"], initial_scent)
             self.assertEqual(tuple(response[field] for field in ("led_r", "led_g", "led_b", "led_br")), initial_led)
-        self.assertEqual(changes, [(62, 7), (122, 8), (182, 9)])
+        self.assertEqual(changes, [(60, 7), (120, 8), (180, 9)])
         self.assertTrue(all(scent == initial_scent for _, scent, _ in self.spray_commands))
+        self.assertEqual([int(when - start) for when, _, _ in self.spray_commands[1:]], list(range(30, 181, 30)))
         self.api.ask_gemini_ambient_mood.assert_called_once()
         self.db.update_device_state.assert_called_once()  # music does not consume scent
+
+    def test_same_bucket_plays_the_whole_song_then_advances_without_changing_outputs(self):
+        self.start_selected(level=70)
+        self.assertEqual(self.playing_music, 3)  # AI's Quiet track 6 is rejected for Moderate.
+        scent = self.table.state["active_scent"]
+        led = tuple(self.table.state[field] for field in ("led_r", "led_g", "led_b", "led_br"))
+        start = self.epoch
+        for elapsed in range(2, 185, 2):
+            self.epoch = start + elapsed
+            response = self.poll(70, music_finished=False)
+            self.assertEqual(response["music"], 0)  # No 60-second interruption.
+            self.assertEqual(self.playing_music, 3)
+            self.assertGreater(self.pump_expires_at, self.epoch)
+        self.epoch += 2
+        response = self.poll(70, music_finished=True)
+        self.assertEqual((response["music"], response["spray"], response["app_command"]), (4, -1, False))
+        self.assertEqual(self.table.state["active_scent"], scent)
+        self.assertEqual(tuple(self.table.state[field] for field in ("led_r", "led_g", "led_b", "led_br")), led)
+        self.assertTrue(all(command[1] == scent for command in self.spray_commands))
+        self.assertEqual(self.poll(70, music_finished=False)["music"], 0)
+        self.api.ask_gemini_ambient_mood.assert_called_once()
+        self.db.update_device_state.assert_called_once()
+
+    def test_finished_short_song_advances_before_a_minute_without_a_noise_window(self):
+        self.start_selected(level=70)
+        self.epoch += 2
+        self.assertFalse(self.table.state["db_window_ready"])
+        response = self.poll(70, music_finished=True)
+        self.assertEqual((response["music"], response["spray"]), (4, -1))
+
+    def test_finished_song_advances_even_if_microphone_is_temporarily_invalid(self):
+        self.start_selected()
+        self.epoch += 2
+        response = self.poll(microphone_valid=False, include_db=False, music_finished=True)
+        self.assertEqual((response["music"], response["spray"]), (7, -1))
+        self.assertFalse(response["microphone_valid"])
+
+    def test_repeated_finish_report_retries_the_same_next_song_without_skipping(self):
+        self.start_selected(level=70)
+        self.epoch += 2
+        self.assertEqual(self.poll(70, music_finished=True)["music"], 4)
+        self.playing_music = 3  # Simulate losing the next-song response.
+        self.epoch += 2
+        self.assertEqual(self.poll(70, music_finished=True)["music"], 4)
+        self.epoch += 2
+        self.assertEqual(self.poll(70, music_finished=False)["music"], 0)
+        self.epoch += 2
+        self.assertEqual(self.poll(70, music_finished=True)["music"], 10)
+
+    def test_finished_track_must_match_current_selection_and_be_nonzero(self):
+        self.start_selected(level=70)
+        before = copy.deepcopy(self.table.state)
+        for track in (None, 0, 6, 4):
+            with self.subTest(track=track):
+                self.assertFalse(self.db.rotate_ambient_music("SS", self.epoch, track, True))
+                self.assertEqual(self.table.state, before)
+
+    def test_app_cannot_advance_music_by_reporting_a_finished_song(self):
+        self.start_selected(level=70)
+        before = copy.deepcopy(self.table.state)
+        response = self.device.handle_device("POLL", "ambient", {
+            "email": "user@example.com", "music": 3, "music_finished": True,
+        }, "SS", [100] * 4)
+        self.assertEqual(json.loads(response["body"])["music"], 3)
+        self.assertEqual(self.table.state, before)
+
+    def test_finished_report_after_stop_does_not_resume_music(self):
+        self.start_selected(level=70)
+        self.device.handle_device("STOP_ALL", "menu", {}, "SS", [100] * 4)
+        response = self.poll(70, music_finished=True)
+        self.assertEqual((response["spray"], response["music"], response["active_mode"]), (0, 0, "ready"))
+
+    def test_selection_validates_ai_tracks_and_falls_back_inside_each_bucket(self):
+        for bucket, tracks in self.config.AMBIENT_MUSIC_BY_BUCKET.items():
+            with self.subTest(bucket=bucket):
+                for suggestion in (0, 6, 26, -1, 999):
+                    selected = self.db.select_ambient_music(bucket, suggestion)
+                    self.assertIn(selected, tracks)
+                self.assertEqual(self.db.select_ambient_music(bucket, tracks[-1]), tracks[-1])
+                self.assertEqual(self.db.select_ambient_music(bucket, tracks[0], tracks[0]), tracks[1])
+                self.assertEqual(self.db.select_ambient_music(bucket, current_music=tracks[-1]), tracks[0])
+
+    def test_moderate_initial_ai_failure_still_starts_a_moderate_song(self):
+        self.api.ask_gemini_ambient_mood.return_value = (0, {})
+        response = self.start_selected(level=70)
+        self.assertEqual(response["music"], 3)
+        self.assertIn("Moderate", response["ambient_context"])
+
+    def test_same_ai_suggestion_cannot_keep_moderate_on_forest(self):
+        self.start_selected(level=70)
+        self.assertEqual(self.playing_music, 3)
+        for expected in (4, 10, 12, 13, 14, 16, 20, 3):
+            self.epoch += 2
+            response = self.poll(70, music_finished=True)
+            self.assertEqual(response["music"], expected)
+            self.assertNotEqual(response["music"], 6)
+        self.api.ask_gemini_ambient_mood.assert_called_once()
+
+    def test_moderate_ai_prompt_uses_actual_allowed_titles_and_example(self):
+        request = Mock()
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({
+            "candidates": [{"content": {"parts": [{"text": json.dumps({"music": 3})}]}}],
+        }).encode("utf-8")
+        network = types.SimpleNamespace(Request=Mock(return_value=request), urlopen=Mock(return_value=response))
+        namespace = {
+            "config": self.config, "os": types.SimpleNamespace(environ={}), "json": json,
+            "logger": logging.getLogger("ambient-tests"), "urllib": types.SimpleNamespace(request=network),
+        }
+        source = ast.parse((LAMBDA_DIR / "api_utils.py").read_text(encoding="utf-8-sig"))
+        function = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "ask_gemini_ambient_mood")
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "api_utils.py", "exec"), namespace)
+        with patch.object(self.config, "GEMINI_API_KEY", "offline-test", create=True):
+            music, _ = namespace["ask_gemini_ambient_mood"](70, 70, False, 0)
+        self.assertEqual(music, 3)
+        payload = json.loads(network.Request.call_args.kwargs["data"])
+        prompt = payload["contents"][0]["parts"][0]["text"]
+        self.assertIn("Moderate", prompt)
+        self.assertIn("3: 바이,썸머", prompt)
+        self.assertNotIn("6: 숲", prompt)
+        self.assertIn('"music": 3', prompt)
+
+    def test_stop_wins_while_finished_song_is_selecting_the_next_track(self):
+        self.start_selected(level=70)
+        original_update = self.table.update_item
+
+        def stop_before_rotation(**kwargs):
+            if kwargs["UpdateExpression"].startswith("set current_music = :music, ambient_music_changed_at"):
+                self.device.handle_device("STOP_ALL", "menu", {}, "SS", [100] * 4)
+            return original_update(**kwargs)
+
+        self.table.update_item = stop_before_rotation
+        self.epoch += 2
+        response = self.poll(70, music_finished=True)
+        self.assertEqual((response["spray"], response["music"], response["active_mode"]), (0, 0, "ready"))
+
+    def test_bucket_change_takes_priority_over_finished_song(self):
+        self.start_selected()
+        start = self.epoch
+        for elapsed in range(2, 61, 2):
+            self.epoch = start + elapsed
+            self.poll(90, music_finished=False)
+        self.epoch = start + 62
+        with patch.object(self.db, "rotate_ambient_music", wraps=self.db.rotate_ambient_music) as rotate:
+            response = self.poll(90, music_finished=True)
+            rotate.assert_not_called()
+        self.assertEqual((response["spray"], response["music"]), (4, 1))
+        self.api.ask_gemini_ambient_mood.assert_called_once()
 
     def test_rotation_uses_each_bucket_playlist_and_excludes_the_current_track(self):
         for bucket, level in (("Quiet", 50), ("Moderate", 70), ("Loud", 90)):
@@ -268,43 +421,95 @@ class AmbientInitialTests(unittest.TestCase):
     def test_app_peek_does_not_rotate_or_consume_due_music(self):
         self.start_selected()
         start = self.epoch
-        for elapsed in range(2, 61, 2):
+        for elapsed in range(2, 60, 2):
             self.epoch = start + elapsed
             self.poll()
-        self.epoch = start + 62
+        self.epoch = start + 60
         before = copy.deepcopy(self.table.state)
         response = self.device.handle_device("POLL", "ambient", {"email": "user@example.com"}, "SS", [100] * 4)
         self.assertEqual(json.loads(response["body"])["music"], 6)
         self.assertEqual(self.table.state, before)
         response = self.poll()
-        self.assertEqual((response["music"], response["spray"]), (7, -1))
+        self.assertEqual((response["music"], response["spray"]), (7, 2))
         self.assertEqual(self.poll()["music"], 0)
 
-    def test_due_rotation_waits_during_invalid_measurement(self):
+    def test_due_rotation_continues_during_invalid_measurement(self):
         self.start_selected()
+        start = self.epoch
+        for elapsed in range(2, 60, 2):
+            self.epoch = start + elapsed
+            self.poll()
+        self.epoch = start + 60
+        self.assertEqual(self.poll(microphone_valid=False, include_db=False)["music"], 7)
+        self.assertEqual(self.table.state["current_music"], 7)
+        self.epoch += 2
+        self.assertEqual(self.poll()["music"], 0)
+
+    def test_legacy_moderate_music_keeps_rotating_without_a_valid_noise_window(self):
+        self.start_selected(level=70)
+        start = self.epoch
+        changes = []
+        for elapsed in range(2, 183, 2):
+            self.epoch = start + elapsed
+            response = self.poll(microphone_valid=False, include_db=False)
+            self.assertFalse(response["db_window_ready"])
+            self.assertIn("Moderate", response["ambient_context"])
+            self.assertEqual(response["active_scent"], 2)
+            self.assertGreater(self.pump_expires_at, self.epoch)
+            if response["music"] > 0:
+                changes.append((elapsed, response["music"]))
+        self.assertEqual(changes, [(60, 4), (120, 10), (180, 12)])
+        self.api.ask_gemini_ambient_mood.assert_called_once()
+
+    def test_music_rotation_is_not_cancelled_by_an_unrelated_noise_update(self):
+        self.start_selected()
+        self.epoch += 60
+        original_update = self.table.update_item
+
+        def change_noise_before_rotation(**kwargs):
+            if kwargs["UpdateExpression"].startswith("set current_music = :music, ambient_music_changed_at"):
+                self.table.state.update(microphone_valid=False, db_window_ready=False, db_avg=90)
+            return original_update(**kwargs)
+
+        self.table.update_item = change_noise_before_rotation
+        self.assertTrue(self.db.rotate_ambient_music("SS", self.epoch, reported_music=6))
+        self.assertEqual(self.table.state["current_music"], 7)
+        self.assertFalse(self.table.state["microphone_valid"])
+        self.assertEqual(self.table.state["db_avg"], 90)
+
+    def test_diagnostics_distinguish_the_selected_track_from_device_acknowledgement(self):
+        first = self.start_selected()
+        self.assertEqual(first["ambient_music_policy"], "finished-or-60s-v2")
+        self.assertEqual(first["ambient_music_rotation_seconds"], 60)
+        self.assertEqual(first["device_reported_music"], 0)
+        self.assertFalse(first["device_music_finish_reporting"])
         start = self.epoch
         for elapsed in range(2, 61, 2):
             self.epoch = start + elapsed
-            self.poll()
-        self.epoch = start + 62
-        self.assertEqual(self.poll(microphone_valid=False, include_db=False)["music"], 0)
-        self.assertEqual(self.table.state["current_music"], 6)
+            response = self.poll()
+        self.assertEqual((response["music"], response["device_reported_music"]), (7, 6))
+        self.assertEqual(response["ambient_music_changed_at"], self.epoch)
+        self.assertEqual(response["device_last_poll_time"], self.epoch)
         self.epoch += 2
-        self.assertEqual(self.poll()["music"], 7)
+        acknowledged = self.poll(music_finished=False)
+        self.assertEqual((acknowledged["music"], acknowledged["device_reported_music"]), (0, 7))
+        self.assertTrue(acknowledged["device_music_finish_reporting"])
 
-    def test_long_sample_gap_requires_a_new_window_before_music_rotation(self):
+    def test_long_sample_gap_does_not_block_music_rotation(self):
         self.start_selected()
         start = self.epoch
-        for elapsed in range(2, 61, 2):
+        for elapsed in range(2, 60, 2):
             self.epoch = start + elapsed
             self.poll()
         self.epoch += 10
         reset_at = self.epoch
-        self.assertEqual(self.poll()["music"], 0)
+        response = self.poll()
+        self.assertEqual(response["music"], 7)
+        self.assertFalse(response["db_window_ready"])
         for elapsed in range(2, 61, 2):
             self.epoch = reset_at + elapsed
             response = self.poll()
-            self.assertEqual(response["music"], 7 if elapsed == 60 else 0)
+            self.assertEqual(response["music"], 8 if elapsed == 60 else 0)
 
     def test_rotation_does_not_replace_a_music_command_not_yet_received_by_hardware(self):
         self.start_selected()
@@ -332,7 +537,6 @@ class AmbientInitialTests(unittest.TestCase):
 
     def test_bucket_change_takes_priority_over_due_music_rotation(self):
         self.start_selected()
-        self.api.ask_gemini_ambient_mood.return_value = (21, {"led_r": 0, "led_g": 0, "led_b": 255, "led_bright": 150})
         start = self.epoch
         with patch.object(self.db, "rotate_ambient_music", wraps=self.db.rotate_ambient_music) as rotate:
             for elapsed in range(2, 61, 2):
@@ -342,13 +546,14 @@ class AmbientInitialTests(unittest.TestCase):
             self.epoch = start + 62
             response = self.poll(90)
             rotate.assert_not_called()
-        self.assertEqual((response["spray"], response["music"]), (4, 21))
+        self.assertEqual((response["spray"], response["music"]), (4, 1))
+        self.api.ask_gemini_ambient_mood.assert_called_once()
         self.assertEqual(self.table.state["ambient_music_changed_at"], self.epoch)
 
     def test_music_only_response_is_retried_until_the_device_reports_the_track(self):
         self.start_selected()
         start = self.epoch
-        for elapsed in range(2, 63, 2):
+        for elapsed in range(2, 61, 2):
             self.epoch = start + elapsed
             response = self.poll()
         self.assertEqual(response["music"], 7)
@@ -751,15 +956,17 @@ class AmbientInitialTests(unittest.TestCase):
         self.assertLessEqual(response["spray"], 0)
         self.assertEqual(self.table.state["pending_cmd"], 0)
 
-    def test_stop_during_later_ai_analysis_cannot_reactivate_ambient(self):
+    def test_stop_during_bucket_music_selection_cannot_reactivate_ambient(self):
         self.start_selected()
+        select_music = self.db.select_ambient_music
 
-        def stop_before_reply(*args):
+        def stop_before_save(*args, **kwargs):
+            music = select_music(*args, **kwargs)
             self.device.handle_device("STOP_ALL", "menu", {}, "SS", [100] * 4)
-            return 7, {"led_r": 0, "led_g": 0, "led_b": 255, "led_bright": 150}
+            return music
 
-        self.api.ask_gemini_ambient_mood.side_effect = stop_before_reply
-        response = self.ambient.handle_ambient("ambient", {"effective_db": 90, "force_spray": True}, "SS", [100] * 4)
+        with patch.object(self.db, "select_ambient_music", side_effect=stop_before_save):
+            response = self.ambient.handle_ambient("ambient", {"effective_db": 90, "force_spray": True}, "SS", [100] * 4)
         self.assertEqual(json.loads(response["body"])["spray"], -1)
         self.assertEqual(self.table.state["active_mode"], "ready")
         self.assertEqual(self.table.state["pending_cmd"], 0)
@@ -843,7 +1050,8 @@ class AmbientInitialTests(unittest.TestCase):
         # Loud prefers slot 4, but the real firmware rejects it below 15%.
         # Slot 1 is the next configured usable scent, so music and the pump
         # command must switch together to an actually usable cartridge.
-        self.assertEqual((response["music"], response["spray"], response["duration"]), (7, 1, 60))
+        # Track 7 is Quiet-only; the invalid AI choice falls back to Loud track 1.
+        self.assertEqual((response["music"], response["spray"], response["duration"]), (1, 1, 60))
 
     def test_scent_kind_is_mapped_to_the_actual_physical_slot(self):
         self.db.get_spray_mapping = lambda device_id: {1: 4, 2: 2, 3: 1, 4: 5}
@@ -881,7 +1089,64 @@ class AmbientInitialTests(unittest.TestCase):
             response = self.poll(90)
         self.api.ask_gemini_ambient_mood.assert_called_once()
         self.assertEqual(response["music"], 0)
-        self.assertEqual(self.table.state["current_music"], 6)
+        self.assertEqual(self.table.state["current_music"], 7)  # Existing Quiet playlist continues.
+
+    def test_all_bucket_transitions_change_music_without_waiting_for_ai(self):
+        self.start_selected(level=50)
+        # Failure in the optional external service must not block a new bucket.
+        self.api.ask_gemini_ambient_mood.side_effect = RuntimeError("AI unavailable")
+        for level, bucket in ((70, "Moderate"), (90, "Loud"), (50, "Quiet"),
+                              (90, "Loud"), (70, "Moderate"), (50, "Quiet")):
+            with self.subTest(bucket=bucket, level=level):
+                start = self.epoch
+                for elapsed in range(2, 65, 2):
+                    self.epoch = start + elapsed
+                    response = self.poll(level)
+                self.assertTrue(response["db_window_ready"])
+                self.assertTrue(response["ambient_context"].endswith("_" + bucket))
+                self.assertIn(self.playing_music, self.config.AMBIENT_MUSIC_BY_BUCKET[bucket])
+                self.assertEqual(response["ambient_bucket_music_policy"], "immediate-bucket-v1")
+        self.api.ask_gemini_ambient_mood.assert_called_once()
+
+    def test_bucket_music_changes_even_if_the_only_usable_scent_stays_the_same(self):
+        self.db.get_spray_mapping = lambda device_id: {1: 6, 2: 0, 3: 0, 4: 0}
+        self.assertEqual(self.start_selected(level=50)["spray"], 1)
+        self.sensor_weights = [100, 0, 0, 0]
+        self.api.ask_gemini_ambient_mood.side_effect = RuntimeError("AI unavailable")
+        start = self.epoch
+        commands = []
+        for elapsed in range(2, 65, 2):
+            self.epoch = start + elapsed
+            response = self.poll(70)
+            if response["music"] > 0:
+                commands.append(response)
+        self.assertEqual(response["active_scent"], 1)
+        self.assertTrue(response["ambient_context"].endswith("_Moderate"))
+        self.assertIn(self.playing_music, self.config.AMBIENT_MUSIC_BY_BUCKET["Moderate"])
+        self.assertTrue(any(cmd["spray"] == 1 and cmd["music"] in self.config.AMBIENT_MUSIC_BY_BUCKET["Moderate"]
+                            for cmd in commands))
+        self.api.ask_gemini_ambient_mood.assert_called_once()
+
+    def test_failed_bucket_command_does_not_publish_a_different_effective_bucket(self):
+        self.start_selected(level=50)
+        applied_context = self.table.state["ambient_context"]
+        applied_level = self.table.state["ambient_effective_db"]
+        original_mailbox = self.db.manage_mailbox
+
+        def reject_new_bucket(*args, **kwargs):
+            context = kwargs.get("save_ambient_metadata", {}).get("ambient_context", "")
+            if context and context != applied_context:
+                return None
+            return original_mailbox(*args, **kwargs)
+
+        start = self.epoch
+        with patch.object(self.db, "manage_mailbox", side_effect=reject_new_bucket):
+            for elapsed in range(2, 65, 2):
+                self.epoch = start + elapsed
+                response = self.poll(90)
+        self.assertGreaterEqual(response["db_avg"], 80)
+        self.assertEqual(response["ambient_context"], applied_context)
+        self.assertEqual(response["ambient_effective_db"], float(applied_level))
 
 
 if __name__ == "__main__":

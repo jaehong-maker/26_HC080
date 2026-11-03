@@ -57,7 +57,9 @@ def _map_diary_kind_to_safe_pumps(kind_code, mapping, disabled_sprays):
             return 0
         if matching_pump not in pumps:
             pumps.append(matching_pump)
-    return int("".join(str(pump) for pump in pumps)) if pumps else 0
+    # The device accepts canonical pairs (12, 13, 14, 23, 24, 34).
+    # AI kind order must not produce reversed commands such as 41 or 43.
+    return int("".join(str(pump) for pump in sorted(pumps))) if pumps else 0
 
 
 # 날씨, 감정 등 메인 모드의 로직을 수행함
@@ -290,7 +292,7 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
             mapped_pump, fb_msg = db_utils.get_smart_spray_mapping(device_id, spray_code)
         result_text += fb_msg
         spray_code = mapped_pump
-    if spray_code > 0 and action != "START" and "_PREVIEW" not in action:
+    if spray_code > 0 and action != "START" and "_PREVIEW" not in action and context_key != "AI_DIARY":
         logger.info(f"[MAILBOX_PRE_WRITE] ID:{device_id} Scent:{spray_code} Mode:{mode} Action:{action}")
         db_utils.manage_mailbox(device_id, spray_code, region if mode == "weather" else "Emotion", duration)
     state = db_utils.get_device_state(device_id) or {}
@@ -418,18 +420,34 @@ def handle_core_modes(action, mode, body, device_id, normalized_weights, region)
         except Exception as e:
             logger.error(f"Failed to save weather state to DB: {e}")
     elif mode in ["emotion", "ai_replay"] and spray_code > 0 and action != "START" and "_PREVIEW" not in action:
-        try:
-            db_utils.state_table.update_item(
-                Key={'deviceId': device_id},
-                UpdateExpression="set active_mode = :am, active_scent = :asc, current_spray = :asc, pending_cmd = :asc, last_mode_change_time = :lmc REMOVE auto_stop_time",
-                ExpressionAttributeValues={
-                    ':am': 'manual',
-                    ':asc': int(spray_code),
-                    ':lmc': int(time.time())
-                }
+        if context_key == "AI_DIARY":
+            music = db_utils.get_music_track(device_id, spray_code, is_pump=True)
+            snapshot = db_utils.state_table.get_item(
+                Key={"deviceId": device_id}, ConsistentRead=True,
+            ).get("Item", {})
+            saved = db_utils.manage_mailbox(
+                device_id, 0, "AI_DIARY", 0,
+                save_active_mode="ready", save_active_scent=0, save_music=0,
+                save_diary_start={"spray": spray_code, "music": music, "duration": duration},
+                expected_initial_state=snapshot,
             )
-        except Exception as e:
-            logger.error(f"Failed to save emotion state to DB: {e}")
+            if saved != 0:
+                return {"statusCode": 200, "body": json.dumps({
+                    "result": "FAIL", "message": "일기 음악 재생 명령을 저장하지 못했습니다.",
+                }, ensure_ascii=False)}
+        else:
+            try:
+                db_utils.state_table.update_item(
+                    Key={'deviceId': device_id},
+                    UpdateExpression="set active_mode = :am, active_scent = :asc, current_spray = :asc, pending_cmd = :asc, last_mode_change_time = :lmc REMOVE auto_stop_time",
+                    ExpressionAttributeValues={
+                        ':am': 'manual',
+                        ':asc': int(spray_code),
+                        ':lmc': int(time.time())
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Failed to save emotion state to DB: {e}")
 
     music_code = 0
     if spray_code > 0:

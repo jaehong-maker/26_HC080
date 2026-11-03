@@ -33,7 +33,11 @@ def handle_ambient(mode, body, device_id, normalized_weights):
         return None
     try:
         now_kst = _get_kst_now()
-        state = db_utils.get_device_state(device_id) or {}
+        # The device POLL just wrote measurements and may have renewed the
+        # lease. Read its latest command token before the conditional write.
+        state = db_utils.state_table.get_item(
+            Key={"deviceId": device_id}, ConsistentRead=True,
+        ).get("Item", {})
         startup_token = body.get("_ambient_startup_token")
         completing_startup = bool(
             startup_token
@@ -83,13 +87,18 @@ def handle_ambient(mode, body, device_id, normalized_weights):
         if not (completing_startup or body.get("force_spray", False) or spray_code != current_spray):
             return _ambient_wait_response(state, "Ambient recommendation unchanged")
 
-        music_code, raw_led = api_utils.ask_gemini_ambient_mood(
-            effective_db, float(body.get("db_1hr_avg", db_avg)), False, db_stddev,
-        )
+        previous_bucket = str(state.get("ambient_context", "")).rsplit("_", 1)[-1]
+        bucket_changed = bool(previous_bucket and previous_bucket != noise_bucket)
+        if bucket_changed and not completing_startup:
+            # A bucket change is a control command, not an AI request. Do not
+            # make the hardware POLL wait for external inference or retries.
+            music_code, raw_led = 0, {}
+        else:
+            music_code, raw_led = api_utils.ask_gemini_ambient_mood(
+                effective_db, float(body.get("db_1hr_avg", db_avg)), False, db_stddev,
+            )
         current_music = int(state.get("current_music", 0) or 0)
-        music_code = int(music_code or 0)
-        if not 1 <= music_code <= 25:
-            music_code = current_music
+        music_code = db_utils.select_ambient_music(noise_bucket, int(music_code or 0), current_music)
         led_dict = {}
         for field, state_field, default in (
             ("led_r", "led_r", 255), ("led_g", "led_g", 180),
