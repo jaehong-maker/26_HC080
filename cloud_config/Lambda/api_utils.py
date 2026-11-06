@@ -49,14 +49,15 @@ def ask_gemini_recommendation(diary_text, user_history_text, slot_info_str="1번
     4. 반드시 [현재 디퓨저에 장착된 향기 목록]에 명시된 향기 고유 번호 중에서만 골라주어야 한다. 장착되지 않은 향기는 절대 추천 금지.
     5. 추천할 향기의 고유 번호를 숫자로 대답해줘. (예: 1번 향기 1개면 1, 1번 향기와 3번 향기를 블렌딩하면 13, 2번과 4번이면 24). 그 숫자를 'kind' 필드에 넣어!! (슬롯 번호가 아니라 향기 고유 번호야!)
     6. 감정에 따라 조명 색상(led_r, led_g, led_b)도 매우 다양하게 추천해줘. 단, 기기(LED) 특성상 빛이 연하게(하얗게) 보일 수 있으므로 파스텔톤을 피하고 매우 진한 색상이 되도록 해줘! (RGB 중 가장 큰 값은 무조건 255에 가깝게, 작은 값은 0에 가깝게 원색 위주로 설정할 것)
+       [조명 절대 규칙] 노란색·금색·호박색·노란 연두색 계열(HSV 색상각 30~90도)은 절대 추천하지 마세요. 해당 색상이 어울리더라도 반드시 선명한 주황색 RGB(255, 80, 0)으로 대체하세요. 다른 색상은 파랑·보라·초록·청록·빨강·분홍 계열에서 다양하게 선택하세요. 추천 설명에도 노란 계열 조명을 제안하지 마세요.
     7. 오늘 하루 사용자의 감정을 요약한 짧은 문장을 'emotion_summary' 필드에 작성해줘.
     8. 사용자의 핵심 감정을 나타내는 단어(예: 피곤함, 우울함, 행복함, 짜증남)를 'emotion_tag' 필드에 작성해줘.
     9. 중요★ 'reason' 필드에 향기를 추천하는 이유를 적을 때 절대 번호(예: 1번 시트러스, 2번 라벤더)를 언급하지 마! 반드시 향기 이름(예: 시트러스 향과 라벤더 향)으로 자연스럽게 적어주세요.
     10. [매우 중요/금지어] 생성하는 모든 텍스트('reason', 'emotion_summary' 등) 내부에 "정지", "중지", "대기", "꺼짐", "멈춰", "스톱" 이라는 단어를 절대 사용하지 마세요. (기기 오작동을 유발할 수 있습니다. 대신 "해소", "완화", "휴식" 등의 단어로 대체하세요.)
     
     반드시 아래와 같은 순수 JSON 형태로만 대답하고 다른 설명글은 절대 쓰지 마: 
-    (주의사항: 아래 예시의 값(15, 255, 100, 0)은 단지 예시일 뿐, 그대로 베끼지 말고, 매번 새롭게 분석하여 다채로운 값을 넣어줘!):
-    {{"kind": 15, "led_r": 255, "led_g": 100, "led_b": 0, "led_bright": 200, "emotion_summary": "오늘 하루 감정은 짜증과 피곤함임.", "emotion_tag": "피곤함", "reason": "사용자의 일기 내용을 분석한 결과, 피로를 풀어줄 시트러스 향과 마음을 진정시킬 라벤더 향기를 추천함. 또한 편안한 오렌지빛 조명으로 설정하였습니다."}}
+    (주의사항: 아래 예시는 형식 참고용이며 매번 새롭게 분석하되, 노란 계열 조명은 항상 제외하세요.):
+    {{"kind": 15, "led_r": 255, "led_g": 80, "led_b": 0, "led_bright": 200, "emotion_summary": "오늘 하루 감정은 짜증과 피곤함임.", "emotion_tag": "피곤함", "reason": "사용자의 일기 내용을 분석한 결과, 피로를 풀어줄 시트러스 향과 마음을 진정시킬 라벤더 향기를 추천함. 또한 편안한 오렌지빛 조명으로 설정하였습니다."}}
     """
 
     payload = json.dumps({
@@ -87,6 +88,23 @@ def ask_gemini_recommendation(diary_text, user_history_text, slot_info_str="1번
                     "led_b": int(result_json.get("led_b", -1)),
                     "led_bright": int(result_json.get("led_bright", -1))
                 }
+                # Enforce the diary lighting rule even if AI ignores the prompt.
+                # Clamp before checking, just as the device clamps RGB values.
+                rgb_fields = ("led_r", "led_g", "led_b")
+                if all(led_dict[field] >= 0 for field in rgb_fields):
+                    for field in rgb_fields:
+                        led_dict[field] = min(led_dict[field], 255)
+                    red, green, blue = (led_dict[field] for field in rgb_fields)
+                    # Hue 30~90 degrees, including amber and yellow-green.
+                    if (red > blue and green > blue
+                            and max(red, green) - blue <= 2 * (min(red, green) - blue)):
+                        led_dict.update(led_r=255, led_g=80, led_b=0)
+                        logger.info("[DIARY_LED] Yellow RGB %s replaced with orange (255, 80, 0)",
+                                    (red, green, blue))
+                else:
+                    # Keep missing/invalid RGB as no-change, never a partial color
+                    # that the device could clamp into yellow.
+                    led_dict.update(led_r=-1, led_g=-1, led_b=-1, led_bright=-1)
                 
                 logger.info(f"[Gemini API 성공] 추천 코드(kind): {kind_str}, 이유: {reason}, 조명: {led_dict}, 감정요약: {emotion_summary}, 감정태그: {emotion_tag}")
                 return kind_str, reason, led_dict, emotion_summary, emotion_tag

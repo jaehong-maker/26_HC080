@@ -83,32 +83,6 @@ def handle_voice(event, device_id):
         
         audio_b64_str = base64.b64encode(wav_bytes).decode('utf-8')
         
-        # --- API Quota Protection (Rate Limiter) ---
-        now_kst = datetime.now(timezone(timedelta(hours=9)))
-        state = db_utils.get_device_state(device_id) or {}
-        last_voice_time_str = state.get('last_voice_request_time')
-        if last_voice_time_str:
-            try:
-                last_voice_time = datetime.fromisoformat(last_voice_time_str)
-                if (now_kst - last_voice_time).total_seconds() < 30:
-                    logger.warning(f"Voice Request Rate Limited for {device_id}")
-                    return {
-                        "statusCode": 200,
-                        "body": json.dumps({"spray": 0, "message": "음성 인식 쿨타임 중입니다.", "transcript": "SILENCE"}, ensure_ascii=False)
-                    }
-            except Exception as e:
-                logger.error(f"Rate Limiter Time parse error: {e}")
-        
-        try:
-            db_utils.state_table.update_item(
-                Key={'deviceId': device_id},
-                UpdateExpression="set last_voice_request_time = :t",
-                ExpressionAttributeValues={':t': now_kst.isoformat()}
-            )
-        except Exception as e:
-            logger.error(f"RateLimit DB Update error: {e}")
-        # -------------------------------------------
-
         user_history_str = db_utils.get_user_history_text(
             device_id,
             contexts=["AI_VOICE"],
@@ -167,18 +141,7 @@ def handle_voice(event, device_id):
                 spray_code = 1
 
         state = db_utils.get_device_state(device_id) or {}
-        last_time_str = state.get('last_spray_time', "2000-01-01T00:00:00")
         now = datetime.now(timezone(timedelta(hours=9)))
-        if spray_code > 0:
-            try:
-                last_time = datetime.fromisoformat(last_time_str)
-                if (now - last_time).total_seconds() < (config.COOLDOWN_MINUTES * 60):
-                    return {
-                        "statusCode": 200,
-                        "body": json.dumps({"spray": 0, "message": "쿨타임 중이라 분사할 수 없습니다.", "mode": "CoolDown"}, ensure_ascii=False)
-                    }
-            except (TypeError, ValueError):
-                pass
 
         if spray_code >= 0:
             target_cmd = spray_code if spray_code > 0 else 0
